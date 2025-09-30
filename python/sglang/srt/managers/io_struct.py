@@ -144,6 +144,19 @@ class GenerateReqInput:
     # For customer metric labels
     customer_labels: Optional[Dict[str, str]] = None
 
+    # ============= SLO and Scheduling Extensions =============
+    # Target time to first token in milliseconds (SLO requirement)
+    target_ttft_ms: Optional[float] = None
+    
+    # Target time per output token in milliseconds (SLO requirement)
+    target_tpot_ms: Optional[float] = None
+    
+    # Starting position for chunked prefill (set by scheduler)
+    chunked_prefill_start_pos: Optional[int] = None
+    
+    # Length of chunked prefill (set by scheduler)
+    chunked_prefill_length: Optional[int] = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -545,6 +558,10 @@ class GenerateReqInput:
             label=self.label,
             priority=self.priority,
             return_bytes=self.return_bytes,
+            target_ttft_ms=self.target_ttft_ms if self.target_ttft_ms is not None else None,
+            target_tpot_ms=self.target_tpot_ms if self.target_tpot_ms is not None else None,
+            chunked_prefill_start_pos=self.chunked_prefill_start_pos[i] if self.chunked_prefill_start_pos is not None else None,
+            chunked_prefill_length=self.chunked_prefill_length[i] if self.chunked_prefill_length is not None else None,
         )
 
 
@@ -611,6 +628,19 @@ class TokenizedGenerateReqInput:
 
     # tracing context
     trace_context: Optional[Dict] = None
+
+    # ============= SLO and Scheduling Extensions =============
+    # Target time to first token in milliseconds (SLO requirement)
+    target_ttft_ms: Optional[float] = None
+    
+    # Target time per output token in milliseconds (SLO requirement)
+    target_tpot_ms: Optional[float] = None
+    
+    # Starting position for chunked prefill (set by scheduler)
+    chunked_prefill_start_pos: Optional[int] = None
+    
+    # Length of chunked prefill (set by scheduler)  
+    chunked_prefill_length: Optional[int] = None
 
 
 @dataclass

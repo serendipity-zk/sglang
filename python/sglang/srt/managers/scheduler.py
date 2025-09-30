@@ -1259,6 +1259,10 @@ class Scheduler(
                 metrics_collector=(
                     self.metrics_collector if self.enable_metrics else None
                 ),
+                target_ttft_ms=recv_req.target_ttft_ms,
+                target_tpot_ms=recv_req.target_tpot_ms,
+                chunked_prefill_start_pos=recv_req.chunked_prefill_start_pos,
+                chunked_prefill_length=recv_req.chunked_prefill_length,
             )
             req.tokenizer = self.tokenizer
 

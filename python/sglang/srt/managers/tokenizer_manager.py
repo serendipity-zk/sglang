@@ -750,6 +750,10 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 return_hidden_states=obj.return_hidden_states,
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
+                target_ttft_ms=obj.target_ttft_ms,
+                target_tpot_ms=obj.target_tpot_ms,
+                chunked_prefill_start_pos=obj.chunked_prefill_start_pos,
+                chunked_prefill_length=obj.chunked_prefill_length,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(

@@ -144,6 +144,10 @@ class Session:
             return_logprob=req.return_logprob,
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
+            target_ttft_ms=req.target_ttft_ms,
+            target_tpot_ms=req.target_tpot_ms,
+            chunked_prefill_start_pos=req.chunked_prefill_start_pos,
+            chunked_prefill_length=req.chunked_prefill_length,
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs

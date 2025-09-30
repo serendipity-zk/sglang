@@ -458,6 +458,10 @@ class Req:
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
+        target_ttft_ms: Optional[float] = None,
+        target_tpot_ms: Optional[float] = None,
+        chunked_prefill_start_pos: Optional[int] = None,
+        chunked_prefill_length: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -652,6 +656,15 @@ class Req:
         # We use `tmp_end_idx` to store the end index of the kv cache to send.
         self.tmp_end_idx: int = -1
         self.metadata_buffer_index: int = -1
+
+        # ============= SLO and Scheduling Extensions =============
+        # SLO requirements from client
+        self.target_ttft_ms = target_ttft_ms
+        self.target_tpot_ms = target_tpot_ms
+        
+        # Chunked prefill scheduling metadata (set by scheduler)
+        self.chunked_prefill_start_pos = chunked_prefill_start_pos
+        self.chunked_prefill_length = chunked_prefill_length
 
     @property
     def seqlen(self):
