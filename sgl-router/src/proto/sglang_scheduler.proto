@@ -122,6 +122,19 @@ message GenerateRequest {
 
   // For load balancing
   int32 dp_balance_id = 17;
+
+  // ============= SLO and Scheduling Extensions =============
+  // Target time to first token in milliseconds (SLO requirement)
+  float target_ttft_ms = 18;
+
+  // Target time per output token in milliseconds (SLO requirement)
+  float target_tpot_ms = 19;
+
+  // Starting position for chunked prefill (set by scheduler)
+  int32 chunked_prefill_start_pos = 20;
+
+  // Length of chunked prefill (set by scheduler)
+  int32 chunked_prefill_length = 21;
 }
 
 message TokenizedInput {
