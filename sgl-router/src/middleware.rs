@@ -1,3 +1,4 @@
+use crate::ui::RouterUi;
 use axum::{
     extract::Request, extract::State, http::HeaderValue, http::StatusCode, middleware::Next,
     response::IntoResponse, response::Response,
@@ -10,7 +11,7 @@ use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tower::{Layer, Service};
 use tower_http::trace::{MakeSpan, OnRequest, OnResponse, TraceLayer};
-use tracing::{debug, error, field::Empty, info, info_span, warn, Span};
+use tracing::{debug, error, field::Empty, info, info_span, trace, warn, Span};
 
 pub use crate::core::token_bucket::TokenBucket;
 
@@ -172,7 +173,7 @@ impl<B> OnRequest<B> for RequestLogger {
         }
 
         // Log the request start
-        info!(
+        trace!(
             target: "sglang_router_rs::request",
             "started processing request"
         );
@@ -214,7 +215,7 @@ impl<B> OnResponse<B> for ResponseLogger {
                 "request failed with client error"
             );
         } else {
-            info!(
+            trace!(
                 target: "sglang_router_rs::response",
                 "finished processing request"
             );
@@ -413,14 +414,28 @@ pub async fn concurrency_limit_middleware(
     // Static counter for embeddings queue size
     static EMBEDDINGS_QUEUE_SIZE: AtomicU64 = AtomicU64::new(0);
 
-    // Identify if this is an embeddings request based on path
-    let is_embeddings = request.uri().path().contains("/v1/embeddings");
+    // Identify request types based on path
+    let path = request.uri().path();
+    let is_generate_route = path == "/generate";
+    let is_embeddings = path.contains("/v1/embeddings");
+
+    if is_generate_route {
+        RouterUi::inc_generate_attempt();
+    }
     let token_bucket = app_state.context.rate_limiter.clone();
 
     // Try to acquire token immediately
     if token_bucket.try_acquire(1.0).await.is_ok() {
         debug!("Acquired token immediately");
+        RouterUi::inc_mid_to_generate_immediate();
+        if is_generate_route {
+            debug!("Request passed middleware to generate endpoint");
+        }
         let response = next.run(request).await;
+        // Count failures for /generate based on response status
+        if is_generate_route && !response.status().is_success() {
+            RouterUi::inc_failed_generate();
+        }
 
         // Return the token to the bucket
         token_bucket.return_tokens(1.0).await;
@@ -428,6 +443,7 @@ pub async fn concurrency_limit_middleware(
         response
     } else {
         // No tokens available, try to queue if enabled
+        RouterUi::inc_mid_not_immediate();
         if let Some(queue_tx) = &app_state.concurrency_queue_tx {
             debug!("No tokens available, attempting to queue request");
 
@@ -447,19 +463,31 @@ pub async fn concurrency_limit_middleware(
                         let new_val = EMBEDDINGS_QUEUE_SIZE.fetch_add(1, Ordering::Relaxed) + 1;
                         RouterMetrics::set_embeddings_queue_size(new_val as usize);
                     }
+                    // Update global pending queue for UI
+                    RouterUi::inc_queue();
 
                     // Wait for token from queue processor
                     match permit_rx.await {
                         Ok(Ok(())) => {
                             debug!("Acquired token from queue");
+                            RouterUi::inc_mid_to_generate_struggle();
+                            if is_generate_route {
+                                debug!("Queued request passed middleware to generate endpoint");
+                            }
                             // Dequeue for embeddings
                             if is_embeddings {
                                 let new_val =
                                     EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
                                 RouterMetrics::set_embeddings_queue_size(new_val as usize);
                             }
+                            // Decrement global pending queue for UI
+                            RouterUi::dec_queue();
 
                             let response = next.run(request).await;
+                            // Count failures for /generate based on response status
+                            if is_generate_route && !response.status().is_success() {
+                                RouterUi::inc_failed_generate();
+                            }
 
                             // Return the token to the bucket
                             token_bucket.return_tokens(1.0).await;
@@ -474,6 +502,11 @@ pub async fn concurrency_limit_middleware(
                                     EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
                                 RouterMetrics::set_embeddings_queue_size(new_val as usize);
                             }
+                            // Decrement global pending queue for UI
+                            RouterUi::dec_queue();
+                            if is_generate_route {
+                                RouterUi::inc_failed_generate();
+                            }
                             status.into_response()
                         }
                         Err(_) => {
@@ -484,17 +517,28 @@ pub async fn concurrency_limit_middleware(
                                     EMBEDDINGS_QUEUE_SIZE.fetch_sub(1, Ordering::Relaxed) - 1;
                                 RouterMetrics::set_embeddings_queue_size(new_val as usize);
                             }
+                            // Decrement global pending queue for UI
+                            RouterUi::dec_queue();
+                            if is_generate_route {
+                                RouterUi::inc_failed_generate();
+                            }
                             StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }
                     }
                 }
                 Err(_) => {
                     warn!("Request queue is full, returning 429");
+                    if is_generate_route {
+                        RouterUi::inc_failed_generate();
+                    }
                     StatusCode::TOO_MANY_REQUESTS.into_response()
                 }
             }
         } else {
             warn!("No tokens available and queuing is disabled, returning 429");
+            if is_generate_route {
+                RouterUi::inc_failed_generate();
+            }
             StatusCode::TOO_MANY_REQUESTS.into_response()
         }
     }

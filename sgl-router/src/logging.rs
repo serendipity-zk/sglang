@@ -1,3 +1,4 @@
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use tracing::Level;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -23,6 +24,10 @@ pub struct LoggingConfig {
     pub log_file_name: String,
     /// Custom log targets to filter (default: "sglang_router_rs")
     pub log_targets: Option<Vec<String>>,
+    /// Optional explicit log file path (takes precedence over log_dir)
+    pub single_file_path: Option<String>,
+    /// Whether to emit logs to stdout
+    pub enable_stdout: bool,
 }
 
 impl Default for LoggingConfig {
@@ -34,6 +39,8 @@ impl Default for LoggingConfig {
             colorize: true,
             log_file_name: "sgl-router".to_string(),
             log_targets: Some(vec!["sglang_router_rs".to_string()]),
+            single_file_path: None,
+            enable_stdout: true,
         }
     }
 }
@@ -98,25 +105,63 @@ pub fn init_logging(config: LoggingConfig) -> LogGuard {
     // Standard timestamp format: YYYY-MM-DD HH:MM:SS
     let time_format = "%Y-%m-%d %H:%M:%S".to_string();
 
-    // Configure the console stdout layer
-    let stdout_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(config.colorize)
-        .with_file(true)
-        .with_line_number(true)
-        .with_timer(ChronoUtc::new(time_format.clone()));
+    if config.enable_stdout {
+        // Configure the console stdout layer
+        let stdout_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(config.colorize)
+            .with_file(true)
+            .with_line_number(true)
+            .with_timer(ChronoUtc::new(time_format.clone()));
 
-    let stdout_layer = if config.json_format {
-        stdout_layer.json().flatten_event(true).boxed()
-    } else {
-        stdout_layer.boxed()
-    };
+        let stdout_layer = if config.json_format {
+            stdout_layer.json().flatten_event(true).boxed()
+        } else {
+            stdout_layer.boxed()
+        };
 
-    layers.push(stdout_layer);
+        layers.push(stdout_layer);
+    }
 
     // Create a file appender if log_dir is specified
     let mut file_guard = None;
 
-    if let Some(log_dir) = &config.log_dir {
+    if let Some(path) = &config.single_file_path {
+        let path_buf = PathBuf::from(path);
+        if let Some(parent) = path_buf.parent() {
+            if !parent.exists() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!("Failed to create log directory: {}", e);
+                    return LogGuard { _file_guard: None };
+                }
+            }
+        }
+
+        match OpenOptions::new().create(true).append(true).open(&path_buf) {
+            Ok(file) => {
+                let (non_blocking, guard) = tracing_appender::non_blocking(file);
+                file_guard = Some(guard);
+
+                let file_layer = tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_timer(ChronoUtc::new(time_format.clone()))
+                    .with_writer(non_blocking);
+
+                let file_layer = if config.json_format {
+                    file_layer.json().flatten_event(true).boxed()
+                } else {
+                    file_layer.boxed()
+                };
+
+                layers.push(file_layer);
+            }
+            Err(e) => {
+                eprintln!("Failed to open log file {}: {}", path, e);
+                return LogGuard { _file_guard: None };
+            }
+        }
+    } else if let Some(log_dir) = &config.log_dir {
         let file_name = config.log_file_name.clone();
         let log_dir = PathBuf::from(log_dir);
 

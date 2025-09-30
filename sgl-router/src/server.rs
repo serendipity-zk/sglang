@@ -1,3 +1,4 @@
+use crate::ui::RouterUi;
 use crate::{
     config::{ConnectionMode, HistoryBackend, RouterConfig},
     core::{WorkerRegistry, WorkerType},
@@ -30,10 +31,12 @@ use axum::{
     routing::{delete, get, post},
     serve, Json, Router,
 };
+use chrono::Utc;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use std::{
+    path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
     time::Duration,
@@ -167,10 +170,14 @@ async fn generate(
     headers: http::HeaderMap,
     Json(body): Json<GenerateRequest>,
 ) -> Response {
-    state
+    // log that we received a generate request
+    RouterUi::inc_total_generate();
+    let resp = state
         .router
         .route_generate(Some(&headers), &body, None)
-        .await
+        .await;
+    RouterUi::inc_finished_generate();
+    resp
 }
 
 async fn v1_chat_completions(
@@ -540,6 +547,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
     let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
+        let base_dir = config.log_dir.clone().unwrap_or_else(|| ".".to_string());
+        let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+        let log_file_name = format!("router-log-{}.txt", timestamp);
+        let log_file_path = PathBuf::from(&base_dir).join(&log_file_name);
+
         Some(logging::init_logging(LoggingConfig {
             level: config
                 .log_level
@@ -557,10 +569,18 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             colorize: true,
             log_file_name: "sgl-router".to_string(),
             log_targets: None,
+            single_file_path: Some(log_file_path.to_string_lossy().into_owned()),
+            enable_stdout: false,
         }))
     } else {
         None
     };
+
+    info!(
+        "Router build info | version: {} | built_at: {}",
+        env!("SGLANG_BUILD_VERSION"),
+        env!("SGLANG_BUILD_TIMESTAMP")
+    );
 
     // Initialize prometheus metrics exporter
     if let Some(prometheus_config) = config.prometheus_config {
@@ -711,6 +731,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         concurrency_queue_tx: limiter.queue_tx.clone(),
         router_manager,
     });
+
+    // Start CLI UI
+    RouterUi::start(app_state.clone());
     let router_arc = Arc::clone(&app_state.router);
 
     // Start the service discovery if enabled

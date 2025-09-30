@@ -11,6 +11,7 @@ use crate::protocols::spec::{
 };
 use crate::routers::header_utils;
 use crate::routers::{RouterTrait, WorkerManagement};
+use crate::ui::RouterUi;
 use axum::body::to_bytes;
 use axum::{
     body::Body,
@@ -517,6 +518,9 @@ impl Router {
                 } else {
                     None
                 };
+
+                // Count issued requests per worker for the UI
+                RouterUi::inc_worker_issued(worker.url());
 
                 let response = self
                     .send_typed_request(

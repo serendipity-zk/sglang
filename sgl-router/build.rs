@@ -1,6 +1,15 @@
+use chrono::Utc;
+use std::env;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Only regenerate if the proto file changes
     println!("cargo:rerun-if-changed=src/proto/sglang_scheduler.proto");
+
+    // Capture build metadata for runtime logging
+    let version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string());
+    let timestamp = Utc::now().to_rfc3339();
+    println!("cargo:rustc-env=SGLANG_BUILD_VERSION={version}");
+    println!("cargo:rustc-env=SGLANG_BUILD_TIMESTAMP={timestamp}");
 
     // Configure protobuf compilation with custom settings
     let config = prost_build::Config::new();
