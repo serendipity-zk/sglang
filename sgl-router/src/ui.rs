@@ -49,7 +49,18 @@ impl RouterUi {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            let _ = UI_APPSTATE.set(app_state);
+            // Store app state and seed worker list so UI shows workers immediately
+            let _ = UI_APPSTATE.set(app_state.clone());
+            if let Some(ui_state) = UI_STATE.get() {
+                for w in app_state.context.worker_registry.get_all() {
+                    let url = w.url().to_string();
+                    ui_state
+                        .worker_issued
+                        .entry(url)
+                        .or_insert_with(|| AtomicU64::new(0));
+                }
+            }
+
             std::thread::spawn(move || {
                 Self::render_loop_blocking();
             });
