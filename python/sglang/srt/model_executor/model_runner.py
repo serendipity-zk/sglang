@@ -243,6 +243,10 @@ class ModelRunner:
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
         self.forward_pass_id = 0
+        # Metrics: per-forward embedding input size (tokens)
+        self.last_input_tokens: int = 0
+        self.last_input_step_type: str = "init"
+        self.last_input_tic: float = 0.0
 
         # Apply the rank zero filter to logger
         if not any(isinstance(f, RankZeroFilter) for f in logger.filters):
@@ -1981,6 +1985,33 @@ class ModelRunner:
         # For MLP sync
         if forward_batch.global_num_tokens_cpu is not None:
             forward_batch.prepare_mlp_sync_batch(self)
+
+        # Record per-pass input tokens (embedding M) prior to running kernels
+        try:
+            # Prefer authoritative DP-aware counts if available
+            m_tokens: Optional[int] = None
+            if forward_batch.global_num_tokens_cpu is not None:
+                # Sum across DP partitions for this pass
+                m_tokens = int(sum(int(x) for x in forward_batch.global_num_tokens_cpu))
+            elif forward_batch.forward_mode.is_decode():
+                # One token per active decode sequence
+                m_tokens = int(forward_batch.batch_size)
+            elif forward_batch.forward_mode.is_extend() or forward_batch.forward_mode.is_split_prefill():
+                # Chunked prefill/new tokens in this pass
+                if getattr(forward_batch, "extend_num_tokens", None) is not None:
+                    m_tokens = int(forward_batch.extend_num_tokens)
+                else:
+                    # Fallback: use batch size when detailed count is unavailable
+                    m_tokens = int(forward_batch.batch_size)
+            else:
+                m_tokens = 0
+            self.last_input_tokens = max(0, int(m_tokens))
+            self.last_input_step_type = (
+                "decode" if forward_batch.forward_mode.is_decode() else "prefill"
+            )
+            self.last_input_tic = time.perf_counter()
+        except Exception:
+            pass
 
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(

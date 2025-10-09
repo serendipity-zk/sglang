@@ -2454,6 +2454,49 @@ class Scheduler(
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)
         ret["last_gen_throughput"] = self.last_gen_throughput
+        # Expose recent scheduler batch signals for UIs/monitoring
+        try:
+            ret["last_prefill_tokens"] = int(self.last_prefill_tokens)
+        except Exception:
+            ret["last_prefill_tokens"] = 0
+        # Expose last stats timestamps to infer most recent step type
+        try:
+            ret["last_prefill_tic"] = float(self.last_prefill_stats_tic)
+        except Exception:
+            pass
+        try:
+            ret["last_decode_tic"] = float(self.last_decode_stats_tic)
+        except Exception:
+            pass
+        try:
+            # Use stats.num_running_reqs if set by metrics mixin; fallback to current running batch
+            if hasattr(self, "stats") and getattr(self.stats, "num_running_reqs", None) is not None:
+                num_running = int(self.stats.num_running_reqs)
+            else:
+                num_running = len(self.running_batch.reqs)
+        except Exception:
+            num_running = len(self.running_batch.reqs)
+        ret["num_running_reqs"] = int(num_running)
+        # KV occupancy (exclude waiting queues)
+        try:
+            if self.is_hybrid:
+                (
+                    full_num_used,
+                    swa_num_used,
+                    _full_token_usage,
+                    _swa_token_usage,
+                    _full_available_size,
+                    _full_evictable_size,
+                    _swa_available_size,
+                    _swa_evictable_size,
+                ) = self._get_swa_token_info()
+                kv_used = max(int(full_num_used), int(swa_num_used))
+            else:
+                num_used, _token_usage, _avail, _evict = self._get_token_info()
+                kv_used = int(num_used)
+            ret["kv_tokens_used"] = kv_used
+        except Exception:
+            pass
         ret["memory_usage"] = {
             "weight": round(
                 self.tp_worker.worker.model_runner.weight_load_mem_usage, 2
@@ -2463,6 +2506,14 @@ class Scheduler(
             ),
             "token_capacity": int(self.max_total_num_tokens),
         }
+        # Per-pass embedding input size observed at runner boundary
+        try:
+            mr = self.tp_worker.worker.model_runner
+            ret["input_tokens"] = int(getattr(mr, "last_input_tokens", 0) or 0)
+            ret["input_step_type"] = getattr(mr, "last_input_step_type", "")
+            ret["last_input_tic"] = float(getattr(mr, "last_input_tic", 0.0) or 0.0)
+        except Exception:
+            pass
 
         ret["memory_usage"]["graph"] = round(
             self.tp_worker.worker.model_runner.graph_mem_usage, 2

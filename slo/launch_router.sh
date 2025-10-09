@@ -8,7 +8,7 @@ python -m sglang_router.launch_router \
   --policy random \
   --log-dir /sgl-workspace/sglang/slo/logs \
   --max-concurrent-requests 8192 \
-  --rate-limit-tokens-per-second 120 \
+  --rate-limit-tokens-per-second 600 \
   --worker-urls \
     http://0.0.0.0:31001 \
     http://0.0.0.0:31002 \

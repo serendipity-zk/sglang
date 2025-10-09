@@ -4,3 +4,4 @@ python launch_server.py \
   --ports 31001,31002,31003,31004 \
   --gpus 0,1,2,3 \
   --log-dir /sgl-workspace/sglang/slo/logs \
+  --tmux-ui
