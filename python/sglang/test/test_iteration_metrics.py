@@ -429,6 +429,143 @@ class TestIterationMetrics(unittest.TestCase):
         self.assertEqual(snapshot2["num_requests"], 4)
         self.assertEqual(snapshot2["iteration_num"], 2)
 
+    def test_prefill_chunk_pairs_empty_list(self):
+        """Test that prefill_chunk_pairs can be an empty list for decode-only batches."""
+        iteration_metrics.initialize(
+            worker_id="test_worker_10",
+            stat_file_path=None,
+            router_url=self.router_url,
+            report_interval=1,
+        )
+
+        # Report metrics for decode-only batch (no prefill chunks)
+        metrics = {
+            "batch_size_tokens": 128,
+            "num_requests": 8,
+            "forward_mode": "DECODE",
+            "prefill_chunk_pairs": [],  # Empty for decode-only
+        }
+        iteration_metrics.report_iteration(metrics)
+
+        time.sleep(0.5)
+
+        # Verify HTTP received the data with empty prefill_chunk_pairs
+        with MockRouterHandler.lock:
+            self.assertEqual(len(MockRouterHandler.received_stats), 1)
+            received = MockRouterHandler.received_stats[0]
+            self.assertEqual(received["forward_mode"], "DECODE")
+            self.assertEqual(received["prefill_chunk_pairs"], [])
+
+    def test_prefill_chunk_pairs_non_chunked(self):
+        """Test prefill_chunk_pairs for non-chunked prefill requests."""
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".stat", delete=False
+        ) as stat_file:
+            stat_file_path = stat_file.name
+
+        try:
+            iteration_metrics.initialize(
+                worker_id="test_worker_11",
+                stat_file_path=stat_file_path,
+                router_url=self.router_url,
+                report_interval=1,
+            )
+
+            # Report metrics with non-chunked prefill (seqlen, seqlen)
+            metrics = {
+                "batch_size_tokens": 512,
+                "num_requests": 2,
+                "forward_mode": "EXTEND",
+                "prefill_chunk_pairs": [[512, 512], [1024, 1024]],  # Two non-chunked requests
+            }
+            iteration_metrics.report_iteration(metrics)
+
+            time.sleep(0.5)
+
+            # Verify file logging
+            with open(stat_file_path, "r") as f:
+                data = json.loads(f.readline())
+                self.assertEqual(data["forward_mode"], "EXTEND")
+                self.assertEqual(len(data["prefill_chunk_pairs"]), 2)
+                self.assertEqual(data["prefill_chunk_pairs"][0], [512, 512])
+                self.assertEqual(data["prefill_chunk_pairs"][1], [1024, 1024])
+
+            # Verify HTTP logging
+            with MockRouterHandler.lock:
+                self.assertEqual(len(MockRouterHandler.received_stats), 1)
+                received = MockRouterHandler.received_stats[0]
+                self.assertEqual(len(received["prefill_chunk_pairs"]), 2)
+                self.assertEqual(received["prefill_chunk_pairs"][0], [512, 512])
+
+        finally:
+            if os.path.exists(stat_file_path):
+                os.remove(stat_file_path)
+
+    def test_prefill_chunk_pairs_chunked(self):
+        """Test prefill_chunk_pairs for chunked prefill requests."""
+        iteration_metrics.initialize(
+            worker_id="test_worker_12",
+            stat_file_path=None,
+            router_url=self.router_url,
+            report_interval=1,
+        )
+
+        # Report metrics with chunked prefill
+        # Format: [current_chunk, cumulative_prefill]
+        # Example: request with 3 chunks of 256 tokens each
+        metrics = {
+            "batch_size_tokens": 256,
+            "num_requests": 1,
+            "forward_mode": "EXTEND",
+            "prefill_chunk_pairs": [[256, 768]],  # Processing 3rd chunk (256) of total 768 tokens
+        }
+        iteration_metrics.report_iteration(metrics)
+
+        time.sleep(0.5)
+
+        # Verify the chunked prefill information was captured
+        with MockRouterHandler.lock:
+            self.assertEqual(len(MockRouterHandler.received_stats), 1)
+            received = MockRouterHandler.received_stats[0]
+            self.assertEqual(received["forward_mode"], "EXTEND")
+            self.assertEqual(len(received["prefill_chunk_pairs"]), 1)
+            # Current chunk is 256, cumulative is 768
+            self.assertEqual(received["prefill_chunk_pairs"][0][0], 256)
+            self.assertEqual(received["prefill_chunk_pairs"][0][1], 768)
+
+    def test_prefill_chunk_pairs_mixed_mode(self):
+        """Test prefill_chunk_pairs in mixed mode (prefill + decode)."""
+        iteration_metrics.initialize(
+            worker_id="test_worker_13",
+            stat_file_path=None,
+            router_url=self.router_url,
+            report_interval=1,
+        )
+
+        # Report metrics in MIXED mode with multiple prefill requests
+        metrics = {
+            "batch_size_tokens": 1024,
+            "num_requests": 5,  # 3 prefill + 2 decode
+            "forward_mode": "MIXED",
+            "prefill_chunk_pairs": [
+                [512, 512],    # Non-chunked prefill
+                [256, 768],    # Chunked prefill (3rd chunk)
+                [128, 128],    # Non-chunked prefill
+            ],  # Decode requests have no entries
+        }
+        iteration_metrics.report_iteration(metrics)
+
+        time.sleep(0.5)
+
+        # Verify mixed mode data
+        with MockRouterHandler.lock:
+            self.assertEqual(len(MockRouterHandler.received_stats), 1)
+            received = MockRouterHandler.received_stats[0]
+            self.assertEqual(received["forward_mode"], "MIXED")
+            self.assertEqual(received["num_requests"], 5)
+            # Should have 3 prefill chunk pairs (no entries for decode requests)
+            self.assertEqual(len(received["prefill_chunk_pairs"]), 3)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

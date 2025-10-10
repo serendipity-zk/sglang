@@ -165,14 +165,18 @@ class TpModelWorkerClient:
             batch_lists[batch_pt % 2] = model_worker_batch
             batch_pt += 1
 
-            # Create event
+            # Create events for timing and copy completion
             copy_done = torch.get_device_module(self.device).Event()
+            # Enable timing for precise GPU elapsed measurement
+            compute_start = torch.get_device_module(self.device).Event(enable_timing=True)
+            compute_end = torch.get_device_module(self.device).Event(enable_timing=True)
 
             # Resolve future tokens in the input
             input_ids = model_worker_batch.input_ids
             resolve_future_token_ids(input_ids, self.future_token_ids_map)
 
-            # Run forward
+            # Mark GPU compute start and run forward
+            compute_start.record()
             logits_output, next_token_ids, can_run_cuda_graph = (
                 self.worker.forward_batch_generation(
                     model_worker_batch,
@@ -209,9 +213,11 @@ class TpModelWorkerClient:
             if next_token_ids.device.type != "cpu":
                 next_token_ids = next_token_ids.to("cpu", non_blocking=True)
             copy_done.record()
+            # Mark GPU compute end after all stream ops are enqueued
+            compute_end.record()
 
             self.output_queue.put(
-                (copy_done, logits_output, next_token_ids, can_run_cuda_graph)
+                (copy_done, logits_output, next_token_ids, can_run_cuda_graph, compute_start, compute_end)
             )
 
     def resolve_last_batch_result(self, launch_done: Optional[threading.Event] = None):
@@ -219,7 +225,7 @@ class TpModelWorkerClient:
         This function is called to resolve the last batch result and
         wait for the current batch to be launched. Used in overlap mode.
         """
-        copy_done, logits_output, next_token_ids, can_run_cuda_graph = (
+        copy_done, logits_output, next_token_ids, can_run_cuda_graph, compute_start, compute_end = (
             self.output_queue.get()
         )
 
@@ -236,7 +242,9 @@ class TpModelWorkerClient:
                 logits_output.input_token_logprobs.tolist()
             )
         next_token_ids = next_token_ids.tolist()
-        return logits_output, next_token_ids, can_run_cuda_graph
+        # Compute precise GPU elapsed time in milliseconds
+        gpu_elapsed_ms = compute_start.elapsed_time(compute_end)
+        return logits_output, next_token_ids, can_run_cuda_graph, gpu_elapsed_ms
 
     def forward_batch_generation(
         self, model_worker_batch: ModelWorkerBatch

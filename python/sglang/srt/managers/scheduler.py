@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
+import copy
 
 import psutil
 import setproctitle
@@ -270,6 +271,9 @@ class Scheduler(
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.page_size = server_args.page_size
+
+        # Timestamp of the last completed process_batch_result call
+        self._last_process_result_end_time: Optional[float] = None
 
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
@@ -706,6 +710,36 @@ class Scheduler(
 
         total_tokens = prefill_tokens + decode_tokens
 
+        # Collect prefill chunk pairs for chunked prefill requests
+        # Each pair is (current_chunk_length, cumulative_prefill_length)
+        # For non-chunked requests, this becomes (seqlen, seqlen)
+        # For decode-only batches, this is an empty list
+        prefill_chunk_pairs = []
+        if batch.forward_mode == ForwardMode.EXTEND or batch.forward_mode == ForwardMode.MIXED:
+            # Prefer stable lengths captured in the batch at preparation time
+            prefix_lens = getattr(batch, "prefix_lens", None)
+            extend_lens = getattr(batch, "extend_lens", None)
+            if prefix_lens is not None and extend_lens is not None and batch.reqs is not None:
+                decoding_reqs = set(batch.decoding_reqs) if getattr(batch, "decoding_reqs", None) else None
+                for i, req in enumerate(batch.reqs):
+                    if batch.forward_mode == ForwardMode.MIXED and decoding_reqs and req in decoding_reqs:
+                        continue
+                    current_chunk = extend_lens[i] if i < len(extend_lens) else 0
+                    if current_chunk and current_chunk > 0:
+                        cumulative_prefill = (prefix_lens[i] if i < len(prefix_lens) else 0) + current_chunk
+                        prefill_chunk_pairs.append([int(current_chunk), int(cumulative_prefill)])
+            else:
+                # Fallback: derive from possibly mutable reqs (non-overlap paths)
+                decoding_reqs = set(batch.decoding_reqs) if getattr(batch, "decoding_reqs", None) else None
+                for req in batch.reqs or []:
+                    if batch.forward_mode == ForwardMode.MIXED and decoding_reqs and req in decoding_reqs:
+                        continue
+                    current_chunk = getattr(req, "extend_input_len", 0)
+                    if current_chunk and current_chunk > 0:
+                        prefix_len = len(getattr(req, "prefix_indices", []))
+                        cumulative_prefill = prefix_len + current_chunk
+                        prefill_chunk_pairs.append([current_chunk, cumulative_prefill])
+
         # Build metrics payload (field names match UI expectations)
         metrics = {
             # UI expects: running_batch_size, queue_reqs, kv_tokens_used, token_capacity
@@ -717,11 +751,18 @@ class Scheduler(
             "prefill_tokens": prefill_tokens,
             "decode_tokens": decode_tokens,
             "token_batch_size": total_tokens,
+            # iteration_time_ms semantically represents elapsed iteration time; we now pass gpu_elapsed_ms here
             "iteration_time_ms": round(iteration_time_ms, 2),
             "forward_mode": batch.forward_mode.name if batch.forward_mode else "UNKNOWN",
+            # Prefill chunk pairs: list of [current_chunk, cumulative_prefill]
+            "prefill_chunk_pairs": prefill_chunk_pairs,
+            # Optional scheduler interval between last two process_batch_result completions (overlap only)
+            **({"scheduler_interval_ms": round(getattr(batch, "scheduler_interval_ms", getattr(batch, "since_last_process_ms", 0.0)), 2)}
+               if getattr(batch, "scheduler_interval_ms", None) is not None or getattr(batch, "since_last_process_ms", None) is not None else {}),
             # Keep some old names for compatibility
             "batch_size_tokens": total_tokens,
             "num_requests": len(batch.reqs),
+            "input_id_len": batch.input_ids.shape[0] if batch.input_ids is not None else 0,
         }
 
         # Report (non-blocking)
@@ -1052,17 +1093,6 @@ class Scheduler(
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 logger.info("Event loop overlap2")
-                # Measure time for completed batch
-                if hasattr(tmp_batch, 'iteration_start_time'):
-                    logger.info(tmp_batch)
-                    logger.info("Event loop overlap3")
-                    batch_end_time = time.perf_counter()
-                    iteration_time_ms = (batch_end_time - tmp_batch.iteration_start_time) * 1000
-
-                    logger.info(f"before report metrics2: {iteration_time_ms}")
-                    # Report metrics for the batch that just completed
-                    self._collect_and_report_iteration_metrics(tmp_batch, iteration_time_ms)
-
                 tmp_batch.next_batch_sampling_info = (
                     self.tp_worker.cur_sampling_info if batch else None
                 )
@@ -1070,6 +1100,20 @@ class Scheduler(
                 self.process_batch_result(
                     tmp_batch, tmp_result, batch.launch_done if batch else None
                 )
+
+                # Report metrics for the batch that just completed using precise GPU time if available
+                gpu_elapsed_ms = getattr(tmp_batch, 'gpu_elapsed_ms', None)
+                if gpu_elapsed_ms is not None:
+                    # Attach scheduler interval since last process result if available
+                    since_last_ms = getattr(tmp_batch, 'since_last_process_ms', None)
+                    if since_last_ms is not None:
+                        tmp_batch.scheduler_interval_ms = since_last_ms
+                    self._collect_and_report_iteration_metrics(tmp_batch, gpu_elapsed_ms)
+                elif hasattr(tmp_batch, 'iteration_start_time'):
+                    # Fallback to wall-clock time if GPU elapsed is unavailable
+                    batch_end_time = time.perf_counter()
+                    iteration_time_ms = (batch_end_time - tmp_batch.iteration_start_time) * 1000
+                    self._collect_and_report_iteration_metrics(tmp_batch, iteration_time_ms)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -2219,6 +2263,8 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
         launch_done: Optional[threading.Event] = None,
     ):
+        
+
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result, launch_done)
             for req in batch.reqs:
@@ -2246,6 +2292,17 @@ class Scheduler(
             self.set_next_batch_sampling_info_done(batch)
 
         self.maybe_send_health_check_signal()
+
+        # Update the last completed timestamp and record interval on batch for metrics
+        # Measure time interval since the last completed process_batch_result
+        last_interval_ms = None
+        now = time.perf_counter()
+        if self._last_process_result_end_time is not None:
+            last_interval_ms = (now - self._last_process_result_end_time) * 1000
+        
+        self._last_process_result_end_time = now
+        if last_interval_ms is not None:
+            setattr(batch, "since_last_process_ms", last_interval_ms)
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ct:

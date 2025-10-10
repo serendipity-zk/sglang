@@ -4,6 +4,7 @@ Unified metrics state and reporting for scheduler and UI.
 This module serves as the single source of truth for:
 - Iteration-level metrics (batch size, KV cache, timing, queue status)
 - UI display metrics (latest iteration data for dashboard)
+- Prefill chunking metrics (tracking chunk pairs for prefill requests)
 
 Supports dual output:
 1. Log to standard logger (redirected to log file with other logs)

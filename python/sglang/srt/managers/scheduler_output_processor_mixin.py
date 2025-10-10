@@ -53,9 +53,11 @@ class SchedulerOutputProcessorMixin:
             )
 
             if self.enable_overlap:
-                logits_output, next_token_ids, _ = (
+                logits_output, next_token_ids, _, gpu_elapsed_ms = (
                     self.tp_worker.resolve_last_batch_result(launch_done)
                 )
+                # Store precise GPU time on the batch for metrics reporting
+                batch.gpu_elapsed_ms = gpu_elapsed_ms
             else:
                 # Move next_token_ids and logprobs to cpu
                 next_token_ids = next_token_ids.tolist()
@@ -211,9 +213,11 @@ class SchedulerOutputProcessorMixin:
         self.num_generated_tokens += len(batch.reqs)
 
         if self.enable_overlap:
-            logits_output, next_token_ids, can_run_cuda_graph = (
+            logits_output, next_token_ids, can_run_cuda_graph, gpu_elapsed_ms = (
                 self.tp_worker.resolve_last_batch_result(launch_done)
             )
+            # Store precise GPU time on the batch for metrics reporting
+            batch.gpu_elapsed_ms = gpu_elapsed_ms
             next_token_logprobs = logits_output.next_token_logprobs
         elif batch.spec_algorithm.is_none():
             # spec decoding handles output logprobs inside verify process.

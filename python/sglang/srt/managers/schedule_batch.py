@@ -1865,7 +1865,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def copy(self):
-        # Only contain fields that will be used by process_batch_result
+        # Only contain fields that will be used by process_batch_result and metrics collection
+        # Note: Avoid copying super huge tensors/pools that are not needed
         return ScheduleBatch(
             reqs=self.reqs,
             model_config=self.model_config,
@@ -1880,6 +1881,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             iteration_start_time=self.iteration_start_time,
+            # Fields used for metrics collection (scheduler.py:700-750)
+            extend_num_tokens=self.extend_num_tokens,  # Used to calculate prefill_tokens
+            input_ids=self.input_ids,  # Small tensor, used for input_id_len metric
+            # Stable prefill lengths for metrics in overlap schedule
+            prefix_lens=self.prefix_lens,
+            extend_lens=self.extend_lens,
         )
 
     def _evict_tree_cache_if_needed(self, num_tokens: int):

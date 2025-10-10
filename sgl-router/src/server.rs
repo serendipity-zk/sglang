@@ -375,19 +375,76 @@ async fn worker_stats(
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
 
+    // Extract prefill chunk pairs (list of [current_chunk, cumulative_prefill])
+    let prefill_chunk_pairs = stats
+        .get("prefill_chunk_pairs")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|pair| {
+                    pair.as_array().and_then(|p| {
+                        if p.len() == 2 {
+                            Some((
+                                p[0].as_i64().unwrap_or(0),
+                                p[1].as_i64().unwrap_or(0),
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+
     // Detailed debug logging
-    tracing::error!(
-        "[WORKER_STATS] worker={} | iter={} | batch_tokens={} | num_reqs={} | \
-         kv_usage={:.2}% | iter_time={:.2}ms | queue={} | mode={}",
-        worker_id,
-        iteration_num,
-        batch_size_tokens,
-        num_requests,
-        kv_cache_usage_pct * 100.0,
-        iteration_time_ms,
-        waiting_queue_size,
-        forward_mode
-    );
+    if let Some(pairs) = &prefill_chunk_pairs {
+        if !pairs.is_empty() {
+            let pairs_str = pairs
+                .iter()
+                .map(|(chunk, cumul)| format!("({},{})", chunk, cumul))
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::error!(
+                "[WORKER_STATS] worker={} | iter={} | batch_tokens={} | num_reqs={} | \
+                 kv_usage={:.2}% | iter_time={:.2}ms | queue={} | mode={} | prefill_chunks=[{}]",
+                worker_id,
+                iteration_num,
+                batch_size_tokens,
+                num_requests,
+                kv_cache_usage_pct * 100.0,
+                iteration_time_ms,
+                waiting_queue_size,
+                forward_mode,
+                pairs_str
+            );
+        } else {
+            tracing::error!(
+                "[WORKER_STATS] worker={} | iter={} | batch_tokens={} | num_reqs={} | \
+                 kv_usage={:.2}% | iter_time={:.2}ms | queue={} | mode={}",
+                worker_id,
+                iteration_num,
+                batch_size_tokens,
+                num_requests,
+                kv_cache_usage_pct * 100.0,
+                iteration_time_ms,
+                waiting_queue_size,
+                forward_mode
+            );
+        }
+    } else {
+        tracing::error!(
+            "[WORKER_STATS] worker={} | iter={} | batch_tokens={} | num_reqs={} | \
+             kv_usage={:.2}% | iter_time={:.2}ms | queue={} | mode={}",
+            worker_id,
+            iteration_num,
+            batch_size_tokens,
+            num_requests,
+            kv_cache_usage_pct * 100.0,
+            iteration_time_ms,
+            waiting_queue_size,
+            forward_mode
+        );
+    }
 
     // TODO: Update worker metadata in registry for load balancing
     // state.context.worker_registry.update_stats(worker_id, stats);
