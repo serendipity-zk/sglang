@@ -230,6 +230,11 @@ class ServerArgs:
     enable_trace: bool = False
     oltp_traces_endpoint: str = "localhost:4317"
 
+    # Iteration metrics reporting
+    enable_iteration_metrics: bool = True
+    router_metrics_url: Optional[str] = None
+    iteration_metrics_interval: int = 1
+
     # API related
     api_key: Optional[str] = None
     served_model_name: Optional[str] = None
@@ -1611,6 +1616,26 @@ class ServerArgs:
             type=str,
             default="localhost:4317",
             help="Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port>",
+        )
+
+        # Iteration metrics
+        parser.add_argument(
+            "--enable-iteration-metrics",
+            action="store_true",
+            default=ServerArgs.enable_iteration_metrics,
+            help="Enable per-iteration metrics reporting (file logging and optional HTTP to router)",
+        )
+        parser.add_argument(
+            "--router-metrics-url",
+            type=str,
+            default=ServerArgs.router_metrics_url,
+            help="Router URL for sending iteration metrics via HTTP (e.g., http://router:8000). Optional.",
+        )
+        parser.add_argument(
+            "--iteration-metrics-interval",
+            type=int,
+            default=ServerArgs.iteration_metrics_interval,
+            help="Report iteration metrics every N iterations (default: 1 = every iteration)",
         )
 
         # API related

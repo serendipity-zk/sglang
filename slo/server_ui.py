@@ -89,7 +89,7 @@ def render(name: str, stats: Dict[str, object], url: str, stale: bool = False) -
         lines.append(f"Input Tokens:        {it}")
     if gen_tps is not None:
         lines.append(f"Gen Throughput:      {gen_tps:.2f} tok/s")
-
+    lines.append(str(stats))
     # Render in one write to reduce flicker
     sys.stdout.write("\x1b[?25l")  # hide cursor
     clear(full=True)

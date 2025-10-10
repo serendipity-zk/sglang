@@ -117,7 +117,6 @@ from sglang.srt.utils import (
 from sglang.srt.warmup import execute_warmups
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
-from sglang.srt.ui import server_ui as _server_ui
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -467,122 +466,33 @@ async def get_load():
     return await _global_state.tokenizer_manager.get_load()
 
 
+
+
 @app.get("/ui_stats")
 async def ui_stats():
     """Lightweight UI stats for local TUI client.
 
-    Returns JSON with:
-      - accepted_requests: cumulative accepted request count (including batch expanded)
-      - last_batch_size: last observed batch size
+    Returns JSON with latest iteration metrics from the scheduler:
+      - batch_size_tokens: current batch size in tokens
+      - num_requests: current number of requests in batch
+      - kv_cache metrics: usage, capacity, availability
+      - iteration_time_ms: latest iteration execution time
+      - waiting_queue_size: number of waiting requests
+      - forward_mode: batch forward mode (EXTEND/DECODE)
     """
-    stats = _server_ui.snapshot()
-    # Aggregate scheduler-derived stats across DP ranks, similar to SchedulerMetricsMixin
-    running_bs = None
-    queue_reqs = None
-    used_tokens = None
-    gen_tput = None
-    token_capacity = None
-    try:
-        loads = await _global_state.tokenizer_manager.get_load()
-        running_total = 0
-        waiting_total = 0
-        tokens_total = 0
-        for ld in loads:
-            running_total += max(0, int(ld.num_reqs) - int(ld.num_waiting_reqs))
-            waiting_total += int(ld.num_waiting_reqs)
-            tokens_total += int(ld.num_tokens)
-        running_bs = running_total
-        queue_reqs = waiting_total
-        used_tokens = tokens_total
-    except Exception:
-        pass
 
-    prefill_tokens = None
-    decode_tokens = None
-    kv_used_sum = None
-    try:
-        internal_states = await _global_state.tokenizer_manager.get_internal_state()
-        cap_sum = 0
-        tput_sum = 0.0
-        prefill_sum = 0
-        decode_sum = 0
-        input_tokens_sum = 0
-        last_input_tics: List[float] = []
-        last_prefill_tics = []
-        last_decode_tics = []
-        for st in internal_states:
-            mu = st.get("memory_usage", {})
-            cap_sum += int(mu.get("token_capacity", 0) or 0)
-            tput_sum += float(st.get("last_gen_throughput", 0.0) or 0.0)
-            prefill_sum += int(st.get("last_prefill_tokens", 0) or 0)
-            decode_sum += int(st.get("num_running_reqs", 0) or 0)
-            kv_used_sum = (kv_used_sum or 0) + int(st.get("kv_tokens_used", 0) or 0)
-            input_tokens_sum += int(st.get("input_tokens", 0) or 0)
-            if "last_input_tic" in st:
-                try:
-                    last_input_tics.append(float(st["last_input_tic"]))
-                except Exception:
-                    pass
-            if "last_prefill_tic" in st:
-                try:
-                    last_prefill_tics.append(float(st["last_prefill_tic"]))
-                except Exception:
-                    pass
-            if "last_decode_tic" in st:
-                try:
-                    last_decode_tics.append(float(st["last_decode_tic"]))
-                except Exception:
-                    pass
-        token_capacity = cap_sum if cap_sum > 0 else None
-        gen_tput = tput_sum
-        # Determine whether to show both (mixed) or only the most recent step
-        mixed_enabled = getattr(_global_state.tokenizer_manager.server_args, "enable_mixed_chunk", False)
-        if mixed_enabled:
-            prefill_tokens = prefill_sum
-            decode_tokens = decode_sum
-        else:
-            last_prefill_time = max(last_prefill_tics) if last_prefill_tics else 0.0
-            last_decode_time = max(last_decode_tics) if last_decode_tics else 0.0
-            if last_prefill_time >= last_decode_time:
-                prefill_tokens = prefill_sum
-                decode_tokens = 0
-            else:
-                prefill_tokens = 0
-                decode_tokens = decode_sum
-    except Exception:
-        pass
+    # Get latest iteration metrics snapshot from scheduler process via IPC
+    logger.info("Getting stats from scheduler")
+    stats = await _global_state.tokenizer_manager.get_ui_metrics()
+    logger.info(f"Got stats from scheduler: {stats}")
 
-    # Add a couple of useful identifiers without extra work
+    # Add server identification
     out = {
         **stats,
         "model": _global_state.tokenizer_manager.served_model_name,
         "pid": os.getpid(),
     }
-    if running_bs is not None:
-        out["running_batch_size"] = running_bs
-    if queue_reqs is not None:
-        out["queue_reqs"] = queue_reqs
-    if used_tokens is not None:
-        out["used_tokens"] = used_tokens
-    if token_capacity is not None and token_capacity > 0:
-        out["token_capacity"] = token_capacity
-        # Use precise KV occupancy across DP ranks if available
-        if kv_used_sum is not None:
-            out["kv_tokens_used"] = int(kv_used_sum)
-            out["kv_usage_pct"] = round(100.0 * int(kv_used_sum) / token_capacity, 2)
-    if gen_tput is not None:
-        out["gen_throughput_tps"] = round(gen_tput, 2)
-    if prefill_tokens is not None:
-        out["prefill_tokens"] = prefill_tokens
-    if decode_tokens is not None:
-        out["decode_tokens"] = decode_tokens
-    if prefill_tokens is not None and decode_tokens is not None:
-        out["token_batch_size"] = int(prefill_tokens) + int(decode_tokens)
-    # Runner-derived embedding input tokens (most recent forward)
-    if 'input_tokens_sum' in locals() and input_tokens_sum:
-        out["input_tokens"] = int(input_tokens_sum)
-        if last_input_tics:
-            out["last_input_tic"] = max(last_input_tics)
+
     return out
 
 

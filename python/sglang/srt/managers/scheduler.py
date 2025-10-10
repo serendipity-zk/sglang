@@ -82,6 +82,8 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     GetLoadReqInput,
     GetLoadReqOutput,
+    GetUIMetricsReqInput,
+    GetUIMetricsReqOutput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -610,8 +612,120 @@ class Scheduler(
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (MultiTokenizerRegisterReq, self.register_multi_tokenizer),
                 (GetLoadReqInput, self.get_load),
+                (GetUIMetricsReqInput, self.get_ui_metrics),
             ]
         )
+
+        # Initialize iteration metrics reporting
+        self.worker_id = self._build_worker_id()
+        if server_args.enable_iteration_metrics:
+            self._init_iteration_metrics()
+
+    def _build_worker_id(self) -> str:
+        """Build unique worker identifier."""
+        worker_id = f"{self.server_args.host}:{self.server_args.port}"
+        if self.tp_size > 1:
+            worker_id += f":tp{self.tp_rank}"
+        if self.dp_size > 1 and self.dp_rank is not None:
+            worker_id += f":dp{self.dp_rank}"
+        return worker_id
+
+    def _get_stat_file_path(self) -> Optional[str]:
+        """
+        Get the .stat file path based on main log configuration.
+
+        Pattern: If main log is /path/to/server.log,
+                 stat file is /path/to/server.log.stat
+        """
+        import tempfile
+        from pathlib import Path
+
+        # Try to determine the main log file path from Python logging
+        root_logger = logging.getLogger()
+        for handler in root_logger.handlers:
+            if isinstance(handler, logging.FileHandler):
+                base_log_path = handler.baseFilename
+                stat_path = f"{base_log_path}.stat"
+                return stat_path
+
+        # Fallback: use temp directory
+        stat_path = (
+            Path(tempfile.gettempdir())
+            / f"sglang_server_{self.worker_id.replace(':', '_')}.stat"
+        )
+        return str(stat_path)
+
+    def _init_iteration_metrics(self) -> None:
+        """Initialize iteration metrics reporting."""
+        from sglang.srt.ui import iteration_metrics
+
+        # Determine stat file path
+        stat_file_path = self._get_stat_file_path()
+
+        iteration_metrics.initialize(
+            worker_id=self.worker_id,
+            stat_file_path=stat_file_path,
+            router_url=self.server_args.router_metrics_url,
+            report_interval=self.server_args.iteration_metrics_interval,
+        )
+        logger.info(f"Iteration metrics enabled for worker: {self.worker_id}")
+
+    def _collect_and_report_iteration_metrics(
+        self, batch: ScheduleBatch, iteration_time_ms: float
+    ) -> None:
+        """
+        Collect iteration metrics and report via iteration_metrics module.
+
+        Args:
+            batch: The batch that was just executed
+            iteration_time_ms: Actual execution time in milliseconds
+        """
+        if not self.server_args.enable_iteration_metrics:
+            return
+
+        from sglang.srt.ui import iteration_metrics
+
+        logger.info(f"[METRICS] Collecting metrics for batch with {len(batch.reqs)} requests")
+
+        # Get KV cache stats
+        num_used, token_usage, available_size, evictable_size = self._get_token_info()
+
+        # Determine prefill/decode token counts based on forward mode
+        from sglang.srt.managers.schedule_batch import ForwardMode
+
+        prefill_tokens = 0
+        decode_tokens = 0
+        if batch.forward_mode == ForwardMode.EXTEND:
+            prefill_tokens = batch.extend_num_tokens if batch.extend_num_tokens else 0
+        elif batch.forward_mode == ForwardMode.DECODE:
+            decode_tokens = len(batch.reqs)
+        elif batch.forward_mode == ForwardMode.MIXED:
+            # Mixed mode: has both prefill and decode
+            prefill_tokens = batch.extend_num_tokens if batch.extend_num_tokens else 0
+            decode_tokens = len(batch.decoding_reqs) if batch.decoding_reqs else 0
+
+        total_tokens = prefill_tokens + decode_tokens
+
+        # Build metrics payload (field names match UI expectations)
+        metrics = {
+            # UI expects: running_batch_size, queue_reqs, kv_tokens_used, token_capacity
+            "running_batch_size": len(batch.reqs),
+            "queue_reqs": len(self.waiting_queue),
+            "kv_tokens_used": num_used,
+            "token_capacity": self.max_total_num_tokens,
+            "kv_usage_pct": round(token_usage * 100, 2),  # Convert to percentage
+            "prefill_tokens": prefill_tokens,
+            "decode_tokens": decode_tokens,
+            "token_batch_size": total_tokens,
+            "iteration_time_ms": round(iteration_time_ms, 2),
+            "forward_mode": batch.forward_mode.name if batch.forward_mode else "UNKNOWN",
+            # Keep some old names for compatibility
+            "batch_size_tokens": total_tokens,
+            "num_requests": len(batch.reqs),
+        }
+
+        # Report (non-blocking)
+        iteration_metrics.report_iteration(metrics)
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -867,8 +981,11 @@ class Scheduler(
 
     @DynamicGradMode()
     def event_loop_normal(self):
+        
+        afeawgeaweg
         """A normal scheduler loop."""
         while True:
+            logger.info("Event loop normal")
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
@@ -880,7 +997,15 @@ class Scheduler(
                     trace_event("schedule", req.rid)
 
             if batch:
+                # Measure iteration time
+                batch_start_time = time.perf_counter()
                 result = self.run_batch(batch)
+                batch_end_time = time.perf_counter()
+                iteration_time_ms = (batch_end_time - batch_start_time) * 1000
+                logger.info(f"before report metrics: {iteration_time_ms}")
+                # Report metrics
+                self._collect_and_report_iteration_metrics(batch, iteration_time_ms)
+
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
@@ -890,6 +1015,7 @@ class Scheduler(
 
     @DynamicGradMode()
     def event_loop_overlap(self):
+        logger.info("Event loop overlap")
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue = deque()
 
@@ -906,6 +1032,8 @@ class Scheduler(
 
             if batch:
                 batch.launch_done = threading.Event()
+                # Mark the start time for this batch
+                batch.iteration_start_time = time.perf_counter()
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
 
@@ -917,11 +1045,24 @@ class Scheduler(
                         forward_mode=ForwardMode.DUMMY_FIRST,
                         next_batch_sampling_info=self.tp_worker.cur_sampling_info,
                     )
+                    tmp_batch.iteration_start_time = time.perf_counter()
                     self.process_batch_result(tmp_batch, None, batch.launch_done)
 
             if self.last_batch:
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
+                logger.info("Event loop overlap2")
+                # Measure time for completed batch
+                if hasattr(tmp_batch, 'iteration_start_time'):
+                    logger.info(tmp_batch)
+                    logger.info("Event loop overlap3")
+                    batch_end_time = time.perf_counter()
+                    iteration_time_ms = (batch_end_time - tmp_batch.iteration_start_time) * 1000
+
+                    logger.info(f"before report metrics2: {iteration_time_ms}")
+                    # Report metrics for the batch that just completed
+                    self._collect_and_report_iteration_metrics(tmp_batch, iteration_time_ms)
+
                 tmp_batch.next_batch_sampling_info = (
                     self.tp_worker.cur_sampling_info if batch else None
                 )
@@ -937,6 +1078,7 @@ class Scheduler(
 
     @DynamicGradMode()
     def event_loop_pp(self):
+        afeawgeaweg
         """A non-overlap scheduler loop for pipeline parallelism."""
         mbs = [None] * self.pp_size
         last_mbs = [None] * self.pp_size
@@ -959,7 +1101,14 @@ class Scheduler(
                 self.cur_batch = mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
+                    # Measure iteration time for this micro-batch
+                    batch_start_time = time.perf_counter()
                     result = self.run_batch(self.cur_batch)
+                    batch_end_time = time.perf_counter()
+                    iteration_time_ms = (batch_end_time - batch_start_time) * 1000
+                    logger.info(f"before report metrics3: {iteration_time_ms}")
+                    # Report metrics for this micro-batch
+                    self._collect_and_report_iteration_metrics(self.cur_batch, iteration_time_ms)
 
                 # (last rank) send the outputs to the next step
                 if self.pp_group.is_last_rank:
@@ -1401,6 +1550,12 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
+
+        # Increment accepted requests counter for metrics
+        if self.server_args.enable_iteration_metrics:
+            from sglang.srt.ui import iteration_metrics
+            iteration_metrics.inc_accepted_requests(1)
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -1760,7 +1915,7 @@ class Scheduler(
         if need_dp_attn_preparation:
             self.maybe_handle_dp_balance_data()
             ret = self.prepare_mlp_sync_batch(ret)
-
+        
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -2450,6 +2605,13 @@ class Scheduler(
             num_waiting_reqs=num_waiting_reqs,
             num_tokens=num_tokens,
         )
+
+    def get_ui_metrics(self, recv_req: GetUIMetricsReqInput = None) -> GetUIMetricsReqOutput:
+        """Get UI metrics from the iteration_metrics module."""
+        from sglang.srt.ui import iteration_metrics
+
+        metrics = iteration_metrics.get_ui_snapshot()
+        return GetUIMetricsReqOutput(metrics=metrics)
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(global_server_args_dict)

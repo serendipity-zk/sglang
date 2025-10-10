@@ -1441,3 +1441,13 @@ class GetLoadReqOutput:
 @dataclass
 class WatchLoadUpdateReq:
     loads: List[GetLoadReqOutput]
+
+
+@dataclass
+class GetUIMetricsReqInput:
+    pass
+
+
+@dataclass
+class GetUIMetricsReqOutput:
+    metrics: Dict[str, Any]

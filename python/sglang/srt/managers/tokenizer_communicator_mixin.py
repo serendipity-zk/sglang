@@ -34,6 +34,8 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReqOutput,
     GetLoadReqInput,
     GetLoadReqOutput,
+    GetUIMetricsReqInput,
+    GetUIMetricsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -202,6 +204,9 @@ class TokenizerCommunicatorMixin:
         self.get_load_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size, mode="watching"
         )
+        self.get_ui_metrics_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -279,6 +284,10 @@ class TokenizerCommunicatorMixin:
                 (
                     GetLoadReqOutput,
                     self.get_load_communicator.handle_recv,
+                ),
+                (
+                    GetUIMetricsReqOutput,
+                    self.get_ui_metrics_communicator.handle_recv,
                 ),
             ]
         )
@@ -588,3 +597,12 @@ class TokenizerCommunicatorMixin:
     async def get_load(self: TokenizerManager) -> List[GetLoadReqOutput]:
         req = GetLoadReqInput()
         return await self.get_load_communicator(req)
+
+    async def get_ui_metrics(self: TokenizerManager) -> Dict[str, Any]:
+        """Get UI metrics from the scheduler."""
+        req = GetUIMetricsReqInput()
+        responses: List[GetUIMetricsReqOutput] = await self.get_ui_metrics_communicator(
+            req
+        )
+        # Return metrics from first DP rank (they should all have similar UI metrics)
+        return responses[0].metrics if responses else {}

@@ -329,6 +329,72 @@ async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Respons
     state.router.get_worker_loads().await
 }
 
+// Worker stats endpoint for receiving metrics from workers
+async fn worker_stats(
+    State(_state): State<Arc<AppState>>,
+    Json(stats): Json<serde_json::Value>,
+) -> Response {
+    // Extract key metrics
+    let worker_id = stats
+        .get("worker_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    let batch_size_tokens = stats
+        .get("batch_size_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    let num_requests = stats
+        .get("num_requests")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    let kv_cache_usage_pct = stats
+        .get("kv_cache_usage_pct")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    let iteration_time_ms = stats
+        .get("iteration_time_ms")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    let waiting_queue_size = stats
+        .get("waiting_queue_size")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    let forward_mode = stats
+        .get("forward_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("UNKNOWN");
+
+    let iteration_num = stats
+        .get("iteration_num")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+
+    // Detailed debug logging
+    tracing::error!(
+        "[WORKER_STATS] worker={} | iter={} | batch_tokens={} | num_reqs={} | \
+         kv_usage={:.2}% | iter_time={:.2}ms | queue={} | mode={}",
+        worker_id,
+        iteration_num,
+        batch_size_tokens,
+        num_requests,
+        kv_cache_usage_pct * 100.0,
+        iteration_time_ms,
+        waiting_queue_size,
+        forward_mode
+    );
+
+    // TODO: Update worker metadata in registry for load balancing
+    // state.context.worker_registry.update_stats(worker_id, stats);
+
+    (StatusCode::OK, "Stats received").into_response()
+}
+
 // ---------- Worker management endpoints (RESTful) ----------
 
 /// POST /workers - Add a new worker with full configuration
@@ -516,7 +582,8 @@ pub fn build_app(
         .route("/remove_worker", post(remove_worker))
         .route("/list_workers", get(list_workers))
         .route("/flush_cache", post(flush_cache))
-        .route("/get_loads", get(get_loads));
+        .route("/get_loads", get(get_loads))
+        .route("/worker_stats", post(worker_stats));
 
     // Worker management routes
     let worker_routes = Router::new()

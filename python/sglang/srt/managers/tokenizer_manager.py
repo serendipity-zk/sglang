@@ -371,18 +371,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
         created_time = time.time()
         self.auto_create_handle_loop()
         obj.normalize_batch_and_arguments()
-        # Update lightweight UI stats: accepted requests and last batch size
-        # Only count when obj.log_metrics is True (exclude health checks, etc.)
-        try:
-            if getattr(obj, "log_metrics", True):
-                from sglang.srt.ui import server_ui
-
-                batch_sz = max(1, int(getattr(obj, "batch_size", 1) or 1))
-                server_ui.inc_accepted(batch_sz)
-                server_ui.set_last_batch_size(batch_sz)
-        except Exception:
-            # Never fail serving due to UI bookkeeping
-            pass
+        # Note: UI stats are now handled by iteration_metrics in scheduler
+        # No need to track accepted requests here anymore
 
         if self.server_args.tokenizer_worker_num > 1:
             # Modify rid, add worker_id
