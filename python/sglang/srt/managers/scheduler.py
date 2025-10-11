@@ -710,8 +710,8 @@ class Scheduler(
         elif batch.forward_mode == ForwardMode.DECODE:
             decode_tokens = len(batch.reqs)
         elif batch.forward_mode == ForwardMode.MIXED:
-            # Mixed mode: has both prefill and decode
-            prefill_tokens = batch.extend_num_tokens if batch.extend_num_tokens else 0
+            # Mixed mode: has both prefill and decode, where prefill should exclude decode tokens
+            prefill_tokens = batch.extend_num_tokens - len(batch.decoding_reqs) if batch.extend_num_tokens else 0
             decode_tokens = len(batch.decoding_reqs) if batch.decoding_reqs else 0
 
         total_tokens = prefill_tokens + decode_tokens

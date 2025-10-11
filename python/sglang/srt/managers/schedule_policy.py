@@ -30,6 +30,8 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.server_args import ServerArgs
 
+import logging
+logger = logging.getLogger(__name__) 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
@@ -431,7 +433,8 @@ class PrefillAdder:
         self.log_input_tokens += extend_input_len
 
     def add_chunked_req(self, req: Req):
-        _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
+        logger.info(f"add_chunked_req: {req.extend_input_len}, {self.rem_chunk_tokens}, {int(self.rem_total_tokens)}")
+        _rem_tokens = max(min(self.rem_chunk_tokens, int(self.rem_total_tokens)), 0)
         truncated = req.extend_input_len > _rem_tokens
         req.extend_input_len = min(req.extend_input_len, _rem_tokens)
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
@@ -593,6 +596,7 @@ class PrefillAdder:
                     req.swa_uuid_for_lock = swa_uuid_for_lock
                 else:
                     self.tree_cache.inc_lock_ref(req.last_node)
+                logger.info(f"add_one_req non-chunked: {req.extend_input_len}, {input_tokens}")
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -629,6 +633,7 @@ class PrefillAdder:
                     req.swa_uuid_for_lock = swa_uuid_for_lock
                 else:
                     self.tree_cache.inc_lock_ref(req.last_node)
+                logger.info(f"add_one_req chunked: {req.extend_input_len}, {trunc_len}")
                 self._update_prefill_budget(prefix_len, trunc_len, 0)
 
         return self.budget_state()
