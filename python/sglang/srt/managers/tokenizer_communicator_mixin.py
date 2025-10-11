@@ -57,6 +57,8 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
+    SetTPOTReqInput,
+    SetTPOTReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
@@ -207,6 +209,9 @@ class TokenizerCommunicatorMixin:
         self.get_ui_metrics_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.set_tpot_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
 
         self._result_dispatcher += self._get_communicator_dispatcher()
 
@@ -288,6 +293,10 @@ class TokenizerCommunicatorMixin:
                 (
                     GetUIMetricsReqOutput,
                     self.get_ui_metrics_communicator.handle_recv,
+                ),
+                (
+                    SetTPOTReqOutput,
+                    self.set_tpot_communicator.handle_recv,
                 ),
             ]
         )
@@ -606,3 +615,9 @@ class TokenizerCommunicatorMixin:
         )
         # Return metrics from first DP rank (they should all have similar UI metrics)
         return responses[0].metrics if responses else {}
+
+    async def set_tpot(self: "TokenizerManager", obj: SetTPOTReqInput) -> List[bool]:
+        """Set a global TPOT value on the scheduler(s). Returns per-DP success flags."""
+        self.auto_create_handle_loop()
+        responses: List[SetTPOTReqOutput] = await self.set_tpot_communicator(obj)
+        return [r.success for r in responses]

@@ -105,6 +105,8 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
+    SetTPOTReqInput,
+    SetTPOTReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
     TokenizedEmbeddingReqInput,
@@ -574,6 +576,9 @@ class Scheduler(
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
 
+        # Global TPOT (cycle time) regulator; set via /set_tpot
+        self.tpot: Optional[float] = None
+
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -610,6 +615,7 @@ class Scheduler(
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
+                (SetTPOTReqInput, self.set_tpot),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
@@ -2784,6 +2790,17 @@ class Scheduler(
             updated=True,
             server_args=global_server_args_dict,
         )
+
+    def set_tpot(self, recv_req: SetTPOTReqInput) -> SetTPOTReqOutput:
+        """Set a global TPOT value on the scheduler. Logs for visibility."""
+        try:
+            self.tpot = float(recv_req.tpot)
+            logger.info(f"[Scheduler] set_tpot received: tpot={self.tpot}")
+            return SetTPOTReqOutput(success=True, tpot=self.tpot, message="ok")
+        except Exception as e:
+            logger.error(f"[Scheduler] set_tpot error: {e}")
+            current = self.tpot if hasattr(self, "tpot") and self.tpot is not None else 0.0
+            return SetTPOTReqOutput(success=False, tpot=float(current), message=str(e))
 
     def handle_rpc_request(self, recv_req: RpcReqInput):
         # Handle RPC requests

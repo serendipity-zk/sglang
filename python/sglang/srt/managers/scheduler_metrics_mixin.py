@@ -118,6 +118,13 @@ class SchedulerMetricsMixin:
             f"{token_msg}"
         )
 
+        # If a global TPOT regulator is set on the scheduler, include it in the log
+        try:
+            if getattr(self, "tpot", None) is not None:
+                f += f"tpot={float(self.tpot):.3f}, "
+        except Exception:
+            pass
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "

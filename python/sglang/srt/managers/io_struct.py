@@ -1451,3 +1451,18 @@ class GetUIMetricsReqInput:
 @dataclass
 class GetUIMetricsReqOutput:
     metrics: Dict[str, Any]
+
+
+# ==== Global TPOT control (cycle time regulator) ====
+@dataclass
+class SetTPOTReqInput:
+    # Global target time per operation/token or cycle time regulator
+    # Unit is arbitrary; commonly milliseconds.
+    tpot: float
+
+
+@dataclass
+class SetTPOTReqOutput:
+    success: bool
+    tpot: float
+    message: Optional[str] = None

@@ -92,6 +92,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
+    # New: global TPOT tuning
+    SetTPOTReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerManager,
@@ -502,6 +504,21 @@ async def ui_stats():
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
     return res
+
+
+# example usage:
+# curl -s -X POST http://localhost:30000/set_tpot -H "Content-Type: application/json" -d '{"tpot": 25.0}'
+@app.api_route("/set_tpot", methods=["POST", "PUT"])
+async def set_tpot(obj: SetTPOTReqInput, request: Request):
+    """Set a global TPOT value (cycle time regulator) on the scheduler.
+
+    Accepts a JSON body like: {"tpot": 25.0}
+    """
+    logger.info(f"[HTTP] /set_tpot received: tpot={obj.tpot}")
+    results = await _global_state.tokenizer_manager.set_tpot(obj)
+    all_ok = all(results)
+    status = HTTPStatus.OK if all_ok else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse({"success": all_ok, "tpot": obj.tpot}, status_code=status)
 
 
 # fastapi implicitly converts json in the request to obj (dataclass)
