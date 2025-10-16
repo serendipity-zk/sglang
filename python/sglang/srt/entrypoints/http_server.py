@@ -484,9 +484,7 @@ async def ui_stats():
     """
 
     # Get latest iteration metrics snapshot from scheduler process via IPC
-    logger.info("Getting stats from scheduler")
     stats = await _global_state.tokenizer_manager.get_ui_metrics()
-    logger.info(f"Got stats from scheduler: {stats}")
 
     # Add server identification
     out = {

@@ -695,8 +695,6 @@ class Scheduler(
 
         from sglang.srt.ui import iteration_metrics
 
-        logger.info(f"[METRICS] Collecting metrics for batch with {len(batch.reqs)} requests")
-
         # Get KV cache stats
         num_used, token_usage, available_size, evictable_size = self._get_token_info()
 
@@ -1098,7 +1096,6 @@ class Scheduler(
             if self.last_batch:
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
-                logger.info("Event loop overlap2")
                 tmp_batch.next_batch_sampling_info = (
                     self.tp_worker.cur_sampling_info if batch else None
                 )

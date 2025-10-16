@@ -70,7 +70,6 @@ class _IterationMetricsState:
 
     def report_iteration(self, metrics: Dict) -> None:
         """Report metrics for one iteration (non-blocking)."""
-        logger.info(f"Reporting metrics: {metrics}")
 
         with self._lock:
             self._iteration_count += 1
@@ -112,18 +111,12 @@ class _IterationMetricsState:
             )
             if not response.ok:
                 logger.info(f"Router metrics HTTP error: {response.status_code}")
-            else:
-                logger.info(f"Send metrics to router: {metrics}")
-        except requests.exceptions.Timeout:
-            logger.info("Router metrics request timeout (non-critical)")
         except Exception as e:
             logger.info(f"Failed to send metrics to router: {e}")
 
     def get_ui_snapshot(self) -> Dict:
         """Get latest metrics snapshot for UI display."""
-        logger.info("Getting UI snapshot inside 22332")
         with self._lock:
-            logger.info(f"Get UI snapshot: {self._latest_metrics}")
             return self._latest_metrics.copy()
 
     def close(self) -> None:
@@ -174,9 +167,7 @@ def report_iteration(metrics: Dict) -> None:
 
 def get_ui_snapshot() -> Dict:
     """Get latest metrics snapshot for UI display."""
-    logger.info("Getting UI snapshot inside")
     if _state is not None:
-        logger.info("Getting UI snapshot inside not none")
         return _state.get_ui_snapshot()
     return {}
 
