@@ -248,7 +248,7 @@ Examples:
                              help='Ratio for train/test split (default: 0.9)')
     train_parser.add_argument('--predictions', '-p', type=str,
                              help='Path to save test set predictions (default: <model>_predictions.json)')
-    train_parser.add_argument('--model-type', type=str, default='ensemble', choices=['linear','polynomial','ensemble','hybrid'],
+    train_parser.add_argument('--model-type', type=str, default='linear', choices=['linear','polynomial','ensemble','hybrid'],
                              help='Model type to train (default: ensemble)')
 
     # Predict command
