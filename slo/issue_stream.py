@@ -29,6 +29,7 @@ import threading
 import json
 import sys
 import os
+import signal
 from typing import List, Optional
 from datetime import datetime
 from collections import deque
@@ -356,31 +357,35 @@ def status_display_thread(
     except Exception:
         pass
     finally:
-        # Final render
-        elapsed_s = max(0.0, time.perf_counter() - start_time)
-        snapshot = stats.snapshot()
-        submitted = snapshot["submitted"]
-        completed = snapshot["completed"]
-        failed = snapshot["failed"]
-        active = snapshot["active"]
-        expected_total = snapshot["expected_total"]
-        percent_complete = (
-            (completed + failed) / expected_total * 100.0 if expected_total > 0 else 0.0
-        )
+        try:
+            # Final render
+            elapsed_s = max(0.0, time.perf_counter() - start_time)
+            snapshot = stats.snapshot()
+            submitted = snapshot["submitted"]
+            completed = snapshot["completed"]
+            failed = snapshot["failed"]
+            active = snapshot["active"]
+            expected_total = snapshot["expected_total"]
+            percent_complete = (
+                (completed + failed) / expected_total * 100.0 if expected_total > 0 else 0.0
+            )
 
-        lines = [
-            "SLO Streaming Issue Runner - Final Stats",
-            "=========================================",
-            f"Total Requests       : {expected_total}",
-            f"Submitted            : {submitted}",
-            f"Active Threads       : {active}",
-            f"Completed / Failed   : {completed} / {failed}",
-            f"Elapsed (s)          : {elapsed_s:.1f}",
-            f"Progress             : {percent_complete:.1f}%",
-            "",
-            f"Log File             : {log_display_path}",
-        ]
-        ui.render(lines, final=True)
+            lines = [
+                "SLO Streaming Issue Runner - Final Stats",
+                "=========================================",
+                f"Total Requests       : {expected_total}",
+                f"Submitted            : {submitted}",
+                f"Active Threads       : {active}",
+                f"Completed / Failed   : {completed} / {failed}",
+                f"Elapsed (s)          : {elapsed_s:.1f}",
+                f"Progress             : {percent_complete:.1f}%",
+                "",
+                f"Log File             : {log_display_path}",
+            ]
+            ui.render(lines, final=True)
+        except Exception:
+            # Suppress errors during shutdown
+            pass
 
 
 def run_trace(
@@ -401,6 +406,18 @@ def run_trace(
     # Build token pool
     token_pool, tokenizer = build_token_pool(text_file, tokenizer_path, 100_000, seed)
     print(f"Token pool length: {len(token_pool)}")
+
+    # Setup stop event for signal handling
+    stop_event = threading.Event()
+
+    def signal_handler(signum, frame):
+        """Handle SIGINT/SIGTERM gracefully."""
+        print("\n[stream] Signal received, shutting down gracefully...")
+        stop_event.set()
+
+    # Register signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     # Build endpoint URL
     native_base = base_url
@@ -444,15 +461,15 @@ def run_trace(
 
     submission_times = deque()
     submission_lock = threading.Lock()
-    stop_event = threading.Event()
 
     # Start status display thread
     start_time = time.perf_counter()
+    status_thread = None
     if enable_ui:
         status_thread = threading.Thread(
             target=status_display_thread,
             args=(stats, submission_times, submission_lock, start_time, stop_event, log_path),
-            daemon=True,
+            daemon=False,  # Changed to False for clean shutdown
         )
         status_thread.start()
 
@@ -537,6 +554,10 @@ def run_trace(
         # Give threads a moment to finish
         if not stats.all_done():
             time.sleep(1.0)
+
+        # Wait for status thread to finish cleanly
+        if status_thread and status_thread.is_alive():
+            status_thread.join(timeout=2.0)
 
     snapshot = stats.snapshot()
     return snapshot["submitted"], snapshot["completed"], snapshot["failed"]
