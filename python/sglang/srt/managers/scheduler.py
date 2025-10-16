@@ -1980,6 +1980,18 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
+        # SLO-aware scheduling: block new prefills if last iteration exceeded TPOT
+        if self.tpot is not None and self.server_args.enable_iteration_metrics:
+            from sglang.srt.ui import iteration_metrics
+            latest_metrics = iteration_metrics.get_ui_snapshot()
+            last_iteration_time = latest_metrics.get("iteration_time_ms")
+            if last_iteration_time is not None and last_iteration_time > self.tpot:
+                # Don't schedule new prefill requests when we're over SLO
+                logger.info(
+                    f"Blocking new prefill: last_iteration_time={last_iteration_time:.2f}ms > tpot={self.tpot:.2f}ms"
+                )
+                return None
+
         # Handle the cases where prefill is not allowed
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0

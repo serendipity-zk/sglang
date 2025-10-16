@@ -182,8 +182,11 @@ def send_streaming_request(
 
     success = False
     first_token_time = None
-    token_times = []
-    token_count = 0
+    all_token_times = []  # Store ALL token arrival times
+    chunk_count = 0  # Number of streaming chunks received
+    output_token_count = 0  # Actual number of output tokens
+    prev_token_count = 0  # Previous token count to detect new tokens
+    output_text = ""  # Accumulated output text
     error_msg = None
 
     try:
@@ -211,18 +214,44 @@ def send_streaming_request(
 
                 try:
                     chunk = json.loads(data_str)
-                    # Track token timing
-                    token_time = time.perf_counter()
-                    token_count += 1
+                    chunk_count += 1
 
-                    if first_token_time is None:
-                        first_token_time = token_time
+                    # Extract actual token count from response
+                    # SGLang native format has 'meta_info' with 'completion_tokens'
+                    if 'meta_info' in chunk and 'completion_tokens' in chunk['meta_info']:
+                        current_token_count = chunk['meta_info']['completion_tokens']
 
-                    # Store up to 10 token times
-                    if len(token_times) < 10:
-                        token_times.append(token_time)
+                        # Record time when we get NEW tokens
+                        if current_token_count > prev_token_count:
+                            token_time = time.perf_counter()
+                            num_new_tokens = current_token_count - prev_token_count
 
-                except json.JSONDecodeError:
+                            if len(all_token_times) == 0:
+                                # First token(s) - no previous time to interpolate from
+                                for _ in range(num_new_tokens):
+                                    all_token_times.append(token_time)
+                                    if first_token_time is None:
+                                        first_token_time = token_time
+                            else:
+                                # Uniformly distribute interval between last token and now
+                                last_time = all_token_times[-1]
+                                interval = token_time - last_time
+
+                                # Assign uniformly spaced times
+                                for i in range(1, num_new_tokens + 1):
+                                    interpolated_time = last_time + (interval * i / num_new_tokens)
+                                    all_token_times.append(interpolated_time)
+
+                            prev_token_count = current_token_count
+
+                        output_token_count = current_token_count
+
+                    # Get output text from server (cumulative)
+                    if 'text' in chunk:
+                        output_text = chunk['text']
+
+                except json.JSONDecodeError as e:
+                    print(f"[DEBUG {request_id}] JSON decode error: {e}, data: {data_str[:100]}")
                     continue
 
         end_time = time.perf_counter()
@@ -233,31 +262,39 @@ def send_streaming_request(
         if first_token_time is not None:
             ttft_ms = (first_token_time - start_time) * 1000
 
-        # Calculate inter-token intervals
-        intervals = []
-        if len(token_times) >= 2:
-            for i in range(1, min(11, len(token_times))):
-                interval_ms = (token_times[i] - token_times[i-1]) * 1000
-                intervals.append(interval_ms)
+        # Calculate inter-token intervals over ALL tokens
+        all_intervals = []
+        if len(all_token_times) >= 2:
+            for i in range(1, len(all_token_times)):
+                interval_ms = (all_token_times[i] - all_token_times[i-1]) * 1000
+                all_intervals.append(interval_ms)
 
-        avg_interval = sum(intervals) / len(intervals) if intervals else None
+        # Average over all tokens
+        avg_interval = sum(all_intervals) / len(all_intervals) if all_intervals else None
 
-        # Build log record
+        # Keep first 10 intervals for printing/logging
+        first_10_intervals = [round(x, 2) for x in all_intervals[:10]]
+
+        # Build log record with logical field ordering
         record = {
             "request_id": request_id,
-            "submit_timestamp": submit_timestamp,
-            "total_duration_ms": total_duration_ms,
+            "input_len": len(prompt_ids),
+            "trace_output_len": decode_tokens,  # Target decode length from trace
+            "real_output_len": output_token_count,  # Actual output tokens generated
             "status": "SUCCESS",
-            "token_count": token_count,
-            "ttft_ms": ttft_ms,
-            "intervals": intervals,
-            "avg_interval_ms": avg_interval,
-            "decode": decode_tokens,
+            "submit_timestamp": submit_timestamp,
+            "total_duration_ms": round(total_duration_ms, 2),
+            "ttft_ms": round(ttft_ms, 2) if ttft_ms is not None else None,
+            "avg_interval_ms": round(avg_interval, 2) if avg_interval is not None else None,
+            "chunk_count": chunk_count,  # Number of streaming chunks
         }
         if ttft is not None:
             record["target_ttft_ms"] = ttft
         if tpot is not None:
             record["target_tpot_ms"] = tpot
+        # Append detailed timing and text at the end
+        record["intervals"] = first_10_intervals
+        record["output_text"] = output_text
 
         success = True
 
@@ -269,17 +306,22 @@ def send_streaming_request(
 
         record = {
             "request_id": request_id,
-            "submit_timestamp": submit_timestamp,
-            "total_duration_ms": total_duration_ms,
+            "input_len": len(prompt_ids),
+            "trace_output_len": decode_tokens,  # Target decode length from trace
+            "real_output_len": output_token_count,  # Actual output tokens before failure
             "status": "FAILED",
             "error": error_msg,
             "exception_type": type(e).__name__,
-            "decode": decode_tokens,
+            "submit_timestamp": submit_timestamp,
+            "total_duration_ms": round(total_duration_ms, 2),
+            "chunk_count": chunk_count,  # Number of streaming chunks before failure
         }
         if ttft is not None:
             record["target_ttft_ms"] = ttft
         if tpot is not None:
             record["target_tpot_ms"] = tpot
+        # Append text at the end
+        record["output_text"] = output_text  # Partial output text before failure
 
     finally:
         # Log the result
@@ -347,7 +389,7 @@ def status_display_thread(
                 f"Progress             : {percent_complete:.1f}%",
                 "",
                 f"Log File             : {log_display_path}",
-                "Ctrl+C to stop",
+                "Ctrl+C twice to force stop",
             ]
             ui.render(lines)
 
@@ -410,10 +452,31 @@ def run_trace(
     # Setup stop event for signal handling
     stop_event = threading.Event()
 
+    # Track signal count for aggressive shutdown
+    signal_count = [0]
+
     def signal_handler(signum, frame):
         """Handle SIGINT/SIGTERM gracefully."""
-        print("\n[stream] Signal received, shutting down gracefully...")
+        signal_count[0] += 1
+        print(f"\n[stream] Received signal {signum}, shutting down gracefully... (signal #{signal_count[0]})")
         stop_event.set()
+
+        # If multiple signals received, force exit
+        if signal_count[0] >= 2:
+            print("[stream] Multiple signals received, forcing immediate exit...")
+            import os
+            os._exit(1)
+
+        # Start watchdog timer for emergency exit
+        def emergency_exit():
+            time.sleep(5.0)  # Give 5 seconds for graceful shutdown
+            if signal_count[0] > 0:  # Only if we received a signal
+                print("[stream] Emergency timeout reached, forcing exit...")
+                import os
+                os._exit(1)
+
+        emergency_thread = threading.Thread(target=emergency_exit, daemon=True)
+        emergency_thread.start()
 
     # Register signal handlers
     signal.signal(signal.SIGINT, signal_handler)
@@ -558,6 +621,12 @@ def run_trace(
         # Wait for status thread to finish cleanly
         if status_thread and status_thread.is_alive():
             status_thread.join(timeout=2.0)
+
+    # Quick exit if interrupted
+    if stop_event.is_set():
+        print("[stream] Cleanup complete. Exiting...")
+        snapshot = stats.snapshot()
+        return snapshot["submitted"], snapshot["completed"], snapshot["failed"]
 
     snapshot = stats.snapshot()
     return snapshot["submitted"], snapshot["completed"], snapshot["failed"]
