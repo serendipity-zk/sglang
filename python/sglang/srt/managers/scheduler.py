@@ -157,6 +157,10 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+# Import grid-based predictor for SLO-aware scheduling
+sys.path.insert(0, "/sgl-workspace/sglang")
+from sglang_profile.grid_predictor import GridBasedCycleTimePredictor
 from sglang.srt.tracing.trace import (
     process_tracing_init,
     trace_event,
@@ -579,6 +583,20 @@ class Scheduler(
         # Global TPOT (cycle time) regulator; set via /set_tpot
         self.tpot: Optional[float] = None
 
+        # Grid-based cycle time predictor for SLO-aware scheduling (optional)
+        self.cycle_time_predictor = None
+        if self.server_args.enable_iteration_metrics:
+            self.cycle_time_predictor = GridBasedCycleTimePredictor(
+                grid_path="/sgl-workspace/sglang/profile/grid3d.json",
+                log_every=100,
+                alpha=0.6,
+                k=64,
+                radius=0.30,
+                bandwidth=0.20,
+                half_life=50.0,
+                W0=4.0,
+            )
+
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -771,6 +789,15 @@ class Scheduler(
 
         # Report (non-blocking)
         iteration_metrics.report_iteration(metrics)
+
+        # Train the online predictor with this iteration's data
+        if self.cycle_time_predictor is not None:
+            self.cycle_time_predictor.submit(
+                batch_size_tokens=total_tokens,
+                prefill_chunk_pairs=prefill_chunk_pairs,
+                kv_tokens_used=num_used,
+                iteration_time_ms=iteration_time_ms,
+            )
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -1027,7 +1054,6 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         
-        afeawgeaweg
         """A normal scheduler loop."""
         while True:
             logger.info("Event loop normal")
@@ -1125,7 +1151,7 @@ class Scheduler(
 
     @DynamicGradMode()
     def event_loop_pp(self):
-        afeawgeaweg
+
         """A non-overlap scheduler loop for pipeline parallelism."""
         mbs = [None] * self.pp_size
         last_mbs = [None] * self.pp_size
@@ -1963,6 +1989,26 @@ class Scheduler(
             self.maybe_handle_dp_balance_data()
             ret = self.prepare_mlp_sync_batch(ret)
         
+        # log the batch infomation
+        # if ret is not None:
+        #     logger.info(f"running batch len reqs: {len(ret.reqs)}")
+        #     # concate all extend input len in a row separate by comma
+        #     extend_input_len_str = ", ".join([str(req.extend_input_len) for req in ret.reqs])
+        #     logger.info(f"extend input len: {extend_input_len_str}")
+        #     logger.info(f"total extend input len: {sum([req.extend_input_len for req in ret.reqs])}")
+        #     # get current kv size
+        #     num_used, token_usage, available_size, evictable_size = self._get_token_info()
+        #     kv_size = num_used
+        #     logger.info(f"kv size: {kv_size}")
+        #     # only for those extend len > 1
+        #     prefill_pairs = []
+        #     for req in ret.reqs:
+        #         if req.extend_input_len > 1:
+        #             prefill_pairs.append([req.extend_input_len, len(req.prefix_indices) + req.extend_input_len])
+        #     logger.info(f"prefill pairs: {prefill_pairs}")
+        #     pred = self.cycle_time_predictor.predict(batch_size_tokens=sum([req.extend_input_len for req in ret.reqs]), prefill_chunk_pairs=prefill_pairs, kv_tokens_used=kv_size)
+        #     logger.info(f"pred: {pred}")
+                            
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -1980,17 +2026,17 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
-        # SLO-aware scheduling: block new prefills if last iteration exceeded TPOT
-        if self.tpot is not None and self.server_args.enable_iteration_metrics:
-            from sglang.srt.ui import iteration_metrics
-            latest_metrics = iteration_metrics.get_ui_snapshot()
-            last_iteration_time = latest_metrics.get("iteration_time_ms")
-            if last_iteration_time is not None and last_iteration_time > self.tpot:
-                # Don't schedule new prefill requests when we're over SLO
-                logger.info(
-                    f"Blocking new prefill: last_iteration_time={last_iteration_time:.2f}ms > tpot={self.tpot:.2f}ms"
-                )
-                return None
+        # # SLO-aware scheduling: block new prefills if last iteration exceeded TPOT
+        # if self.tpot is not None and self.server_args.enable_iteration_metrics:
+        #     from sglang.srt.ui import iteration_metrics
+        #     latest_metrics = iteration_metrics.get_ui_snapshot()
+        #     last_iteration_time = latest_metrics.get("iteration_time_ms")
+        #     if last_iteration_time is not None and last_iteration_time > self.tpot:
+        #         # Don't schedule new prefill requests when we're over SLO
+        #         logger.info(
+        #             f"Blocking new prefill: last_iteration_time={last_iteration_time:.2f}ms > tpot={self.tpot:.2f}ms"
+        #         )
+        #         return None
 
         # Handle the cases where prefill is not allowed
         if (
@@ -2029,6 +2075,9 @@ class Scheduler(
             self.chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
+            cycle_time_predictor=self.cycle_time_predictor,
+            tpot_slo=self.tpot,
+            max_total_num_tokens=self.max_total_num_tokens,
         )
 
         if self.chunked_req is not None:

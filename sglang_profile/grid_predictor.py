@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Grid-based cycle time predictor with local bias correction.
+
+Replaces the online RLS predictor with:
+- Offline 3D trilinear grid lookup (from grid3d.json)
+- Online local bias-only correction using BiasLocalCorrector
+
+Interface compatible with OnlineLinearCycleTime:
+- predict(batch_size_tokens, prefill_chunk_pairs, kv_tokens_used) -> float
+- submit(batch_size_tokens, prefill_chunk_pairs, kv_tokens_used, iteration_time_ms) -> (prediction, abs_error)
+"""
+
+import json
+from pathlib import Path
+from typing import List, Tuple
+import numpy as np
+import csv
+from datetime import datetime
+import os
+
+
+# ---------- Trilinear interpolation ----------
+def trilinear_predict(x, y, z, X, Y, Z, G):
+    """
+    Trilinear interpolation on a 3D grid.
+
+    Args:
+        x, y, z: Query points (scalars or arrays)
+        X, Y, Z: Knot arrays for each axis
+        G: 3D grid array of shape (len(X), len(Y), len(Z))
+
+    Returns:
+        Interpolated values at (x, y, z)
+    """
+    ix = np.searchsorted(X, x, side="right") - 1
+    iy = np.searchsorted(Y, y, side="right") - 1
+    iz = np.searchsorted(Z, z, side="right") - 1
+    ix = np.clip(ix, 0, len(X) - 2)
+    iy = np.clip(iy, 0, len(Y) - 2)
+    iz = np.clip(iz, 0, len(Z) - 2)
+
+    x0, x1 = X[ix], X[ix + 1]
+    y0, y1 = Y[iy], Y[iy + 1]
+    z0, z1 = Z[iz], Z[iz + 1]
+
+    tx = np.divide(x - x0, x1 - x0, out=np.zeros_like(x), where=(x1 > x0))
+    ty = np.divide(y - y0, y1 - y0, out=np.zeros_like(y), where=(y1 > y0))
+    tz = np.divide(z - z0, z1 - z0, out=np.zeros_like(z), where=(z1 > z0))
+
+    g000 = G[ix, iy, iz]
+    g100 = G[ix+1, iy, iz]
+    g010 = G[ix, iy+1, iz]
+    g110 = G[ix+1, iy+1, iz]
+    g001 = G[ix, iy, iz+1]
+    g101 = G[ix+1, iy, iz+1]
+    g011 = G[ix, iy+1, iz+1]
+    g111 = G[ix+1, iy+1, iz+1]
+
+    return ((1-tx)*(1-ty)*(1-tz)*g000 + tx*(1-ty)*(1-tz)*g100 +
+            (1-tx)*ty*(1-tz)*g010 + tx*ty*(1-tz)*g110 +
+            (1-tx)*(1-ty)*tz*g001 + tx*(1-ty)*tz*g101 +
+            (1-tx)*ty*tz*g011 + tx*ty*tz*g111)
+
+
+# ---------- Online bias-only corrector ----------
+class BiasLocalCorrector:
+    """
+    Online local bias correction using k-NN weighted averaging.
+
+    Maintains a circular buffer of recent (x, y, z, residual) observations.
+    For each prediction, computes a local bias estimate from nearby points
+    using spatial and temporal weighting.
+    """
+    def __init__(self, buffer_size=10000, k=64, radius=0.30, bandwidth=0.20,
+                 half_life=50.0, alpha=0.6, W0=4.0, max_correction=np.inf,
+                 x_min=0, x_max=1, y_min=0, y_max=1, z_min=0, z_max=1):
+        self.N, self.k, self.radius, self.h2 = int(buffer_size), int(k), radius, bandwidth**2
+        self.tau, self.alpha, self.W0, self.max_corr = half_life / np.log(2.0), alpha, W0, max_correction
+        self.xmin, self.xmax = x_min, x_max
+        self.ymin, self.ymax = y_min, y_max
+        self.zmin, self.zmax = z_min, z_max
+        self.xspan = max(x_max - x_min, 1e-12)
+        self.yspan = max(y_max - y_min, 1e-12)
+        self.zspan = max(z_max - z_min, 1e-12)
+
+        self.buf_x = np.empty(self.N, np.float32)
+        self.buf_y = np.empty(self.N, np.float32)
+        self.buf_z = np.empty(self.N, np.float32)
+        self.buf_r = np.empty(self.N, np.float32)
+        self.buf_t = np.empty(self.N, np.int32)
+        self.size, self.head, self.t = 0, 0, 0
+
+    def _norm(self, x, y, z):
+        """Normalize coordinates to [0, 1] range."""
+        return (x - self.xmin) / self.xspan, (y - self.ymin) / self.yspan, (z - self.zmin) / self.zspan
+
+    def update(self, x, y, z, residual):
+        """Add a new observation to the buffer."""
+        xn, yn, zn = self._norm(x, y, z)
+        self.buf_x[self.head] = xn
+        self.buf_y[self.head] = yn
+        self.buf_z[self.head] = zn
+        self.buf_r[self.head] = residual
+        self.buf_t[self.head] = self.t
+        self.head = (self.head + 1) % self.N
+        self.size = min(self.size + 1, self.N)
+        self.t += 1
+
+    def correction(self, x, y, z):
+        """
+        Compute local bias correction for point (x, y, z).
+
+        Returns:
+            (correction, num_neighbors): Correction value and number of neighbors used
+        """
+        if self.size == 0:
+            return 0.0, 0
+
+        xn, yn, zn = self._norm(x, y, z)
+        Xb = self.buf_x[:self.size]
+        Yb = self.buf_y[:self.size]
+        Zb = self.buf_z[:self.size]
+        Rb = self.buf_r[:self.size]
+        Tb = self.buf_t[:self.size]
+
+        # Find neighbors within radius
+        d2 = (Xb - xn)**2 + (Yb - yn)**2 + (Zb - zn)**2
+        mask = d2 <= self.radius**2
+        if not np.any(mask):
+            return 0.0, 0
+
+        d2 = d2[mask]
+        Rb = Rb[mask]
+        Tb = Tb[mask]
+
+        # Keep only k nearest
+        if d2.size > self.k:
+            idx = np.argpartition(d2, self.k)[:self.k]
+            d2 = d2[idx]
+            Rb = Rb[idx]
+            Tb = Tb[idx]
+
+        # Compute weights: spatial (Gaussian) * temporal (exponential decay)
+        w = np.exp(-d2 / (2 * self.h2)) * np.exp(-(self.t - Tb) / self.tau)
+        Wsum = float(w.sum())
+
+        if Wsum <= 1e-9:
+            return 0.0, len(Rb)
+
+        # Local bias estimate
+        local_bias = float(np.sum(w * Rb) / Wsum)
+
+        # Adaptive alpha based on confidence (total weight)
+        alpha_eff = self.alpha * (Wsum / (Wsum + self.W0))
+
+        return float(np.clip(alpha_eff * local_bias, -self.max_corr, self.max_corr)), len(Rb)
+
+
+# ---------- Grid-based predictor with bias correction ----------
+class GridBasedCycleTimePredictor:
+    """
+    Cycle time predictor using offline 3D grid + online local bias correction.
+
+    Provides the same interface as OnlineLinearCycleTime for drop-in replacement.
+    """
+
+    def __init__(
+        self,
+        grid_path: str,
+        buffer_size: int = 10000,
+        k: int = 64,
+        radius: float = 0.30,
+        bandwidth: float = 0.20,
+        half_life: float = 50.0,
+        alpha: float = 0.6,
+        W0: float = 4.0,
+        max_correction: float = np.inf,
+        log_every: int = 100,
+        csv_log_path: str = None,
+    ):
+        """
+        Args:
+            grid_path: Path to grid3d.json file
+            buffer_size: Size of circular buffer for bias correction
+            k: Number of nearest neighbors for local correction
+            radius: Spatial radius for neighbor search (normalized)
+            bandwidth: Gaussian kernel bandwidth for spatial weighting
+            half_life: Temporal decay half-life for weighting
+            alpha: Strength of bias correction (0-1)
+            W0: Confidence threshold for adaptive alpha
+            max_correction: Maximum absolute correction value
+            log_every: Log statistics every N samples
+            csv_log_path: Path to CSV log file (if None, uses default)
+        """
+        # Load grid model
+        self.grid_path = grid_path
+        model = json.loads(Path(grid_path).read_text())
+
+        self.X_knots = np.array(model["knots"]["X_knots"])
+        self.Y_knots = np.array(model["knots"]["Y_knots"])
+        self.Z_knots = np.array(model["knots"]["Z_knots"])
+        self.grid = np.array(model["grid"])
+
+        print(f"[GridBasedCycleTimePredictor] Loaded grid from {grid_path}")
+        print(f"  Grid shape: {self.grid.shape}")
+        print(f"  X range: [{self.X_knots.min():.0f}, {self.X_knots.max():.0f}]")
+        print(f"  Y range: [{self.Y_knots.min():.0f}, {self.Y_knots.max():.0f}]")
+        print(f"  Z range: [{self.Z_knots.min():.0f}, {self.Z_knots.max():.0f}]")
+
+        # Initialize bias corrector with grid bounds
+        self.bias_corrector = BiasLocalCorrector(
+            buffer_size=buffer_size,
+            k=k,
+            radius=radius,
+            bandwidth=bandwidth,
+            half_life=half_life,
+            alpha=alpha,
+            W0=W0,
+            max_correction=max_correction,
+            x_min=self.X_knots.min(),
+            x_max=self.X_knots.max(),
+            y_min=self.Y_knots.min(),
+            y_max=self.Y_knots.max(),
+            z_min=self.Z_knots.min(),
+            z_max=self.Z_knots.max(),
+        )
+
+        # Logging
+        self.log_every = log_every
+        self._n_seen = 0
+        self._sum_abs_err = 0.0
+        self._window_errs = []
+
+        # CSV logger for predict and submit calls
+        if csv_log_path is None:
+            csv_log_path = f"grid_predictor_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        self.csv_log_path = csv_log_path
+        self.csv_file = open(self.csv_log_path, 'w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+        # Write CSV header
+        self.csv_writer.writerow([
+            'timestamp', 'operation', 'batch_size_tokens', 'prefill_chunk_pairs',
+            'kv_tokens_used', 'x', 'y', 'z', 'grid_pred', 'correction', 'n_neighbors',
+            'final_prediction', 'actual_time_ms', 'abs_error'
+        ])
+        self.csv_file.flush()
+
+        print(f"  Bias correction: α={alpha}, k={k}, r={radius}, h={bandwidth}, half_life={half_life}, W0={W0}")
+        print(f"  CSV logging to: {self.csv_log_path}")
+
+    def _compute_y_scalar(self, prefill_chunk_pairs: List[List[int]]) -> float:
+        """
+        Convert prefill_chunk_pairs to Y-axis scalar for grid lookup.
+
+        Uses sum of chunk*cumulative products (feature 8 from online predictor).
+        """
+        if not prefill_chunk_pairs:
+            return 0.0
+        return float(sum(pair[0] * pair[1] for pair in prefill_chunk_pairs))
+
+    def predict(self, batch_size_tokens: int, prefill_chunk_pairs: List[List[int]], kv_tokens_used: int) -> float:
+        """
+        Predict iteration time with grid + local bias correction.
+
+        Args:
+            batch_size_tokens: Total tokens in batch
+            prefill_chunk_pairs: List of [current_chunk, cumulative_prefill] pairs
+            kv_tokens_used: Number of KV cache tokens used
+
+        Returns:
+            Predicted iteration time in milliseconds
+        """
+        # Map to grid coordinates
+        x = float(batch_size_tokens)
+        y = self._compute_y_scalar(prefill_chunk_pairs)
+        z = float(kv_tokens_used)
+
+        # Grid base prediction
+        grid_pred = float(trilinear_predict(x, y, z, self.X_knots, self.Y_knots, self.Z_knots, self.grid))
+
+        # Local bias correction
+        correction, n_neighbors = self.bias_corrector.correction(x, y, z)
+
+        # Final prediction (ensure non-negative)
+        final_pred = max(0.0, grid_pred + correction)
+
+        # Log to CSV
+        self.csv_writer.writerow([
+            datetime.now().isoformat(),
+            'predict',
+            batch_size_tokens,
+            str(prefill_chunk_pairs),
+            kv_tokens_used,
+            x,
+            y,
+            z,
+            grid_pred,
+            correction,
+            n_neighbors,
+            final_pred,
+            '',  # actual_time_ms (not available for predict)
+            ''   # abs_error (not available for predict)
+        ])
+        self.csv_file.flush()
+
+        return final_pred
+
+    def submit(
+        self,
+        batch_size_tokens: int,
+        prefill_chunk_pairs: List[List[int]],
+        kv_tokens_used: int,
+        iteration_time_ms: float,
+    ) -> Tuple[float, float]:
+        """
+        Update predictor with actual measurement.
+
+        Predicts first (using current state), then updates bias corrector.
+
+        Args:
+            batch_size_tokens: Total tokens in batch
+            prefill_chunk_pairs: List of [current_chunk, cumulative_prefill] pairs
+            kv_tokens_used: Number of KV cache tokens used
+            iteration_time_ms: Actual measured iteration time
+
+        Returns:
+            (prediction_before_update, absolute_error): Prediction and error in milliseconds
+        """
+        # Map to grid coordinates
+        x = float(batch_size_tokens)
+        y = self._compute_y_scalar(prefill_chunk_pairs)
+        z = float(kv_tokens_used)
+
+        # Compute base grid prediction (without bias correction)
+        grid_pred = float(trilinear_predict(x, y, z, self.X_knots, self.Y_knots, self.Z_knots, self.grid))
+
+        # Get current correction before update
+        correction, n_neighbors = self.bias_corrector.correction(x, y, z)
+
+        # Predict BEFORE update (using corrected prediction)
+        y_pred = max(0.0, grid_pred + correction)
+
+        # Residual relative to base grid (this is what we correct)
+        residual = float(iteration_time_ms) - grid_pred
+
+        # Update bias corrector
+        self.bias_corrector.update(x, y, z, residual)
+
+        # Track error for logging
+        abs_err = abs(float(iteration_time_ms) - y_pred)
+        self._n_seen += 1
+        self._sum_abs_err += abs_err
+        self._window_errs.append(abs_err)
+        if len(self._window_errs) > self.log_every:
+            self._window_errs.pop(0)
+
+        # Log to CSV
+        self.csv_writer.writerow([
+            datetime.now().isoformat(),
+            'submit',
+            batch_size_tokens,
+            str(prefill_chunk_pairs),
+            kv_tokens_used,
+            x,
+            y,
+            z,
+            grid_pred,
+            correction,
+            n_neighbors,
+            y_pred,
+            iteration_time_ms,
+            abs_err
+        ])
+        self.csv_file.flush()
+
+        # Logging
+        if self._n_seen % self.log_every == 0:
+            window_avg = float(np.mean(self._window_errs)) if self._window_errs else 0.0
+            cum_avg = self._sum_abs_err / self._n_seen
+            if self._window_errs:
+                p90 = float(np.percentile(self._window_errs, 90))
+                p99 = float(np.percentile(self._window_errs, 99))
+            else:
+                p90 = p99 = 0.0
+
+            print(
+                f"[GridBasedCycleTimePredictor] N={self._n_seen} | "
+                f"avg_abs_err_window({self.log_every})={window_avg:.2f} ms | "
+                f"p90_window={p90:.2f} ms | p99_window={p99:.2f} ms | "
+                f"avg_abs_err_cum={cum_avg:.2f} ms"
+            )
+
+        return y_pred, abs_err
+
+    @property
+    def n_seen(self) -> int:
+        """Number of samples seen."""
+        return self._n_seen
+
+    @property
+    def mean_abs_err_cum(self) -> float:
+        """Cumulative mean absolute error."""
+        return self._sum_abs_err / self._n_seen if self._n_seen > 0 else 0.0
+
+    def __del__(self):
+        """Close CSV file on cleanup."""
+        if hasattr(self, 'csv_file') and self.csv_file:
+            try:
+                self.csv_file.close()
+            except Exception:
+                pass

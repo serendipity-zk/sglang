@@ -15,6 +15,7 @@ from __future__ import annotations
 # ==============================================================================
 """Request scheduler policy"""
 
+from math import log
 import os
 import random
 from collections import defaultdict
@@ -322,6 +323,9 @@ class PrefillAdder:
         rem_chunk_tokens: Optional[int],
         mixed_with_decode_tokens: int = 0,
         priority_scheduling_preemption_threshold: int = 0,
+        cycle_time_predictor = None,
+        tpot_slo: Optional[float] = None,
+        max_total_num_tokens: Optional[int] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -360,6 +364,14 @@ class PrefillAdder:
             priority_scheduling_preemption_threshold
         )
 
+        # SLO-aware prediction (optional feature)
+        self.cycle_time_predictor = cycle_time_predictor
+        self.tpot_slo = tpot_slo
+        self.max_total_num_tokens = max_total_num_tokens
+        self.slo_aware_chunking = (
+            cycle_time_predictor is not None and tpot_slo is not None
+        )
+
     def _get_running_request_total_token_offset(self, req: Req) -> int:
         return (
             min(
@@ -368,6 +380,109 @@ class PrefillAdder:
             )
             * self.new_token_ratio
         )
+
+    def _get_current_batch_state(self):
+        """Get current batch_size_tokens and kv_tokens_used for predictor input."""
+        # Compute batch_size_tokens: tokens being processed in current forward pass
+        batch_size_tokens = 0
+        if self.running_batch is not None:
+            batch_size_tokens = len(self.running_batch.reqs)
+
+        # KV tokens used = total capacity - (available + evictable)
+        # Following the same pattern as Scheduler._get_token_info()
+        available_size = self.token_to_kv_pool_allocator.available_size()
+        evictable_size = self.tree_cache.evictable_size()
+
+        if self.max_total_num_tokens is not None:
+            kv_tokens_used = self.max_total_num_tokens - (available_size + evictable_size)
+        else:
+            # Fallback: estimate based on available + evictable
+            # This is less accurate but allows the code to work
+            kv_tokens_used = 0
+
+        return batch_size_tokens, kv_tokens_used
+
+    def _apply_slo_and_budget_limits(self, req: Req, budget_limit: int, context: str) -> int:
+        """
+        Apply SLO-aware chunking constraints to a chunk size.
+
+        Args:
+            req: Request being processed
+            budget_limit: Maximum chunk size from budget calculations
+            context: Description for logging (e.g., "add_chunked_req", "ignore_eos")
+
+        Returns:
+            Adjusted chunk size (0 if SLO prevents adding any tokens)
+        """
+        if budget_limit <= 0:
+            return 0
+
+        if self.slo_aware_chunking:
+            adjusted_size = self._compute_slo_aware_chunk_size(req, budget_limit)
+            if adjusted_size < budget_limit:
+                logger.info(
+                    f"SLO-aware chunking in {context}: {budget_limit} -> {adjusted_size}"
+                )
+            return adjusted_size
+
+        return budget_limit
+
+    def _compute_slo_aware_chunk_size(self, req: Req, max_chunk_size: int) -> int:
+        """
+        Find maximum chunk size that keeps predicted iteration time <= SLO.
+        Returns adjusted chunk size (may be same as max_chunk_size if no limit needed).
+        """
+        if not self.slo_aware_chunking or max_chunk_size <= 0:
+            return max_chunk_size
+
+        # Get current state
+        batch_tokens, kv_used = self._get_current_batch_state()
+
+        # Add tokens from already-queued can_run_list
+        for queued_req in self.can_run_list:
+            batch_tokens += queued_req.extend_input_len
+
+        # Build prefill_chunk_pairs for current batch
+        prefill_pairs = []
+        for queued_req in self.can_run_list:
+            chunk = queued_req.extend_input_len
+            cumulative = len(queued_req.prefix_indices) + chunk
+            prefill_pairs.append([chunk, cumulative])
+
+        # Binary search for maximum safe chunk size
+        # Start from 0 to allow returning 0 if even 1 token violates SLO
+        left, right = 0, max_chunk_size
+        best_size = 0
+
+        while left <= right:
+            mid = (left + right) // 2
+
+            if mid == 0:
+                # Can't add any tokens
+                left = 1
+                continue
+
+            # Round to nearest 32 tokens for prediction granularity
+            mid_rounded = ((mid + 16) // 32) * 32
+            mid_rounded = max(32, min(mid_rounded, max_chunk_size))
+
+            # Test with rounded chunk size
+            test_pairs = prefill_pairs + [[mid_rounded, len(req.prefix_indices) + mid_rounded]]
+            test_batch_tokens = batch_tokens + mid_rounded
+
+            predicted_time = self.cycle_time_predictor.predict(
+                batch_size_tokens=test_batch_tokens,
+                prefill_chunk_pairs=test_pairs,
+                kv_tokens_used=kv_used,
+            )
+
+            if predicted_time <= self.tpot_slo:
+                best_size = mid
+                left = mid + 1
+            else:
+                right = mid - 1
+
+        return best_size
 
     @property
     def rem_total_tokens(self):
@@ -433,10 +548,23 @@ class PrefillAdder:
         self.log_input_tokens += extend_input_len
 
     def add_chunked_req(self, req: Req):
-        logger.info(f"add_chunked_req: {req.extend_input_len}, {self.rem_chunk_tokens}, {int(self.rem_total_tokens)}")
         _rem_tokens = max(min(self.rem_chunk_tokens, int(self.rem_total_tokens)), 0)
+        original_extend_len = req.extend_input_len
         truncated = req.extend_input_len > _rem_tokens
-        req.extend_input_len = min(req.extend_input_len, _rem_tokens)
+
+        # Apply budget and SLO limits
+        req.extend_input_len = self._apply_slo_and_budget_limits(
+            req, min(req.extend_input_len, _rem_tokens), "add_chunked_req"
+        )
+
+        # If no tokens can be added due to SLO constraints, keep as chunked but don't add to batch
+        if req.extend_input_len <= 0:
+            req.extend_input_len = 0
+            # return req  # Still needs processing, try again next iteration
+
+        # Check if still truncated after all adjustments
+        truncated = req.extend_input_len < original_extend_len
+
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
         self._update_prefill_budget(
@@ -450,6 +578,7 @@ class PrefillAdder:
         )
 
         # Return if chunked prefill not finished
+        logger.info(f"add_chunked_req return: {req.extend_input_len} out of {original_extend_len}, {truncated}")
         return req if truncated else None
 
     @contextmanager
@@ -523,10 +652,26 @@ class PrefillAdder:
                     return AddReqResult.NO_TOKEN
                 tokens_freed += tokens_occupied
 
-        if (
+        # Check if we can add as non-chunked or need to chunk due to SLO
+        can_add_full_request = (
             self.rem_chunk_tokens is None  # chunked prefill is disabled
             or req.extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
-        ):
+        )
+
+        if can_add_full_request:
+            # Check SLO constraints for full request
+            allowed_tokens = self._apply_slo_and_budget_limits(req, req.extend_input_len, "add_one_req_ignore_eos_non_chunked")
+
+            # If SLO prevents adding full request
+            if allowed_tokens < req.extend_input_len:
+                if self.rem_chunk_tokens is not None:
+                    # Force chunking by setting can_add_full_request to False
+                    can_add_full_request = False
+                else:
+                    # Chunking disabled, cannot add this request
+                    return AddReqResult.OTHER
+
+        if can_add_full_request:
             # Non-chunked prefill
             self.can_run_list.append(req)
             self._update_prefill_budget(
@@ -535,11 +680,17 @@ class PrefillAdder:
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
             )
         else:
+            # Cannot create a new chunked request if one already exists
+            if has_chunked_req:
+                return AddReqResult.OTHER
+
             if self.rem_chunk_tokens == 0:
                 return AddReqResult.OTHER
 
             # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            trunc_len = self._apply_slo_and_budget_limits(req, self.rem_chunk_tokens, "add_one_req_ignore_eos_chunked")
+            if trunc_len <= 0:
+                return AddReqResult.OTHER
 
             req.extend_input_len = trunc_len
             req.fill_ids = req.fill_ids[:trunc_len]
@@ -555,6 +706,11 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req, has_chunked_req)
 
+
+        # Cannot create a new chunked request if one already exists
+        if has_chunked_req or self.new_chunked_req is not None:
+            return AddReqResult.OTHER
+        
         total_tokens = req.extend_input_len + min(
             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
         )
@@ -588,15 +744,31 @@ class PrefillAdder:
             if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
                 return AddReqResult.OTHER
 
-            if self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
+            # Check if we can add as non-chunked or need to chunk due to SLO
+            can_add_full_request = self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens
+
+            if can_add_full_request:
+                # Check SLO constraints for full request
+                allowed_tokens = self._apply_slo_and_budget_limits(req, req.extend_input_len, "add_one_req_non_chunked")
+
+                # If SLO prevents adding full request
+                if allowed_tokens < req.extend_input_len:
+                    if self.rem_chunk_tokens is not None and allowed_tokens > 0:
+                        # Force chunking by setting can_add_full_request to False
+                        can_add_full_request = False
+                    else:
+                        # Chunking disabled, cannot add this request
+                        return AddReqResult.OTHER
+
+            if can_add_full_request:
                 # Non-chunked prefill
+                logger.info(f"add one non-chunked req: {req.extend_input_len}, {input_tokens}")
                 self.can_run_list.append(req)
                 if self.is_hybrid:
                     swa_uuid_for_lock = self.tree_cache.inc_lock_ref(req.last_node)
                     req.swa_uuid_for_lock = swa_uuid_for_lock
                 else:
                     self.tree_cache.inc_lock_ref(req.last_node)
-                logger.info(f"add_one_req non-chunked: {req.extend_input_len}, {input_tokens}")
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -621,6 +793,11 @@ class PrefillAdder:
                         trunc_len = truncation_align_size * (
                             trunc_len // truncation_align_size
                         )
+
+                # Apply SLO-aware chunking if enabled
+                trunc_len = self._apply_slo_and_budget_limits(req, trunc_len, "add_one_req_chunked")
+                if trunc_len <= 0:
+                    return AddReqResult.OTHER
 
                 # Chunked prefill
                 req.extend_input_len = trunc_len

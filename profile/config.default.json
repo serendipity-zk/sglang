@@ -1,0 +1,22 @@
+{
+  "model_path": "meta-llama/Llama-3.1-8B-Instruct",
+  "chunk_sizes": [128, 256, 384, 512, 768, 1024, 1536, 2048, 4096, 8192],
+  "length_configs": [
+    "128:1", "256:1", "512:1", "1024:1", "2048:1", "4096:1", "8192:1",
+    "128:128", "256:256", "512:512", "1024:1024", "2048:2048",
+    "1:128", "1:512", "1:1024",
+    "512:128", "1024:256", "2048:512",
+    "128:512", "256:1024", "512:2048"
+  ],
+  "requests_per_length": 256,
+  "profile_name_prefix": "chunk_prefill_sweep",
+  "output_root": "./profile_runs_full",
+  "enable_mixed_chunk": true,
+  "wait_for_idle": true,
+  "idle_wait_timeout": 60.0,
+  "idle_poll_interval": 0.2,
+  "post_length_wait": 0.5,
+  "max_concurrent_requests": 256,
+  "extra_profile_args": ["--iteration-metrics-interval", "1"],
+  "sleep_between_jobs": 0.0
+}

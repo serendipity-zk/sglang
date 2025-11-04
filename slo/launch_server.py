@@ -345,7 +345,7 @@ def main():
                 cmd.extend(args.extra_worker_args.split())
 
             log_path = os.path.join(
-                args.log_dir, f"worker_{idx}_gpu{gpu}_p{port}_{stamp}.log"
+                args.log_dir, f"worker_{idx}_gpu{gpu}_p{port}_{stamp}.ans"
             )
             prefix = f"w{idx}@gpu{gpu}:{port}"
             print(f"Starting worker {idx} on GPU {gpu} port {port} ... log -> {log_path}")

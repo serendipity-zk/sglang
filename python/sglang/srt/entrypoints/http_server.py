@@ -441,6 +441,27 @@ async def get_model_info():
     return result
 
 
+@app.get("/check_idle")
+async def check_idle():
+    """Check if the server is fully idle (no running or waiting requests)."""
+    loads = await _global_state.tokenizer_manager.get_load()
+
+    # Server is idle if all DP ranks have no requests
+    is_idle = all(load.num_reqs == 0 for load in loads)
+
+    return {
+        "is_idle": is_idle,
+        "loads": [
+            {
+                "dp_rank": load.dp_rank,
+                "num_reqs": load.num_reqs,
+                "num_waiting_reqs": load.num_waiting_reqs,
+            }
+            for load in loads
+        ],
+    }
+
+
 @app.get("/get_weight_version")
 async def get_weight_version():
     """Get the current weight version."""
