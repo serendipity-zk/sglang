@@ -4,6 +4,6 @@ python launch_server.py \
   --ports 31001,31002 \
   --gpus 4,5 \
   --log-dir /sgl-workspace/sglang/slo/logs \
-  --extra-worker-args "  --enable-mixed-chunk --chunked-prefill-size 4096 --router-metrics-url http://0.0.0.0:40000 --enable-iteration-metrics --iteration-metrics-interval 1" \
+  --extra-worker-args "  --enable-mixed-chunk --enable-debug-metrics --chunked-prefill-size 4096 --router-metrics-url http://0.0.0.0:40000 --enable-iteration-metrics --iteration-metrics-interval 1" \
   --tmux-ui \
   

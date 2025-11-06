@@ -19,7 +19,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import requests
 
@@ -32,17 +32,12 @@ class _IterationMetricsState:
     def __init__(
         self,
         worker_id: str,
-        stat_file_path: Optional[str] = None,
         router_url: Optional[str] = None,
-        report_interval: int = 1,
     ):
         self.worker_id = worker_id
-        self.stat_file_path = stat_file_path
         self.router_url = router_url
-        self.report_interval = report_interval
 
         self._lock = threading.Lock()
-        self._iteration_count = 0
         self._accepted_requests = 0  # Cumulative counter for accepted requests
         self._http_session = None
         self._http_executor = None
@@ -68,37 +63,51 @@ class _IterationMetricsState:
         with self._lock:
             self._accepted_requests += n
 
-    def report_iteration(self, metrics: Dict) -> None:
-        """Report metrics for one iteration (non-blocking)."""
+    def report_iteration(
+        self,
+        metrics: Dict,
+        iteration_num: int,
+        destinations: Optional[List[str]] = None,
+    ) -> None:
+        """Report metrics for one iteration (non-blocking).
+
+        Args:
+            metrics: Dictionary of metrics to report
+            iteration_num: The iteration number (provided by scheduler)
+            destinations: List of destinations - ["log", "ui", "router", "debug"]
+                         Default: ["log", "ui", "router"] (all three)
+        """
+        if destinations is None:
+            destinations = ["log", "ui", "router"]
 
         with self._lock:
-            self._iteration_count += 1
+            # Always update UI snapshot if requested
+            if "ui" in destinations:
+                self._latest_metrics = metrics.copy()
+                self._latest_metrics["worker_id"] = self.worker_id
+                self._latest_metrics["timestamp"] = time.time()
+                self._latest_metrics["iteration_num"] = iteration_num
+                self._latest_metrics["accepted_requests"] = self._accepted_requests
 
-            # Always update UI snapshot with latest metrics
-            self._latest_metrics = metrics.copy()
-            self._latest_metrics["worker_id"] = self.worker_id
-            self._latest_metrics["timestamp"] = time.time()
-            self._latest_metrics["iteration_num"] = self._iteration_count
-            self._latest_metrics["accepted_requests"] = self._accepted_requests
-
-            # Check if we should report based on interval
-            if self._iteration_count % self.report_interval != 0:
-                return
-
-            # Add worker ID, timestamp, and accepted_requests to metrics for logging
+            # Add worker ID, timestamp, and accepted_requests to metrics
+            metrics = metrics.copy()  # Don't modify caller's dict
             metrics["worker_id"] = self.worker_id
             metrics["timestamp"] = time.time()
-            metrics["iteration_num"] = self._iteration_count
+            metrics["iteration_num"] = iteration_num
             metrics["accepted_requests"] = self._accepted_requests
 
             # Log to standard logger (will be redirected to log file)
-            # Use root logger to ensure it's always logged
-            json_line = json.dumps(metrics, separators=(",", ":"))
-            # Also log with module logger for compatibility
-            logger.info(f"STAT_METRICS: {json_line}")
+            if "log" in destinations:
+                json_line = json.dumps(metrics, separators=(",", ":"))
+                logger.info(f"STAT_METRICS: {json_line}")
+
+            # Debug log with different prefix
+            if "debug" in destinations:
+                json_line = json.dumps(metrics, separators=(",", ":"))
+                logger.info(f"DEBUG_METRICS: {json_line}")
 
             # Send to router (asynchronous, non-blocking)
-            if self.router_url and self._http_executor:
+            if "router" in destinations and self.router_url and self._http_executor:
                 self._http_executor.submit(self._send_to_router, metrics)
 
     def _send_to_router(self, metrics: Dict) -> None:
@@ -133,9 +142,7 @@ _state_lock = threading.Lock()
 
 def initialize(
     worker_id: str,
-    stat_file_path: Optional[str] = None,
     router_url: Optional[str] = None,
-    report_interval: int = 1,
 ) -> None:
     """Initialize the iteration metrics state (called once from scheduler __init__)."""
     global _state
@@ -147,9 +154,7 @@ def initialize(
         logger.info("Initializing iteration metrics")
         _state = _IterationMetricsState(
             worker_id=worker_id,
-            stat_file_path=stat_file_path,
             router_url=router_url,
-            report_interval=report_interval,
         )
 
 
@@ -159,10 +164,21 @@ def inc_accepted_requests(n: int = 1) -> None:
         _state.inc_accepted_requests(n)
 
 
-def report_iteration(metrics: Dict) -> None:
-    """Report metrics for one iteration."""
+def report_iteration(
+    metrics: Dict,
+    iteration_num: int,
+    destinations: Optional[List[str]] = None,
+) -> None:
+    """Report metrics for one iteration.
+
+    Args:
+        metrics: Dictionary of metrics to report
+        iteration_num: The iteration number (provided by scheduler)
+        destinations: List of destinations - ["log", "ui", "router", "debug"]
+                     Default: ["log", "ui", "router"] (all three)
+    """
     if _state is not None:
-        _state.report_iteration(metrics)
+        _state.report_iteration(metrics, iteration_num, destinations)
 
 
 def get_ui_snapshot() -> Dict:

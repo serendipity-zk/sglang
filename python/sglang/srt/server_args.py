@@ -232,6 +232,7 @@ class ServerArgs:
 
     # Iteration metrics reporting
     enable_iteration_metrics: bool = True
+    enable_debug_metrics: bool = False
     router_metrics_url: Optional[str] = None
     iteration_metrics_interval: int = 1
 
@@ -1624,6 +1625,12 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_iteration_metrics,
             help="Enable per-iteration metrics reporting (file logging and optional HTTP to router)",
+        )
+        parser.add_argument(
+            "--enable-debug-metrics",
+            action="store_true",
+            default=ServerArgs.enable_debug_metrics,
+            help="Enable debug-level metrics logging for running batches (overlap mode only)",
         )
         parser.add_argument(
             "--router-metrics-url",

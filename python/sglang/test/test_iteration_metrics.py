@@ -1,18 +1,14 @@
 """
 Unit tests for iteration metrics module.
 
-Tests the dual-output metrics system (file + HTTP) for reporting
-scheduler iteration statistics.
+Tests the metrics system for reporting scheduler iteration statistics.
 """
 
 import json
-import os
-import tempfile
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
 from typing import Dict, List
 
 from sglang.srt.ui import iteration_metrics
@@ -78,58 +74,12 @@ class TestIterationMetrics(unittest.TestCase):
         """Clean up after each test."""
         iteration_metrics.shutdown()
 
-    def test_file_logging_only(self):
-        """Test metrics logging to file without HTTP."""
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".stat", delete=False
-        ) as stat_file:
-            stat_file_path = stat_file.name
-
-        try:
-            # Initialize with file logging only
-            iteration_metrics.initialize(
-                worker_id="test_worker_1",
-                stat_file_path=stat_file_path,
-                router_url=None,
-                report_interval=1,
-            )
-
-            # Report some metrics
-            metrics = {
-                "batch_size_tokens": 512,
-                "num_requests": 4,
-                "kv_cache_used_tokens": 1024,
-                "iteration_time_ms": 15.5,
-            }
-            iteration_metrics.report_iteration(metrics)
-
-            # Give file I/O time to complete
-            time.sleep(0.1)
-
-            # Verify file contents
-            with open(stat_file_path, "r") as f:
-                lines = f.readlines()
-                self.assertEqual(len(lines), 1)
-
-                logged_data = json.loads(lines[0])
-                self.assertEqual(logged_data["worker_id"], "test_worker_1")
-                self.assertEqual(logged_data["batch_size_tokens"], 512)
-                self.assertEqual(logged_data["num_requests"], 4)
-                self.assertEqual(logged_data["iteration_num"], 1)
-                self.assertIn("timestamp", logged_data)
-
-        finally:
-            if os.path.exists(stat_file_path):
-                os.remove(stat_file_path)
-
     def test_http_logging_only(self):
         """Test metrics reporting via HTTP without file."""
         # Initialize with HTTP logging only
         iteration_metrics.initialize(
             worker_id="test_worker_2",
-            stat_file_path=None,
             router_url=self.router_url,
-            report_interval=1,
         )
 
         # Report metrics
@@ -139,7 +89,7 @@ class TestIterationMetrics(unittest.TestCase):
             "kv_cache_usage_pct": 0.75,
             "iteration_time_ms": 10.2,
         }
-        iteration_metrics.report_iteration(metrics)
+        iteration_metrics.report_iteration(metrics, iteration_num=1)
 
         # Wait for HTTP request to complete
         time.sleep(0.5)
@@ -151,214 +101,112 @@ class TestIterationMetrics(unittest.TestCase):
             self.assertEqual(received["worker_id"], "test_worker_2")
             self.assertEqual(received["batch_size_tokens"], 256)
             self.assertEqual(received["kv_cache_usage_pct"], 0.75)
+            self.assertEqual(received["iteration_num"], 1)
 
     def test_dual_output(self):
-        """Test metrics reported to both file and HTTP."""
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".stat", delete=False
-        ) as stat_file:
-            stat_file_path = stat_file.name
+        """Test metrics reported to both log and HTTP."""
+        # Initialize with both outputs
+        iteration_metrics.initialize(
+            worker_id="test_worker_3",
+            router_url=self.router_url,
+        )
 
-        try:
-            # Initialize with both outputs
-            iteration_metrics.initialize(
-                worker_id="test_worker_3",
-                stat_file_path=stat_file_path,
-                router_url=self.router_url,
-                report_interval=1,
-            )
+        # Report metrics
+        metrics = {
+            "batch_size_tokens": 1024,
+            "num_requests": 8,
+            "waiting_queue_size": 5,
+            "forward_mode": "EXTEND",
+        }
+        iteration_metrics.report_iteration(metrics, iteration_num=1)
 
-            # Report metrics
-            metrics = {
-                "batch_size_tokens": 1024,
-                "num_requests": 8,
-                "waiting_queue_size": 5,
-                "forward_mode": "EXTEND",
-            }
-            iteration_metrics.report_iteration(metrics)
+        # Wait for both outputs
+        time.sleep(0.5)
 
-            # Wait for both outputs
-            time.sleep(0.5)
-
-            # Verify file
-            with open(stat_file_path, "r") as f:
-                lines = f.readlines()
-                self.assertEqual(len(lines), 1)
-                file_data = json.loads(lines[0])
-                self.assertEqual(file_data["batch_size_tokens"], 1024)
-
-            # Verify HTTP
-            with MockRouterHandler.lock:
-                self.assertEqual(len(MockRouterHandler.received_stats), 1)
-                http_data = MockRouterHandler.received_stats[0]
-                self.assertEqual(http_data["batch_size_tokens"], 1024)
-                self.assertEqual(http_data["forward_mode"], "EXTEND")
-
-        finally:
-            if os.path.exists(stat_file_path):
-                os.remove(stat_file_path)
-
-    def test_report_interval(self):
-        """Test that report_interval controls reporting frequency."""
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".stat", delete=False
-        ) as stat_file:
-            stat_file_path = stat_file.name
-
-        try:
-            # Initialize with interval of 3
-            iteration_metrics.initialize(
-                worker_id="test_worker_4",
-                stat_file_path=stat_file_path,
-                router_url=None,
-                report_interval=3,
-            )
-
-            # Report 5 times
-            for i in range(5):
-                metrics = {"batch_size_tokens": 128 * (i + 1), "num_requests": i + 1}
-                iteration_metrics.report_iteration(metrics)
-
-            time.sleep(0.1)
-
-            # Should only log at iterations 3 (only one that's a multiple of 3 in range 1-5)
-            with open(stat_file_path, "r") as f:
-                lines = f.readlines()
-                # Iterations 3 is reported (1, 2, 4, 5 are skipped)
-                self.assertEqual(len(lines), 1)
-                data = json.loads(lines[0])
-                self.assertEqual(data["iteration_num"], 3)
-                self.assertEqual(data["batch_size_tokens"], 128 * 3)
-
-        finally:
-            if os.path.exists(stat_file_path):
-                os.remove(stat_file_path)
+        # Verify HTTP
+        with MockRouterHandler.lock:
+            self.assertEqual(len(MockRouterHandler.received_stats), 1)
+            http_data = MockRouterHandler.received_stats[0]
+            self.assertEqual(http_data["batch_size_tokens"], 1024)
+            self.assertEqual(http_data["forward_mode"], "EXTEND")
+            self.assertEqual(http_data["iteration_num"], 1)
 
     def test_multiple_iterations(self):
         """Test logging multiple iterations with incrementing iteration numbers."""
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".stat", delete=False
-        ) as stat_file:
-            stat_file_path = stat_file.name
+        iteration_metrics.initialize(
+            worker_id="test_worker_5",
+            router_url=self.router_url,
+        )
 
-        try:
-            iteration_metrics.initialize(
-                worker_id="test_worker_5",
-                stat_file_path=stat_file_path,
-                router_url=None,
-                report_interval=1,
-            )
+        # Report 3 iterations
+        for i in range(3):
+            metrics = {
+                "batch_size_tokens": 100 + i * 50,
+                "iteration_time_ms": 10.0 + i,
+            }
+            iteration_metrics.report_iteration(metrics, iteration_num=i + 1)
 
-            # Report 3 iterations
+        time.sleep(0.5)
+
+        # Verify all 3 reported with correct iteration numbers
+        with MockRouterHandler.lock:
+            self.assertEqual(len(MockRouterHandler.received_stats), 3)
             for i in range(3):
-                metrics = {
-                    "batch_size_tokens": 100 + i * 50,
-                    "iteration_time_ms": 10.0 + i,
-                }
-                iteration_metrics.report_iteration(metrics)
-
-            time.sleep(0.1)
-
-            # Verify all 3 logged with correct iteration numbers
-            with open(stat_file_path, "r") as f:
-                lines = f.readlines()
-                self.assertEqual(len(lines), 3)
-
-                for i, line in enumerate(lines):
-                    data = json.loads(line)
-                    self.assertEqual(data["iteration_num"], i + 1)
-                    self.assertEqual(data["batch_size_tokens"], 100 + i * 50)
-
-        finally:
-            if os.path.exists(stat_file_path):
-                os.remove(stat_file_path)
+                data = MockRouterHandler.received_stats[i]
+                self.assertEqual(data["iteration_num"], i + 1)
+                self.assertEqual(data["batch_size_tokens"], 100 + i * 50)
 
     def test_shutdown_cleanup(self):
         """Test that shutdown properly closes resources."""
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".stat", delete=False
-        ) as stat_file:
-            stat_file_path = stat_file.name
+        iteration_metrics.initialize(
+            worker_id="test_worker_6",
+            router_url=self.router_url,
+        )
 
-        try:
-            iteration_metrics.initialize(
-                worker_id="test_worker_6",
-                stat_file_path=stat_file_path,
-                router_url=self.router_url,
-                report_interval=1,
-            )
+        # Report a metric
+        metrics = {"batch_size_tokens": 200}
+        iteration_metrics.report_iteration(metrics, iteration_num=1)
+        time.sleep(0.5)
 
-            # Report a metric
-            metrics = {"batch_size_tokens": 200}
-            iteration_metrics.report_iteration(metrics)
-            time.sleep(0.1)
+        # Shutdown
+        iteration_metrics.shutdown()
 
-            # Shutdown
-            iteration_metrics.shutdown()
+        # Try reporting after shutdown (should be no-op)
+        iteration_metrics.report_iteration({"batch_size_tokens": 300}, iteration_num=2)
+        time.sleep(0.5)
 
-            # Try reporting after shutdown (should be no-op)
-            iteration_metrics.report_iteration({"batch_size_tokens": 300})
-            time.sleep(0.1)
-
-            # Verify only the first metric was logged
-            with open(stat_file_path, "r") as f:
-                lines = f.readlines()
-                self.assertEqual(len(lines), 1)
-
-        finally:
-            if os.path.exists(stat_file_path):
-                os.remove(stat_file_path)
+        # Verify only the first metric was reported
+        with MockRouterHandler.lock:
+            self.assertEqual(len(MockRouterHandler.received_stats), 1)
 
     def test_http_timeout_handling(self):
         """Test that HTTP timeouts don't block reporting."""
         # Use an unreachable URL to simulate timeout
         unreachable_url = "http://127.0.0.1:1"  # Port 1 is typically unreachable
 
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".stat", delete=False
-        ) as stat_file:
-            stat_file_path = stat_file.name
+        iteration_metrics.initialize(
+            worker_id="test_worker_7",
+            router_url=unreachable_url,
+        )
 
-        try:
-            iteration_metrics.initialize(
-                worker_id="test_worker_7",
-                stat_file_path=stat_file_path,
-                router_url=unreachable_url,
-                report_interval=1,
-            )
+        # Report metrics (HTTP should timeout but should return quickly)
+        start_time = time.perf_counter()
+        metrics = {"batch_size_tokens": 400, "num_requests": 3}
+        iteration_metrics.report_iteration(metrics, iteration_num=1)
+        elapsed = time.perf_counter() - start_time
 
-            # Report metrics (HTTP should timeout but file should still work)
-            start_time = time.perf_counter()
-            metrics = {"batch_size_tokens": 400, "num_requests": 3}
-            iteration_metrics.report_iteration(metrics)
-            elapsed = time.perf_counter() - start_time
-
-            # Should return quickly (not blocking on HTTP timeout)
-            self.assertLess(elapsed, 0.5)
-
-            # File should still be written
-            time.sleep(0.1)
-            with open(stat_file_path, "r") as f:
-                lines = f.readlines()
-                self.assertEqual(len(lines), 1)
-                data = json.loads(lines[0])
-                self.assertEqual(data["batch_size_tokens"], 400)
-
-        finally:
-            if os.path.exists(stat_file_path):
-                os.remove(stat_file_path)
+        # Should return quickly (not blocking on HTTP timeout)
+        self.assertLess(elapsed, 0.5)
 
     def test_worker_id_in_metrics(self):
         """Test that worker_id is properly added to all metrics."""
         iteration_metrics.initialize(
             worker_id="server1:8000:tp0:dp1",
-            stat_file_path=None,
             router_url=self.router_url,
-            report_interval=1,
         )
 
         metrics = {"batch_size_tokens": 512}
-        iteration_metrics.report_iteration(metrics)
+        iteration_metrics.report_iteration(metrics, iteration_num=1)
 
         time.sleep(0.5)
 
@@ -369,48 +217,35 @@ class TestIterationMetrics(unittest.TestCase):
 
     def test_timestamp_added(self):
         """Test that timestamp is automatically added to metrics."""
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".stat", delete=False
-        ) as stat_file:
-            stat_file_path = stat_file.name
+        iteration_metrics.initialize(
+            worker_id="test_worker_8",
+            router_url=self.router_url,
+        )
 
-        try:
-            iteration_metrics.initialize(
-                worker_id="test_worker_8",
-                stat_file_path=stat_file_path,
-                router_url=None,
-                report_interval=1,
-            )
+        before_time = time.time()
+        metrics = {"batch_size_tokens": 100}
+        iteration_metrics.report_iteration(metrics, iteration_num=1)
+        after_time = time.time()
 
-            before_time = time.time()
-            metrics = {"batch_size_tokens": 100}
-            iteration_metrics.report_iteration(metrics)
-            after_time = time.time()
+        time.sleep(0.5)
 
-            time.sleep(0.1)
-
-            with open(stat_file_path, "r") as f:
-                data = json.loads(f.readline())
-                self.assertIn("timestamp", data)
-                self.assertGreaterEqual(data["timestamp"], before_time)
-                self.assertLessEqual(data["timestamp"], after_time)
-
-        finally:
-            if os.path.exists(stat_file_path):
-                os.remove(stat_file_path)
+        with MockRouterHandler.lock:
+            self.assertEqual(len(MockRouterHandler.received_stats), 1)
+            data = MockRouterHandler.received_stats[0]
+            self.assertIn("timestamp", data)
+            self.assertGreaterEqual(data["timestamp"], before_time)
+            self.assertLessEqual(data["timestamp"], after_time)
 
     def test_ui_snapshot(self):
         """Test that UI snapshot is updated with latest metrics."""
         iteration_metrics.initialize(
             worker_id="test_worker_9",
-            stat_file_path=None,
             router_url=None,
-            report_interval=1,
         )
 
         # Report first metric
         metrics1 = {"batch_size_tokens": 100, "num_requests": 2}
-        iteration_metrics.report_iteration(metrics1)
+        iteration_metrics.report_iteration(metrics1, iteration_num=1)
 
         # Get UI snapshot
         snapshot = iteration_metrics.get_ui_snapshot()
@@ -421,7 +256,7 @@ class TestIterationMetrics(unittest.TestCase):
 
         # Report second metric
         metrics2 = {"batch_size_tokens": 200, "num_requests": 4}
-        iteration_metrics.report_iteration(metrics2)
+        iteration_metrics.report_iteration(metrics2, iteration_num=2)
 
         # Verify UI snapshot updated to latest
         snapshot2 = iteration_metrics.get_ui_snapshot()
@@ -433,9 +268,7 @@ class TestIterationMetrics(unittest.TestCase):
         """Test that prefill_chunk_pairs can be an empty list for decode-only batches."""
         iteration_metrics.initialize(
             worker_id="test_worker_10",
-            stat_file_path=None,
             router_url=self.router_url,
-            report_interval=1,
         )
 
         # Report metrics for decode-only batch (no prefill chunks)
@@ -445,7 +278,7 @@ class TestIterationMetrics(unittest.TestCase):
             "forward_mode": "DECODE",
             "prefill_chunk_pairs": [],  # Empty for decode-only
         }
-        iteration_metrics.report_iteration(metrics)
+        iteration_metrics.report_iteration(metrics, iteration_num=1)
 
         time.sleep(0.5)
 
@@ -458,56 +291,34 @@ class TestIterationMetrics(unittest.TestCase):
 
     def test_prefill_chunk_pairs_non_chunked(self):
         """Test prefill_chunk_pairs for non-chunked prefill requests."""
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".stat", delete=False
-        ) as stat_file:
-            stat_file_path = stat_file.name
+        iteration_metrics.initialize(
+            worker_id="test_worker_11",
+            router_url=self.router_url,
+        )
 
-        try:
-            iteration_metrics.initialize(
-                worker_id="test_worker_11",
-                stat_file_path=stat_file_path,
-                router_url=self.router_url,
-                report_interval=1,
-            )
+        # Report metrics with non-chunked prefill (seqlen, seqlen)
+        metrics = {
+            "batch_size_tokens": 512,
+            "num_requests": 2,
+            "forward_mode": "EXTEND",
+            "prefill_chunk_pairs": [[512, 512], [1024, 1024]],  # Two non-chunked requests
+        }
+        iteration_metrics.report_iteration(metrics, iteration_num=1)
 
-            # Report metrics with non-chunked prefill (seqlen, seqlen)
-            metrics = {
-                "batch_size_tokens": 512,
-                "num_requests": 2,
-                "forward_mode": "EXTEND",
-                "prefill_chunk_pairs": [[512, 512], [1024, 1024]],  # Two non-chunked requests
-            }
-            iteration_metrics.report_iteration(metrics)
+        time.sleep(0.5)
 
-            time.sleep(0.5)
-
-            # Verify file logging
-            with open(stat_file_path, "r") as f:
-                data = json.loads(f.readline())
-                self.assertEqual(data["forward_mode"], "EXTEND")
-                self.assertEqual(len(data["prefill_chunk_pairs"]), 2)
-                self.assertEqual(data["prefill_chunk_pairs"][0], [512, 512])
-                self.assertEqual(data["prefill_chunk_pairs"][1], [1024, 1024])
-
-            # Verify HTTP logging
-            with MockRouterHandler.lock:
-                self.assertEqual(len(MockRouterHandler.received_stats), 1)
-                received = MockRouterHandler.received_stats[0]
-                self.assertEqual(len(received["prefill_chunk_pairs"]), 2)
-                self.assertEqual(received["prefill_chunk_pairs"][0], [512, 512])
-
-        finally:
-            if os.path.exists(stat_file_path):
-                os.remove(stat_file_path)
+        # Verify HTTP logging
+        with MockRouterHandler.lock:
+            self.assertEqual(len(MockRouterHandler.received_stats), 1)
+            received = MockRouterHandler.received_stats[0]
+            self.assertEqual(len(received["prefill_chunk_pairs"]), 2)
+            self.assertEqual(received["prefill_chunk_pairs"][0], [512, 512])
 
     def test_prefill_chunk_pairs_chunked(self):
         """Test prefill_chunk_pairs for chunked prefill requests."""
         iteration_metrics.initialize(
             worker_id="test_worker_12",
-            stat_file_path=None,
             router_url=self.router_url,
-            report_interval=1,
         )
 
         # Report metrics with chunked prefill
@@ -519,7 +330,7 @@ class TestIterationMetrics(unittest.TestCase):
             "forward_mode": "EXTEND",
             "prefill_chunk_pairs": [[256, 768]],  # Processing 3rd chunk (256) of total 768 tokens
         }
-        iteration_metrics.report_iteration(metrics)
+        iteration_metrics.report_iteration(metrics, iteration_num=1)
 
         time.sleep(0.5)
 
@@ -537,9 +348,7 @@ class TestIterationMetrics(unittest.TestCase):
         """Test prefill_chunk_pairs in mixed mode (prefill + decode)."""
         iteration_metrics.initialize(
             worker_id="test_worker_13",
-            stat_file_path=None,
             router_url=self.router_url,
-            report_interval=1,
         )
 
         # Report metrics in MIXED mode with multiple prefill requests
@@ -553,7 +362,7 @@ class TestIterationMetrics(unittest.TestCase):
                 [128, 128],    # Non-chunked prefill
             ],  # Decode requests have no entries
         }
-        iteration_metrics.report_iteration(metrics)
+        iteration_metrics.report_iteration(metrics, iteration_num=1)
 
         time.sleep(0.5)
 

@@ -583,6 +583,9 @@ class Scheduler(
         # Global TPOT (cycle time) regulator; set via /set_tpot
         self.tpot: Optional[float] = None
 
+        # Iteration counter - tracks completed GPU iterations
+        self.iteration_count = 0
+
         # Grid-based cycle time predictor for SLO-aware scheduling (optional)
         self.cycle_time_predictor = None
         if self.server_args.enable_iteration_metrics:
@@ -687,26 +690,26 @@ class Scheduler(
         """Initialize iteration metrics reporting."""
         from sglang.srt.ui import iteration_metrics
 
-        # Determine stat file path
-        stat_file_path = self._get_stat_file_path()
-
         iteration_metrics.initialize(
             worker_id=self.worker_id,
-            stat_file_path=stat_file_path,
             router_url=self.server_args.router_metrics_url,
-            report_interval=self.server_args.iteration_metrics_interval,
         )
         logger.info(f"Iteration metrics enabled for worker: {self.worker_id}")
 
     def _collect_and_report_iteration_metrics(
-        self, batch: ScheduleBatch, iteration_time_ms: float
+        self,
+        batch: ScheduleBatch,
+        iteration_time_ms: float = None,
+        destinations: list = None,
     ) -> None:
         """
         Collect iteration metrics and report via iteration_metrics module.
 
         Args:
             batch: The batch that was just executed
-            iteration_time_ms: Actual execution time in milliseconds
+            iteration_time_ms: Actual execution time in milliseconds (None for running batch)
+            destinations: List of destinations ["log", "ui", "router", "debug"]
+                         (None defaults to ["log", "ui", "router"])
         """
         if not self.server_args.enable_iteration_metrics:
             return
@@ -762,36 +765,67 @@ class Scheduler(
                         cumulative_prefill = prefix_len + current_chunk
                         prefill_chunk_pairs.append([current_chunk, cumulative_prefill])
 
-        # Build metrics payload (field names match UI expectations)
+        # Build metrics payload (field names match router and UI expectations)
         metrics = {
             # UI expects: running_batch_size, queue_reqs, kv_tokens_used, token_capacity
             "running_batch_size": len(batch.reqs),
             "queue_reqs": len(self.waiting_queue),
+            "waiting_queue_size": len(self.waiting_queue),  # Router expects this name
             "kv_tokens_used": num_used,
             "token_capacity": self.max_total_num_tokens,
-            "kv_usage_pct": round(token_usage * 100, 2),  # Convert to percentage
+            "kv_usage_pct": round(token_usage * 100, 2),  # For UI (as percentage)
+            "kv_cache_usage_pct": round(token_usage, 4),  # For router (as fraction 0.0-1.0)
             "prefill_tokens": prefill_tokens,
             "decode_tokens": decode_tokens,
             "token_batch_size": total_tokens,
-            # iteration_time_ms semantically represents elapsed iteration time; we now pass gpu_elapsed_ms here
-            "iteration_time_ms": round(iteration_time_ms, 2),
             "forward_mode": batch.forward_mode.name if batch.forward_mode else "UNKNOWN",
             # Prefill chunk pairs: list of [current_chunk, cumulative_prefill]
             "prefill_chunk_pairs": prefill_chunk_pairs,
-            # Optional scheduler interval between last two process_batch_result completions (overlap only)
-            **({"scheduler_interval_ms": round(getattr(batch, "scheduler_interval_ms", getattr(batch, "since_last_process_ms", 0.0)), 2)}
-               if getattr(batch, "scheduler_interval_ms", None) is not None or getattr(batch, "since_last_process_ms", None) is not None else {}),
             # Keep some old names for compatibility
             "batch_size_tokens": total_tokens,
             "num_requests": len(batch.reqs),
             "input_id_len": batch.input_ids.shape[0] if batch.input_ids is not None else 0,
         }
 
+        # Add timing fields only if iteration_time_ms is provided (finishing batch)
+        if iteration_time_ms is not None:
+            # iteration_time_ms semantically represents elapsed iteration time; we now pass gpu_elapsed_ms here
+            metrics["iteration_time_ms"] = round(iteration_time_ms, 2)
+            # Optional scheduler interval between last two process_batch_result completions (overlap only)
+            scheduler_interval = getattr(batch, "scheduler_interval_ms", None) or getattr(batch, "since_last_process_ms", None)
+            if scheduler_interval is not None:
+                metrics["scheduler_interval_ms"] = round(scheduler_interval, 2)
+
+        # Collect waiting queue information
+        waiting_queue_requests = []
+        total_extend_len = 0
+
+        for i, req in enumerate(self.waiting_queue):
+            extend_len = getattr(req, "extend_input_len", 0)
+
+            if i < 10:  # Limit to first 10 requests
+                prefix_len = len(getattr(req, "prefix_indices", []))
+                waiting_queue_requests.append({
+                    "prefix_len": prefix_len,
+                    "extend_len": extend_len,
+                })
+
+            # Calculate total for all requests (not just first 10)
+            total_extend_len += extend_len
+
+        metrics["waiting_queue_info"] = {
+            "pending_req_num": len(self.waiting_queue),
+            "total_extend_len": total_extend_len,
+            "requests": waiting_queue_requests,
+        }
+
         # Report (non-blocking)
-        iteration_metrics.report_iteration(metrics)
+        iteration_metrics.report_iteration(
+            metrics, iteration_num=self.iteration_count, destinations=destinations
+        )
 
         # Train the online predictor with this iteration's data
-        if self.cycle_time_predictor is not None:
+        if self.cycle_time_predictor is not None and iteration_time_ms is not None:
             self.cycle_time_predictor.submit(
                 batch_size_tokens=total_tokens,
                 prefill_chunk_pairs=prefill_chunk_pairs,
@@ -1074,6 +1108,8 @@ class Scheduler(
                 batch_end_time = time.perf_counter()
                 iteration_time_ms = (batch_end_time - batch_start_time) * 1000
                 logger.info(f"before report metrics: {iteration_time_ms}")
+                # Increment iteration counter for completed iteration
+                self.iteration_count += 1
                 # Report metrics
                 self._collect_and_report_iteration_metrics(batch, iteration_time_ms)
 
@@ -1108,6 +1144,21 @@ class Scheduler(
                 result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), result))
 
+                # Send running batch state to router (no timing information)
+                self._collect_and_report_iteration_metrics(
+                    batch,
+                    iteration_time_ms=None,  # No timing for running batch
+                    destinations=["router"]   # Router only
+                )
+
+                # Optional: Debug log running batch snapshot
+                if getattr(self.server_args, "enable_debug_metrics", False):
+                    self._collect_and_report_iteration_metrics(
+                        batch,
+                        iteration_time_ms=None,
+                        destinations=["debug"]  # Debug log only
+                    )
+
                 if self.last_batch is None:
                     # Create a dummy first batch to start the pipeline for overlap schedule.
                     # It is now used for triggering the sampling_info_done event.
@@ -1131,18 +1182,31 @@ class Scheduler(
                 )
 
                 # Report metrics for the batch that just completed using precise GPU time if available
+                # Send to log/UI only (router already got running batch state)
                 gpu_elapsed_ms = getattr(tmp_batch, 'gpu_elapsed_ms', None)
                 if gpu_elapsed_ms is not None:
+                    # Increment iteration counter for completed iteration
+                    self.iteration_count += 1
                     # Attach scheduler interval since last process result if available
                     since_last_ms = getattr(tmp_batch, 'since_last_process_ms', None)
                     if since_last_ms is not None:
                         tmp_batch.scheduler_interval_ms = since_last_ms
-                    self._collect_and_report_iteration_metrics(tmp_batch, gpu_elapsed_ms)
+                    self._collect_and_report_iteration_metrics(
+                        tmp_batch,
+                        gpu_elapsed_ms,
+                        destinations=["log", "ui"]  # Skip router
+                    )
                 elif hasattr(tmp_batch, 'iteration_start_time'):
+                    # Increment iteration counter for completed iteration
+                    self.iteration_count += 1
                     # Fallback to wall-clock time if GPU elapsed is unavailable
                     batch_end_time = time.perf_counter()
                     iteration_time_ms = (batch_end_time - tmp_batch.iteration_start_time) * 1000
-                    self._collect_and_report_iteration_metrics(tmp_batch, iteration_time_ms)
+                    self._collect_and_report_iteration_metrics(
+                        tmp_batch,
+                        iteration_time_ms,
+                        destinations=["log", "ui"]  # Skip router
+                    )
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -1180,6 +1244,8 @@ class Scheduler(
                     batch_end_time = time.perf_counter()
                     iteration_time_ms = (batch_end_time - batch_start_time) * 1000
                     logger.info(f"before report metrics3: {iteration_time_ms}")
+                    # Increment iteration counter for completed micro-batch
+                    self.iteration_count += 1
                     # Report metrics for this micro-batch
                     self._collect_and_report_iteration_metrics(self.cur_batch, iteration_time_ms)
 
