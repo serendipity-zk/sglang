@@ -91,7 +91,9 @@ impl RouterUi {
     /// Increment requests that passed middleware to generate endpoint immediately
     pub fn inc_mid_to_generate_immediate() {
         if let Some(state) = UI_STATE.get() {
-            state.mid_to_generate_immediate.fetch_add(1, Ordering::Relaxed);
+            state
+                .mid_to_generate_immediate
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -105,7 +107,9 @@ impl RouterUi {
     /// Increment requests that struggled through queue to generate endpoint
     pub fn inc_mid_to_generate_struggle() {
         if let Some(state) = UI_STATE.get() {
-            state.mid_to_generate_struggle.fetch_add(1, Ordering::Relaxed);
+            state
+                .mid_to_generate_struggle
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 

@@ -384,10 +384,7 @@ async fn worker_stats(
                 .filter_map(|pair| {
                     pair.as_array().and_then(|p| {
                         if p.len() == 2 {
-                            Some((
-                                p[0].as_i64().unwrap_or(0),
-                                p[1].as_i64().unwrap_or(0),
-                            ))
+                            Some((p[0].as_i64().unwrap_or(0), p[1].as_i64().unwrap_or(0)))
                         } else {
                             None
                         }
