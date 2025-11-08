@@ -86,6 +86,9 @@ class RouterArgs:
     # Tokenizer configuration
     model_path: Optional[str] = None
     tokenizer_path: Optional[str] = None
+    # Scheduler configuration
+    scheduler: str = "eager"
+    scheduler_tpot_buckets: Optional[List[float]] = None
 
     @staticmethod
     def add_cli_args(
@@ -445,6 +448,21 @@ class RouterArgs:
             type=str,
             default=None,
             help="Explicit tokenizer path (overrides model_path tokenizer if provided)",
+        )
+        # Scheduler configuration
+        parser.add_argument(
+            f"--{prefix}scheduler",
+            type=str,
+            default=RouterArgs.scheduler,
+            choices=["eager", "gated", "slo_aware"],
+            help="Scheduling strategy: 'eager' (always schedules), 'gated' (can keep in queue), 'slo_aware' (SLO-based multi-queue)",
+        )
+        parser.add_argument(
+            f"--{prefix}scheduler-tpot-buckets",
+            type=float,
+            nargs="*",
+            default=None,
+            help="TPOT bucket boundaries in ms for slo_aware scheduler (e.g., 10.0 50.0 100.0 creates 4 buckets: <10, 10-50, 50-100, >100)",
         )
 
     @classmethod

@@ -12,6 +12,9 @@ pub struct RouterConfig {
     pub connection_mode: ConnectionMode,
     /// Policy configuration
     pub policy: PolicyConfig,
+    /// Scheduler configuration
+    #[serde(default)]
+    pub scheduler: SchedulerConfig,
     /// Server host address
     pub host: String,
     /// Server port
@@ -208,6 +211,42 @@ impl PolicyConfig {
     }
 }
 
+/// Scheduler configuration for different scheduling strategies
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SchedulerConfig {
+    /// Eager scheduler - always attempts to schedule all pending requests (default behavior)
+    #[serde(rename = "eager")]
+    Eager,
+
+    /// Gated scheduler - allows requests to be kept in queue if policy returns None
+    #[serde(rename = "gated")]
+    Gated,
+
+    /// SLO-aware scheduler - maintains separate queues based on target TPOT
+    #[serde(rename = "slo_aware")]
+    SloAware {
+        /// TPOT bucket boundaries in milliseconds (e.g., [10.0, 50.0] creates 3 buckets: <10ms, 10-50ms, >50ms)
+        tpot_buckets: Vec<f32>,
+    },
+}
+
+impl SchedulerConfig {
+    pub fn name(&self) -> &'static str {
+        match self {
+            SchedulerConfig::Eager => "eager",
+            SchedulerConfig::Gated => "gated",
+            SchedulerConfig::SloAware { .. } => "slo_aware",
+        }
+    }
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        SchedulerConfig::Eager
+    }
+}
+
 /// Service discovery configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscoveryConfig {
@@ -353,6 +392,7 @@ impl Default for RouterConfig {
                 worker_urls: vec![],
             },
             policy: PolicyConfig::Random,
+            scheduler: SchedulerConfig::default(),
             host: "127.0.0.1".to_string(),
             port: 3001,
             max_payload_size: 536_870_912, // 512MB
@@ -913,6 +953,7 @@ mod tests {
             policy: PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 30,
             },
+            scheduler: SchedulerConfig::default(),
             host: "0.0.0.0".to_string(),
             port: 3000,
             max_payload_size: 1048576,
@@ -977,6 +1018,7 @@ mod tests {
                 eviction_interval_secs: 600,
                 max_tree_size: 10000,
             },
+            scheduler: SchedulerConfig::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
             max_payload_size: 536870912,
@@ -1032,6 +1074,7 @@ mod tests {
                 worker_urls: vec!["http://worker1".to_string()],
             },
             policy: PolicyConfig::RoundRobin,
+            scheduler: SchedulerConfig::default(),
             host: "::1".to_string(), // IPv6
             port: 8888,
             max_payload_size: 1024 * 1024 * 512, // 512MB

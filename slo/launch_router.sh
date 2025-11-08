@@ -11,4 +11,6 @@ python -m sglang_router.launch_router \
   --rate-limit-tokens-per-second 600 \
   --worker-urls \
     http://0.0.0.0:31001 \
-    http://0.0.0.0:31002 
+    http://0.0.0.0:31002 \
+  --scheduler slo_aware \
+  --scheduler-tpot-buckets 10.0 50.0 100.0

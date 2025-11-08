@@ -54,6 +54,7 @@ pub struct AppContext {
     pub tool_parser_registry: Option<&'static ParserRegistry>,
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
+    pub scheduler_registry: Arc<crate::schedulers::SchedulerRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub response_storage: SharedResponseStorage,
 }
@@ -98,6 +99,13 @@ impl AppContext {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(router_config.policy.clone()));
 
+        // Initialize scheduler registry with configured scheduler
+        let scheduler = crate::schedulers::SchedulerFactory::create_from_config(
+            &router_config.scheduler,
+            policy_registry.clone(),
+        );
+        let scheduler_registry = Arc::new(crate::schedulers::SchedulerRegistry::new(scheduler));
+
         let router_manager = None;
 
         // Initialize response storage based on configuration
@@ -115,6 +123,7 @@ impl AppContext {
             tool_parser_registry,
             worker_registry,
             policy_registry,
+            scheduler_registry,
             router_manager,
             response_storage,
         })

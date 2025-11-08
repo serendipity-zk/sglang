@@ -131,7 +131,11 @@ impl Router {
             queue_timeout,
         };
 
-        let scheduler_handle = spawn_scheduler(scheduler_config, pending_rx);
+        let scheduler_handle = spawn_scheduler(
+            ctx.scheduler_registry.clone(),
+            scheduler_config,
+            pending_rx,
+        );
 
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),
@@ -492,6 +496,10 @@ impl Router {
         let headers_owned = headers.cloned();
         let (response_tx, response_rx) = oneshot::channel();
 
+        // Extract SLO fields from the request
+        let target_ttft_ms = typed_req.get_target_ttft_ms();
+        let target_tpot_ms = typed_req.get_target_tpot_ms();
+
         let pending = PendingRequest {
             headers: headers_owned,
             body_json,
@@ -501,6 +509,8 @@ impl Router {
             text,
             enqueue_started: Instant::now(),
             response_tx,
+            target_ttft_ms,
+            target_tpot_ms,
         };
 
         match self.pending_tx.try_send(pending) {

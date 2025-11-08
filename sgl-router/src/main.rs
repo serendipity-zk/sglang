@@ -2,7 +2,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 use sglang_router_rs::config::{
     CircuitBreakerConfig, ConfigError, ConfigResult, ConnectionMode, DiscoveryConfig,
     HealthCheckConfig, HistoryBackend, MetricsConfig, PolicyConfig, RetryConfig, RouterConfig,
-    RoutingMode,
+    RoutingMode, SchedulerConfig,
 };
 use sglang_router_rs::metrics::PrometheusConfig;
 use sglang_router_rs::server::{self, ServerConfig};
@@ -463,6 +463,7 @@ impl CliArgs {
         Ok(RouterConfig {
             mode,
             policy,
+            scheduler: SchedulerConfig::default(),
             connection_mode,
             host: self.host.clone(),
             port: self.port,

@@ -1,7 +1,7 @@
 from typing import Optional
 
 from sglang_router.router_args import RouterArgs
-from sglang_router_rs import PolicyType
+from sglang_router_rs import PolicyType, SchedulerType
 from sglang_router_rs import Router as _Router
 
 
@@ -16,6 +16,16 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "power_of_two": PolicyType.PowerOfTwo,
     }
     return policy_map[policy_str]
+
+
+def scheduler_from_str(scheduler_str: str) -> SchedulerType:
+    """Convert scheduler string to SchedulerType enum."""
+    scheduler_map = {
+        "eager": SchedulerType.Eager,
+        "gated": SchedulerType.Gated,
+        "slo_aware": SchedulerType.SloAware,
+    }
+    return scheduler_map.get(scheduler_str, SchedulerType.Eager)
 
 
 class Router:
@@ -118,6 +128,7 @@ class Router:
         )
         args_dict["prefill_policy"] = policy_from_str(args_dict["prefill_policy"])
         args_dict["decode_policy"] = policy_from_str(args_dict["decode_policy"])
+        args_dict["scheduler"] = scheduler_from_str(args_dict["scheduler"])
 
         # remove mini_lb parameter
         args_dict.pop("mini_lb")

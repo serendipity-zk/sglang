@@ -175,7 +175,7 @@ impl RouterUi {
         };
 
         // Clear screen and move cursor to home; lock stdout for the entire frame
-        let mut out = stdout();
+        let out = stdout();
         let mut handle = out.lock();
         let _ = write!(handle, "\x1b[2J\x1b[H");
 

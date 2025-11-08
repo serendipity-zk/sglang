@@ -12,6 +12,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod policies;
 pub mod protocols;
+pub mod schedulers;
 pub mod reasoning_parser;
 pub mod routers;
 pub mod server;
@@ -29,6 +30,14 @@ pub enum PolicyType {
     RoundRobin,
     CacheAware,
     PowerOfTwo,
+}
+
+#[pyclass(eq)]
+#[derive(Clone, PartialEq, Debug)]
+pub enum SchedulerType {
+    Eager,
+    Gated,
+    SloAware,
 }
 
 #[pyclass]
@@ -98,6 +107,9 @@ struct Router {
     model_path: Option<String>,
     // Explicit tokenizer path
     tokenizer_path: Option<String>,
+    // Scheduler configuration
+    scheduler: SchedulerType,
+    scheduler_tpot_buckets: Option<Vec<f32>>,
 }
 
 impl Router {
@@ -159,6 +171,15 @@ impl Router {
         // Convert main policy
         let policy = convert_policy(&self.policy);
 
+        // Convert scheduler configuration
+        let scheduler = match &self.scheduler {
+            SchedulerType::Eager => config::SchedulerConfig::Eager,
+            SchedulerType::Gated => config::SchedulerConfig::Gated,
+            SchedulerType::SloAware => config::SchedulerConfig::SloAware {
+                tpot_buckets: self.scheduler_tpot_buckets.clone().unwrap_or_else(|| vec![10.0, 50.0]),
+            },
+        };
+
         // Service discovery configuration
         let discovery = if self.service_discovery {
             Some(DiscoveryConfig {
@@ -187,6 +208,7 @@ impl Router {
         Ok(config::RouterConfig {
             mode,
             policy,
+            scheduler,
             host: self.host.clone(),
             port: self.port,
             connection_mode: self.connection_mode.clone(),
@@ -301,6 +323,9 @@ impl Router {
         // Tokenizer defaults
         model_path = None,
         tokenizer_path = None,
+        // Scheduler defaults
+        scheduler = SchedulerType::Eager,
+        scheduler_tpot_buckets = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -360,6 +385,8 @@ impl Router {
         rate_limit_tokens_per_second: Option<usize>,
         model_path: Option<String>,
         tokenizer_path: Option<String>,
+        scheduler: SchedulerType,
+        scheduler_tpot_buckets: Option<Vec<f32>>,
     ) -> PyResult<Self> {
         // Determine connection mode from worker URLs
         let mut all_urls = worker_urls.clone();
@@ -436,6 +463,8 @@ impl Router {
             connection_mode,
             model_path,
             tokenizer_path,
+            scheduler,
+            scheduler_tpot_buckets,
         })
     }
 
@@ -506,6 +535,7 @@ impl Router {
 #[pymodule]
 fn sglang_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PolicyType>()?;
+    m.add_class::<SchedulerType>()?;
     m.add_class::<Router>()?;
     Ok(())
 }

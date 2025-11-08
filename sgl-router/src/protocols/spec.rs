@@ -1867,6 +1867,14 @@ impl GenerationRequest for GenerateRequest {
         // No text input found
         String::new()
     }
+
+    fn get_target_ttft_ms(&self) -> Option<f32> {
+        self.target_ttft_ms
+    }
+
+    fn get_target_tpot_ms(&self) -> Option<f32> {
+        self.target_tpot_ms
+    }
 }
 
 // ==================================================================
@@ -2144,6 +2152,16 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Extract text content for routing decisions
     fn extract_text_for_routing(&self) -> String;
+
+    /// Get target TTFT (time to first token) SLO in milliseconds
+    fn get_target_ttft_ms(&self) -> Option<f32> {
+        None
+    }
+
+    /// Get target TPOT (time per output token) SLO in milliseconds
+    fn get_target_tpot_ms(&self) -> Option<f32> {
+        None
+    }
 }
 
 /// Helper type for string or array of strings
