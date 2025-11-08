@@ -3,7 +3,8 @@
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
 
-use crate::core::Worker;
+use crate::core::{Worker, WorkerStats};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -71,8 +72,22 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Update worker load information
     ///
     /// This is called periodically with current load information for load-aware policies.
-    fn update_loads(&self, _loads: &std::collections::HashMap<String, isize>) {
+    fn update_loads(&self, _loads: &HashMap<String, isize>) {
         // Default: no-op for policies that don't use load information
+    }
+
+    /// Update worker stats with detailed metrics
+    ///
+    /// This is called when workers push their stats via /worker_stats endpoint.
+    /// Policies can override this to access rich stats (cache usage, iteration time, etc.).
+    /// Default implementation converts stats to simple load map and calls update_loads().
+    fn update_worker_stats(&self, stats: &HashMap<String, WorkerStats>) {
+        // Default: convert to load map (num_requests + waiting_queue_size)
+        let loads: HashMap<String, isize> = stats
+            .iter()
+            .map(|(url, s)| (url.clone(), s.total_load() as isize))
+            .collect();
+        self.update_loads(&loads);
     }
 
     /// Reset any internal state

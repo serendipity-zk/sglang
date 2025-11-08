@@ -340,122 +340,142 @@ async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Respons
 
 // Worker stats endpoint for receiving metrics from workers
 async fn worker_stats(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(stats): Json<serde_json::Value>,
 ) -> Response {
-    // Extract key metrics
-    let worker_id = stats
-        .get("worker_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-
-    let batch_size_tokens = stats
-        .get("batch_size_tokens")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-
-    let num_requests = stats
-        .get("num_requests")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-
-    let kv_cache_usage_pct = stats
-        .get("kv_cache_usage_pct")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-
-    let iteration_time_ms = stats
-        .get("iteration_time_ms")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-
-    let waiting_queue_size = stats
-        .get("waiting_queue_size")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-
-    let forward_mode = stats
-        .get("forward_mode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("UNKNOWN");
-
-    let iteration_num = stats
-        .get("iteration_num")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-
-    // Extract prefill chunk pairs (list of [current_chunk, cumulative_prefill])
-    let prefill_chunk_pairs = stats
-        .get("prefill_chunk_pairs")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|pair| {
-                    pair.as_array().and_then(|p| {
-                        if p.len() == 2 {
-                            Some((p[0].as_i64().unwrap_or(0), p[1].as_i64().unwrap_or(0)))
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .collect::<Vec<_>>()
-        });
+    // Parse stats into structured format
+    let mut worker_stats = match crate::core::WorkerStats::from_json(&stats) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("Failed to parse worker stats: {}", e);
+            return (StatusCode::BAD_REQUEST, format!("Invalid stats: {}", e)).into_response();
+        }
+    };
 
     // Detailed debug logging
-    if let Some(pairs) = &prefill_chunk_pairs {
+    let queue_info_str = worker_stats.waiting_queue_info.as_ref().map(|info| {
+        format!(
+            "pending={} extend_len={}",
+            info.pending_req_num, info.total_extend_len
+        )
+    });
+
+    if let Some(pairs) = &worker_stats.prefill_chunk_pairs {
         if !pairs.is_empty() {
             let pairs_str = pairs
                 .iter()
                 .map(|(chunk, cumul)| format!("({},{})", chunk, cumul))
                 .collect::<Vec<_>>()
                 .join(", ");
-            tracing::error!(
-                "[WORKER_STATS] worker={} | iter={} | batch_tokens={} | num_reqs={} | \
-                 kv_usage={:.2}% | iter_time={:.2}ms | queue={} | mode={} | prefill_chunks=[{}]",
-                worker_id,
-                iteration_num,
-                batch_size_tokens,
-                num_requests,
-                kv_cache_usage_pct * 100.0,
-                iteration_time_ms,
-                waiting_queue_size,
-                forward_mode,
-                pairs_str
-            );
+
+            if let Some(ref queue_info) = queue_info_str {
+                tracing::debug!(
+                    "[WORKER_STATS] worker={} | iter={} | batch_tokens={} | num_reqs={} | \
+                     queue={} | {} | mode={} | prefill_chunks=[{}]",
+                    worker_stats.worker_id,
+                    worker_stats.iteration_num,
+                    worker_stats.batch_size_tokens,
+                    worker_stats.num_requests,
+                    worker_stats.waiting_queue_size,
+                    queue_info,
+                    worker_stats.forward_mode,
+                    pairs_str
+                );
+            } else {
+                tracing::debug!(
+                    "[WORKER_STATS] worker={} | iter={} | batch_tokens={} | num_reqs={} | \
+                     queue={} | mode={} | prefill_chunks=[{}]",
+                    worker_stats.worker_id,
+                    worker_stats.iteration_num,
+                    worker_stats.batch_size_tokens,
+                    worker_stats.num_requests,
+                    worker_stats.waiting_queue_size,
+                    worker_stats.forward_mode,
+                    pairs_str
+                );
+            }
         } else {
-            tracing::error!(
-                "[WORKER_STATS] worker={} | iter={} | batch_tokens={} | num_reqs={} | \
-                 kv_usage={:.2}% | iter_time={:.2}ms | queue={} | mode={}",
-                worker_id,
-                iteration_num,
-                batch_size_tokens,
-                num_requests,
-                kv_cache_usage_pct * 100.0,
-                iteration_time_ms,
-                waiting_queue_size,
-                forward_mode
-            );
+            if let Some(ref queue_info) = queue_info_str {
+                tracing::debug!(
+                    "[WORKER_STATS] worker={} | iter={} | batch_tokens={} | num_reqs={} | \
+                     queue={} | {} | mode={}",
+                    worker_stats.worker_id,
+                    worker_stats.iteration_num,
+                    worker_stats.batch_size_tokens,
+                    worker_stats.num_requests,
+                    worker_stats.waiting_queue_size,
+                    queue_info,
+                    worker_stats.forward_mode
+                );
+            } else {
+                tracing::debug!(
+                    "[WORKER_STATS] worker={} | iter={} | batch_tokens={} | num_reqs={} | \
+                     queue={} | mode={}",
+                    worker_stats.worker_id,
+                    worker_stats.iteration_num,
+                    worker_stats.batch_size_tokens,
+                    worker_stats.num_requests,
+                    worker_stats.waiting_queue_size,
+                    worker_stats.forward_mode
+                );
+            }
         }
     } else {
-        tracing::error!(
-            "[WORKER_STATS] worker={} | iter={} | batch_tokens={} | num_reqs={} | \
-             kv_usage={:.2}% | iter_time={:.2}ms | queue={} | mode={}",
-            worker_id,
-            iteration_num,
-            batch_size_tokens,
-            num_requests,
-            kv_cache_usage_pct * 100.0,
-            iteration_time_ms,
-            waiting_queue_size,
-            forward_mode
-        );
+        if let Some(ref queue_info) = queue_info_str {
+            tracing::debug!(
+                "[WORKER_STATS] worker={} | iter={} | batch_tokens={} | num_reqs={} | \
+                 queue={} | {} | mode={}",
+                worker_stats.worker_id,
+                worker_stats.iteration_num,
+                worker_stats.batch_size_tokens,
+                worker_stats.num_requests,
+                worker_stats.waiting_queue_size,
+                queue_info,
+                worker_stats.forward_mode
+            );
+        } else {
+            tracing::debug!(
+                "[WORKER_STATS] worker={} | iter={} | batch_tokens={} | num_reqs={} | \
+                 queue={} | mode={}",
+                worker_stats.worker_id,
+                worker_stats.iteration_num,
+                worker_stats.batch_size_tokens,
+                worker_stats.num_requests,
+                worker_stats.waiting_queue_size,
+                worker_stats.forward_mode
+            );
+        }
     }
 
-    // TODO: Update worker metadata in registry for load balancing
-    // state.context.worker_registry.update_stats(worker_id, stats);
+    // Store stats in WorkerRegistry
+    let resolved_worker_url = state
+        .context
+        .worker_registry
+        .resolve_worker_url(&worker_stats.worker_id)
+        .or_else(|| {
+            tracing::debug!(
+                "Worker stats identifier {} does not match a registered worker yet",
+                worker_stats.worker_id
+            );
+            None
+        })
+        .unwrap_or_else(|| worker_stats.worker_id.clone());
 
-    (StatusCode::OK, "Stats received").into_response()
+    worker_stats.worker_id = resolved_worker_url.clone();
+    state
+        .context
+        .worker_registry
+        .update_stats(&resolved_worker_url, worker_stats);
+
+    // Asynchronously broadcast stats to all policies
+    let registry_clone = Arc::clone(&state.context.worker_registry);
+    let policy_registry_clone = Arc::clone(&state.context.policy_registry);
+    tokio::spawn(async move {
+        let all_stats = registry_clone.get_all_stats();
+        policy_registry_clone.broadcast_worker_stats(&all_stats);
+    });
+
+    (StatusCode::OK, "Stats received and propagated").into_response()
 }
 
 // ---------- Worker management endpoints (RESTful) ----------

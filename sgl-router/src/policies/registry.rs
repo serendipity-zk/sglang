@@ -9,7 +9,7 @@ use super::{
     RoundRobinPolicy,
 };
 use crate::config::types::PolicyConfig;
-use crate::core::Worker;
+use crate::core::{Worker, WorkerStats};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info, warn};
@@ -329,6 +329,37 @@ impl PolicyRegistry {
                     }
                 }
             }
+        }
+    }
+
+    /// Broadcast worker stats to all policies
+    ///
+    /// This is called when worker stats are received via /worker_stats endpoint.
+    /// It propagates the stats to all registered policies (default, model-specific, and PD policies).
+    pub fn broadcast_worker_stats(&self, stats: &HashMap<String, WorkerStats>) {
+        debug!("Broadcasting worker stats to all policies");
+
+        // Update default policy
+        self.default_policy.update_worker_stats(stats);
+
+        // Update all model-specific policies
+        {
+            let policies = self.model_policies.read().unwrap();
+            for (model_id, policy) in policies.iter() {
+                debug!("Updating stats for model {} policy: {}", model_id, policy.name());
+                policy.update_worker_stats(stats);
+            }
+        }
+
+        // Update PD policies if present
+        if let Some(prefill_policy) = self.prefill_policy.read().unwrap().as_ref() {
+            debug!("Updating stats for prefill policy: {}", prefill_policy.name());
+            prefill_policy.update_worker_stats(stats);
+        }
+
+        if let Some(decode_policy) = self.decode_policy.read().unwrap().as_ref() {
+            debug!("Updating stats for decode policy: {}", decode_policy.name());
+            decode_policy.update_worker_stats(stats);
         }
     }
 }

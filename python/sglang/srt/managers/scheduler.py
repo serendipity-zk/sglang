@@ -806,6 +806,7 @@ class Scheduler(
             if i < 10:  # Limit to first 10 requests
                 prefix_len = len(getattr(req, "prefix_indices", []))
                 waiting_queue_requests.append({
+                    "id": req.rid,
                     "prefix_len": prefix_len,
                     "extend_len": extend_len,
                 })

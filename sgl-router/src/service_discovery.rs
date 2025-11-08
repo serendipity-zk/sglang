@@ -596,14 +596,23 @@ mod tests {
         }; // Very short timeout for tests
 
         // Create AppContext with minimal components
+        let worker_registry = Arc::new(crate::core::WorkerRegistry::new());
+        let policy_registry = Arc::new(crate::policies::PolicyRegistry::new(
+            router_config.policy.clone(),
+        ));
+        let scheduler = crate::schedulers::SchedulerFactory::create_from_config(
+            &router_config.scheduler,
+            policy_registry.clone(),
+        );
+        let scheduler_registry =
+            Arc::new(crate::schedulers::SchedulerRegistry::new(scheduler));
         let app_context = Arc::new(AppContext {
             client: reqwest::Client::new(),
             router_config: router_config.clone(),
             rate_limiter: Arc::new(TokenBucket::new(1000, 1000)),
-            worker_registry: Arc::new(crate::core::WorkerRegistry::new()),
-            policy_registry: Arc::new(crate::policies::PolicyRegistry::new(
-                router_config.policy.clone(),
-            )),
+            worker_registry,
+            policy_registry,
+            scheduler_registry,
             tokenizer: None,                // HTTP mode doesn't need tokenizer
             reasoning_parser_factory: None, // HTTP mode doesn't need reasoning parser
             tool_parser_registry: None,     // HTTP mode doesn't need tool parser

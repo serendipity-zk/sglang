@@ -1,0 +1,149 @@
+use serde::{Deserialize, Serialize};
+use std::time::Instant;
+
+/// Individual waiting queue request information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaitingQueueRequest {
+    pub id: String,
+    pub prefix_len: i64,
+    pub extend_len: i64,
+}
+
+/// Waiting queue information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaitingQueueInfo {
+    pub pending_req_num: i64,
+    pub total_extend_len: i64,
+    pub requests: Vec<WaitingQueueRequest>,
+}
+
+/// Statistics reported by workers via /worker_stats endpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerStats {
+    /// Worker identifier (URL)
+    pub worker_id: String,
+
+    /// Current batch size in tokens
+    pub batch_size_tokens: i64,
+
+    /// Number of requests currently being processed
+    pub num_requests: i64,
+
+    /// Size of the waiting queue
+    pub waiting_queue_size: i64,
+
+    /// Detailed waiting queue information
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_queue_info: Option<WaitingQueueInfo>,
+
+    /// Current forward mode (e.g., "PREFILL", "DECODE", "UNKNOWN")
+    pub forward_mode: String,
+
+    /// Iteration counter
+    pub iteration_num: i64,
+
+    /// Prefill chunk pairs: [(chunk_size, cumulative_prefill), ...]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_chunk_pairs: Option<Vec<(i64, i64)>>,
+
+    /// Timestamp when stats were received (not serialized)
+    #[serde(skip, default = "Instant::now")]
+    pub timestamp: Instant,
+}
+
+impl WorkerStats {
+    /// Calculate total load as num_requests + waiting_queue_size
+    pub fn total_load(&self) -> i64 {
+        self.num_requests + self.waiting_queue_size
+    }
+
+    /// Create WorkerStats from JSON value
+    pub fn from_json(stats: &serde_json::Value) -> Result<Self, String> {
+        let worker_id = stats
+            .get("worker_id")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing worker_id")?
+            .to_string();
+
+        let batch_size_tokens = stats
+            .get("batch_size_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        let num_requests = stats
+            .get("num_requests")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        let waiting_queue_size = stats
+            .get("waiting_queue_size")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        let waiting_queue_info = stats
+            .get("waiting_queue_info")
+            .and_then(|v| v.as_object())
+            .and_then(|obj| {
+                let pending_req_num = obj.get("pending_req_num")?.as_i64()?;
+                let total_extend_len = obj.get("total_extend_len")?.as_i64()?;
+                let requests = obj.get("requests")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|req| {
+                        let req_obj = req.as_object()?;
+                        Some(WaitingQueueRequest {
+                            id: req_obj.get("id")?.as_str()?.to_string(),
+                            prefix_len: req_obj.get("prefix_len")?.as_i64()?,
+                            extend_len: req_obj.get("extend_len")?.as_i64()?,
+                        })
+                    })
+                    .collect();
+
+                Some(WaitingQueueInfo {
+                    pending_req_num,
+                    total_extend_len,
+                    requests,
+                })
+            });
+
+        let forward_mode = stats
+            .get("forward_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UNKNOWN")
+            .to_string();
+
+        let iteration_num = stats
+            .get("iteration_num")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        let prefill_chunk_pairs = stats
+            .get("prefill_chunk_pairs")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|pair| {
+                        pair.as_array().and_then(|p| {
+                            if p.len() == 2 {
+                                Some((p[0].as_i64()?, p[1].as_i64()?))
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .collect()
+            });
+
+        Ok(WorkerStats {
+            worker_id,
+            batch_size_tokens,
+            num_requests,
+            waiting_queue_size,
+            waiting_queue_info,
+            forward_mode,
+            iteration_num,
+            prefill_chunk_pairs,
+            timestamp: Instant::now(),
+        })
+    }
+}

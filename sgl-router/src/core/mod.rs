@@ -13,6 +13,7 @@ pub mod token_bucket;
 pub mod worker;
 pub mod worker_builder;
 pub mod worker_registry;
+pub mod worker_stats;
 
 // Re-export commonly used types at the module level
 pub use circuit_breaker::{
@@ -26,3 +27,4 @@ pub use worker::{
 };
 pub use worker_builder::{BasicWorkerBuilder, DPAwareWorkerBuilder};
 pub use worker_registry::{WorkerId, WorkerRegistry, WorkerRegistryStats};
+pub use worker_stats::WorkerStats;

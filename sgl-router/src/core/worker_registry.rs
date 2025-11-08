@@ -2,10 +2,12 @@
 //!
 //! Provides centralized registry for workers with model-based indexing
 
-use crate::core::{ConnectionMode, Worker, WorkerType};
+use crate::core::{ConnectionMode, Worker, WorkerStats, WorkerType};
 use dashmap::DashMap;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
+use url::Url;
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -57,6 +59,9 @@ pub struct WorkerRegistry {
 
     /// URL to worker ID mapping (for backward compatibility)
     url_to_id: Arc<DashMap<String, WorkerId>>,
+
+    /// Real-time worker stats (worker_url -> stats)
+    worker_stats: Arc<DashMap<String, WorkerStats>>,
 }
 
 impl WorkerRegistry {
@@ -69,6 +74,7 @@ impl WorkerRegistry {
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
+            worker_stats: Arc::new(DashMap::new()),
         }
     }
 
@@ -149,6 +155,9 @@ impl WorkerRegistry {
             {
                 conn_workers.retain(|id| id != worker_id);
             }
+
+            // Remove worker stats
+            self.worker_stats.remove(worker.url());
 
             Some(worker)
         } else {
@@ -413,6 +422,128 @@ impl WorkerRegistry {
 
         crate::core::HealthChecker::new(handle, shutdown)
     }
+
+    /// Update worker stats for a given worker URL
+    pub fn update_stats(&self, worker_url: &str, stats: WorkerStats) {
+        self.worker_stats.insert(worker_url.to_string(), stats);
+    }
+
+    /// Try to resolve a worker identifier (ID, URL, or `<host>:<port>[:dp#]`) to a registered URL
+    pub fn resolve_worker_url(&self, identifier: &str) -> Option<String> {
+        if identifier.is_empty() {
+            return None;
+        }
+
+        if self.get_by_url(identifier).is_some() {
+            return Some(identifier.to_string());
+        }
+
+        let (host_port, dp_rank) = Self::parse_worker_identifier(identifier)?;
+        for worker in self.get_all() {
+            if let Some(expected_dp) = dp_rank {
+                if worker.dp_rank() != Some(expected_dp) {
+                    continue;
+                }
+            } else if worker.dp_rank().is_some() {
+                // Avoid matching DP-aware workers when stats omit dp rank, since multiple entries share host:port
+                continue;
+            }
+
+            if let Some(candidate_host_port) = Self::host_port_from_url(worker.base_url()) {
+                if candidate_host_port == host_port {
+                    return Some(worker.url().to_string());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Get worker stats for a given worker URL
+    pub fn get_stats(&self, worker_url: &str) -> Option<WorkerStats> {
+        self.worker_stats.get(worker_url).map(|s| s.clone())
+    }
+
+    /// Get all worker stats as a HashMap
+    pub fn get_all_stats(&self) -> HashMap<String, WorkerStats> {
+        self.worker_stats
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
+    }
+
+    /// Remove stats for a given worker URL
+    pub fn remove_stats(&self, worker_url: &str) {
+        self.worker_stats.remove(worker_url);
+    }
+
+    fn parse_worker_identifier(identifier: &str) -> Option<(String, Option<usize>)> {
+        let mut base = identifier.trim();
+        let mut dp_rank = None;
+
+        while let Some((rest, suffix)) = base.rsplit_once(':') {
+            if let Some(rank) = suffix.strip_prefix("dp") {
+                if dp_rank.is_none() {
+                    if let Ok(num) = rank.parse::<usize>() {
+                        dp_rank = Some(num);
+                        base = rest;
+                        continue;
+                    }
+                }
+            }
+
+            if let Some(rank) = suffix.strip_prefix("tp") {
+                if rank.parse::<usize>().is_ok() {
+                    base = rest;
+                    continue;
+                }
+            }
+
+            break;
+        }
+
+        let host_port = if base.contains("://") {
+            Self::host_port_from_url(base)?
+        } else {
+            Self::host_port_from_host_port(base)?
+        };
+
+        Some((host_port, dp_rank))
+    }
+
+    fn host_port_from_url(url_str: &str) -> Option<String> {
+        if let Ok(parsed) = Url::parse(url_str) {
+            let host = parsed.host_str()?.to_ascii_lowercase();
+            let port = parsed.port_or_known_default()?;
+            return Some(format!("{host}:{port}"));
+        }
+
+        if let Some((base, _)) = url_str.rsplit_once('@') {
+            if let Ok(parsed) = Url::parse(base) {
+                let host = parsed.host_str()?.to_ascii_lowercase();
+                let port = parsed.port_or_known_default()?;
+                return Some(format!("{host}:{port}"));
+            }
+        }
+
+        None
+    }
+
+    fn host_port_from_host_port(input: &str) -> Option<String> {
+        let trimmed = input.trim().trim_matches('/');
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let (host_part, port_part) = trimmed.rsplit_once(':')?;
+        let port = port_part.parse::<u16>().ok()?;
+        let host = host_part
+            .trim()
+            .trim_matches(|c| c == '[' || c == ']')
+            .to_ascii_lowercase();
+
+        Some(format!("{host}:{port}"))
+    }
 }
 
 impl Default for WorkerRegistry {
@@ -436,7 +567,7 @@ pub struct WorkerRegistryStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, CircuitBreakerConfig};
+    use crate::core::{BasicWorkerBuilder, CircuitBreakerConfig, DPAwareWorkerBuilder};
     use std::collections::HashMap;
 
     #[test]
@@ -546,5 +677,42 @@ mod tests {
         let llama_workers_after = registry.get_by_model_fast("llama-3");
         assert_eq!(llama_workers_after.len(), 1);
         assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
+    }
+
+    #[test]
+    fn test_resolve_worker_url_basic_identifier() {
+        let registry = WorkerRegistry::new();
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker-basic:8080")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        registry.register(worker);
+
+        let resolved = registry
+            .resolve_worker_url("worker-basic:8080")
+            .expect("should resolve host:port identifier");
+        assert_eq!(resolved, "http://worker-basic:8080");
+
+        let resolved_url = registry
+            .resolve_worker_url("http://worker-basic:8080")
+            .expect("should accept existing url");
+        assert_eq!(resolved_url, "http://worker-basic:8080");
+    }
+
+    #[test]
+    fn test_resolve_worker_url_dp_identifier() {
+        let registry = WorkerRegistry::new();
+        let worker: Arc<dyn Worker> =
+            Arc::new(DPAwareWorkerBuilder::new("http://worker-dp:9090", 1, 2).build());
+        registry.register(worker);
+
+        let resolved = registry
+            .resolve_worker_url("worker-dp:9090:dp1")
+            .expect("should resolve dp-aware worker");
+        assert_eq!(resolved, "http://worker-dp:9090@1");
+
+        // Missing dp rank is ambiguous across DP workers and should not resolve
+        assert!(registry.resolve_worker_url("worker-dp:9090").is_none());
     }
 }
