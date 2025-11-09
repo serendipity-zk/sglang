@@ -325,6 +325,7 @@ class PrefillAdder:
         priority_scheduling_preemption_threshold: int = 0,
         cycle_time_predictor = None,
         tpot_slo: Optional[float] = None,
+        target_iteration_time_ms: Optional[float] = None,
         max_total_num_tokens: Optional[int] = None,
     ):
         self.page_size = page_size
@@ -367,9 +368,11 @@ class PrefillAdder:
         # SLO-aware prediction (optional feature)
         self.cycle_time_predictor = cycle_time_predictor
         self.tpot_slo = tpot_slo
+        self.target_iteration_time_ms = target_iteration_time_ms
         self.max_total_num_tokens = max_total_num_tokens
         self.slo_aware_chunking = (
-            cycle_time_predictor is not None and tpot_slo is not None
+            cycle_time_predictor is not None
+            and (tpot_slo is not None or target_iteration_time_ms is not None)
         )
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
@@ -476,7 +479,18 @@ class PrefillAdder:
                 kv_tokens_used=kv_used,
             )
 
-            if predicted_time <= self.tpot_slo:
+            target_limit = (
+                self.target_iteration_time_ms
+                if self.target_iteration_time_ms is not None
+                else self.tpot_slo
+            )
+
+            if target_limit is None:
+                best_size = mid
+                left = mid + 1
+                continue
+
+            if predicted_time <= target_limit:
                 best_size = mid
                 left = mid + 1
             else:
@@ -795,6 +809,7 @@ class PrefillAdder:
                         )
 
                 # Apply SLO-aware chunking if enabled
+                trunc_len = min(trunc_len, req.extend_input_len)
                 trunc_len = self._apply_slo_and_budget_limits(req, trunc_len, "add_one_req_chunked")
                 if trunc_len <= 0:
                     return AddReqResult.OTHER

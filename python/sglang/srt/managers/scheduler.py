@@ -141,6 +141,7 @@ from sglang.srt.managers.scheduler_output_processor_mixin import (
 )
 from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
+from sglang.srt.managers.iteration_target import compute_iteration_target
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
@@ -282,6 +283,8 @@ class Scheduler(
 
         # Timestamp of the last completed process_batch_result call
         self._last_process_result_end_time: Optional[float] = None
+        # Timestamp of the last payload we submitted to the detokenizer
+        self._last_detokenizer_submit_time: Optional[float] = None
 
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
@@ -588,6 +591,10 @@ class Scheduler(
         # Iteration counter - tracks completed GPU iterations
         self.iteration_count = 0
 
+        # Rolling history for iteration durations (ms) + derived target for next iteration
+        self.iteration_time_history: deque = deque(maxlen=10)
+        self.target_iteration_time_ms: Optional[float] = None
+
         # Grid-based cycle time predictor for SLO-aware scheduling (optional)
         self.cycle_time_predictor = None
         if self.server_args.enable_iteration_metrics:
@@ -793,6 +800,16 @@ class Scheduler(
         if iteration_time_ms is not None:
             # iteration_time_ms semantically represents elapsed iteration time; we now pass gpu_elapsed_ms here
             metrics["iteration_time_ms"] = round(iteration_time_ms, 2)
+            self._record_iteration_time(iteration_time_ms)
+
+        avg_iteration = self._get_iteration_time_average()
+        if avg_iteration is not None:
+            metrics["iteration_time_avg_ms"] = round(avg_iteration, 2)
+
+        if self.target_iteration_time_ms is not None:
+            metrics["target_iteration_time_ms"] = round(
+                self.target_iteration_time_ms, 2
+            )
             # Optional scheduler interval between last two process_batch_result completions (overlap only)
             scheduler_interval = getattr(batch, "scheduler_interval_ms", None) or getattr(batch, "since_last_process_ms", None)
             if scheduler_interval is not None:
@@ -842,6 +859,41 @@ class Scheduler(
                 kv_tokens_used=num_used,
                 iteration_time_ms=iteration_time_ms,
             )
+
+    def _record_iteration_time(self, iteration_time_ms: float):
+        """Store the latest iteration and refresh derived targets."""
+        self.iteration_time_history.append(float(iteration_time_ms))
+        self._refresh_iteration_time_target()
+
+    def _get_iteration_time_average(self) -> Optional[float]:
+        if not self.iteration_time_history:
+            return None
+        return sum(self.iteration_time_history) / len(self.iteration_time_history)
+
+    def _refresh_iteration_time_target(self):
+        avg = self._get_iteration_time_average()
+        if avg is None or self.tpot is None:
+            if self.target_iteration_time_ms is not None:
+                logger.debug(
+                    "[Scheduler] clearing iteration target; avg=%s tpot=%s",
+                    avg,
+                    self.tpot,
+                )
+            self.target_iteration_time_ms = None
+            return
+
+        new_target = compute_iteration_target(self.tpot, avg)
+        if (
+            self.target_iteration_time_ms is None
+            or abs(self.target_iteration_time_ms - new_target) > 1e-3
+        ):
+            logger.info(
+                "[Scheduler] iteration target updated: avg=%.3fms tpot=%.3fms target=%.3fms",
+                avg,
+                self.tpot,
+                new_target,
+            )
+        self.target_iteration_time_ms = new_target
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -2159,6 +2211,7 @@ class Scheduler(
             self.priority_scheduling_preemption_threshold,
             cycle_time_predictor=self.cycle_time_predictor,
             tpot_slo=self.tpot,
+            target_iteration_time_ms=self.target_iteration_time_ms,
             max_total_num_tokens=self.max_total_num_tokens,
         )
 
@@ -2936,6 +2989,7 @@ class Scheduler(
         try:
             self.tpot = float(recv_req.tpot)
             logger.info(f"[Scheduler] set_tpot received: tpot={self.tpot}")
+            self._refresh_iteration_time_target()
             return SetTPOTReqOutput(success=True, tpot=self.tpot, message="ok")
         except Exception as e:
             logger.error(f"[Scheduler] set_tpot error: {e}")

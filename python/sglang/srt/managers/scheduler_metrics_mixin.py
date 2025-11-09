@@ -122,6 +122,9 @@ class SchedulerMetricsMixin:
         try:
             if getattr(self, "tpot", None) is not None:
                 f += f"tpot={float(self.tpot):.3f}, "
+                target_ms = getattr(self, "target_iteration_time_ms", None)
+                if target_ms is not None:
+                    f += f"target_iteration_time_ms={float(target_ms):.3f}, "
         except Exception:
             pass
 
