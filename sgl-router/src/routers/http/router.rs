@@ -131,11 +131,8 @@ impl Router {
             queue_timeout,
         };
 
-        let scheduler_handle = spawn_scheduler(
-            ctx.scheduler_registry.clone(),
-            scheduler_config,
-            pending_rx,
-        );
+        let scheduler_handle =
+            spawn_scheduler(ctx.scheduler_registry.clone(), scheduler_config, pending_rx);
 
         Ok(Router {
             worker_registry: ctx.worker_registry.clone(),

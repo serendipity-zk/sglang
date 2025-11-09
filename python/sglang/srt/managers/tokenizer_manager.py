@@ -756,6 +756,8 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 target_tpot_ms=obj.target_tpot_ms,
                 chunked_prefill_start_pos=obj.chunked_prefill_start_pos,
                 chunked_prefill_length=obj.chunked_prefill_length,
+                router_generation=obj.router_generation,
+                router_message_id=obj.router_message_id,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(

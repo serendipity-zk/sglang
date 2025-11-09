@@ -157,6 +157,10 @@ class GenerateReqInput:
     # Length of chunked prefill (set by scheduler)
     chunked_prefill_length: Optional[int] = None
 
+    # Router-provided metadata for message tracking
+    router_generation: Optional[int] = None
+    router_message_id: Optional[int] = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -562,6 +566,8 @@ class GenerateReqInput:
             target_tpot_ms=self.target_tpot_ms if self.target_tpot_ms is not None else None,
             chunked_prefill_start_pos=self.chunked_prefill_start_pos[i] if self.chunked_prefill_start_pos is not None else None,
             chunked_prefill_length=self.chunked_prefill_length[i] if self.chunked_prefill_length is not None else None,
+            router_generation=self.router_generation,
+            router_message_id=self.router_message_id,
         )
 
 
@@ -641,6 +647,10 @@ class TokenizedGenerateReqInput:
     
     # Length of chunked prefill (set by scheduler)  
     chunked_prefill_length: Optional[int] = None
+
+    # Router-provided message tracking metadata
+    router_generation: Optional[int] = None
+    router_message_id: Optional[int] = None
 
 
 @dataclass

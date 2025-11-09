@@ -1,8 +1,8 @@
 //! Factory for creating load balancing policies
 
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
-    RoundRobinPolicy,
+    CacheAwareConfig, CacheAwarePolicy, GatedRoundRobinPolicy, LoadBalancingPolicy,
+    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 use std::sync::Arc;
@@ -16,6 +16,7 @@ impl PolicyFactory {
         match config {
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
+            PolicyConfig::GatedRoundRobin => Arc::new(GatedRoundRobinPolicy::new()),
             PolicyConfig::PowerOfTwo { .. } => Arc::new(PowerOfTwoPolicy::new()),
             PolicyConfig::CacheAware {
                 cache_threshold,
@@ -41,6 +42,7 @@ impl PolicyFactory {
         match name.to_lowercase().as_str() {
             "random" => Some(Arc::new(RandomPolicy::new())),
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
+            "gated_round_robin" | "gatedroundrobin" => Some(Arc::new(GatedRoundRobinPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             _ => None,

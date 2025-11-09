@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 mod cache_aware;
 mod factory;
+mod gated_round_robin;
 mod power_of_two;
 mod random;
 mod registry;
@@ -17,6 +18,7 @@ mod round_robin;
 
 pub use cache_aware::CacheAwarePolicy;
 pub use factory::PolicyFactory;
+pub use gated_round_robin::GatedRoundRobinPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;

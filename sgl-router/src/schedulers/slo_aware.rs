@@ -22,7 +22,10 @@ pub struct SloAwareScheduler {
 }
 
 impl SloAwareScheduler {
-    pub fn new(_policy_registry: Arc<crate::policies::PolicyRegistry>, tpot_buckets: Vec<f32>) -> Self {
+    pub fn new(
+        _policy_registry: Arc<crate::policies::PolicyRegistry>,
+        tpot_buckets: Vec<f32>,
+    ) -> Self {
         Self { tpot_buckets }
     }
 
@@ -81,10 +84,8 @@ impl SloAwareScheduler {
                 continue;
             }
 
-            let available = available_workers_for_request(
-                &config.worker_registry,
-                front.model_id.as_deref(),
-            );
+            let available =
+                available_workers_for_request(&config.worker_registry, front.model_id.as_deref());
 
             if available.is_empty() {
                 break;

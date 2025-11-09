@@ -240,3 +240,10 @@ Cargo.lock
 lmms-eval
 
 learn_rust/
+
+.cursor/
+.claude/
+.kilocode
+.github/
+openspec/
+*.md

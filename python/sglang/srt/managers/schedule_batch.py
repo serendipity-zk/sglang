@@ -462,6 +462,8 @@ class Req:
         target_tpot_ms: Optional[float] = None,
         chunked_prefill_start_pos: Optional[int] = None,
         chunked_prefill_length: Optional[int] = None,
+        router_generation: Optional[int] = None,
+        router_message_id: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -521,6 +523,8 @@ class Req:
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
         self.priority = priority
+        self.router_generation = router_generation
+        self.router_message_id = router_message_id
 
         # For incremental decoding
         # ----- | --------- read_ids -------|

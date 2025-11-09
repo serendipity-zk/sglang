@@ -148,6 +148,8 @@ class Session:
             target_tpot_ms=req.target_tpot_ms,
             chunked_prefill_start_pos=req.chunked_prefill_start_pos,
             chunked_prefill_length=req.chunked_prefill_length,
+            router_generation=req.router_generation,
+            router_message_id=req.router_message_id,
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs

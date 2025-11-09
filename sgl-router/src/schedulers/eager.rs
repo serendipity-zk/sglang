@@ -39,10 +39,8 @@ impl EagerScheduler {
                 continue;
             }
 
-            let available = available_workers_for_request(
-                &config.worker_registry,
-                front.model_id.as_deref(),
-            );
+            let available =
+                available_workers_for_request(&config.worker_registry, front.model_id.as_deref());
 
             if available.is_empty() {
                 break;

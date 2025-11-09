@@ -5,11 +5,14 @@ use crate::grpc::SglangSchedulerClient;
 use crate::metrics::RouterMetrics;
 use async_trait::async_trait;
 use futures;
+use parking_lot::RwLock;
 use serde_json;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tracing::warn;
 
 // Shared HTTP client for worker operations (health checks, server info, etc.)
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -18,6 +21,39 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .expect("Failed to create worker HTTP client")
 });
+
+/// Represents a request dispatched to a worker that hasn't been acknowledged yet.
+#[derive(Debug, Clone)]
+pub struct PendingMessage {
+    /// Unique message ID assigned by the router
+    pub message_id: i64,
+    /// Router generation (epoch) when the message was created
+    pub generation: i64,
+    /// Optional request identifier from the incoming request
+    pub request_id: Option<String>,
+    /// Route/endpoint that was invoked (e.g., "/generate")
+    pub route: String,
+    /// Timestamp when the router dispatched the message
+    pub timestamp: Instant,
+}
+
+impl PendingMessage {
+    /// Convenience constructor for creating pending messages.
+    pub fn new(
+        message_id: i64,
+        generation: i64,
+        route: impl Into<String>,
+        request_id: Option<String>,
+    ) -> Self {
+        Self {
+            message_id,
+            generation,
+            request_id,
+            route: route.into(),
+            timestamp: Instant::now(),
+        }
+    }
+}
 
 /// Core worker abstraction that represents a backend service
 #[async_trait]
@@ -68,6 +104,29 @@ pub trait Worker: Send + Sync + fmt::Debug {
         // Default implementation - does nothing
         // Workers that track load should override this
     }
+
+    /// Get number of messages dispatched but not yet acknowledged by the worker.
+    fn pending_message_count(&self) -> usize;
+
+    /// Track a dispatched message until it is acknowledged.
+    fn add_pending_message(&self, message: PendingMessage);
+
+    /// Remove acknowledged messages up to and including the provided ID for a generation.
+    /// Returns removed messages so callers can emit metrics.
+    fn remove_messages_up_to(&self, generation: i64, last_message_id: i64) -> Vec<PendingMessage>;
+
+    /// Remove pending messages older than the specified TTL. Returns removed entries.
+    fn cleanup_stale_messages(&self, ttl: Duration) -> Vec<PendingMessage>;
+
+    /// Generate next message ID for this worker
+    fn next_message_id(&self) -> i64;
+
+    /// Get the router generation (startup timestamp)
+    fn generation(&self) -> i64;
+
+    /// Cleanup stale pending messages and record metrics
+    /// This method handles its own metrics recording
+    fn cleanup_pending_messages(&self, ttl: Duration);
 
     /// Get the number of processed requests
     fn processed_requests(&self) -> usize;
@@ -334,12 +393,17 @@ pub struct BasicWorker {
     pub metadata: WorkerMetadata,
     pub load_counter: Arc<AtomicUsize>,
     pub processed_counter: Arc<AtomicUsize>,
+    pub pending_messages: Arc<RwLock<Vec<PendingMessage>>>,
     pub healthy: Arc<AtomicBool>,
     pub consecutive_failures: Arc<AtomicUsize>,
     pub consecutive_successes: Arc<AtomicUsize>,
     pub circuit_breaker: CircuitBreaker,
     /// Optional gRPC client for gRPC workers
     pub grpc_client: Option<Arc<Mutex<SglangSchedulerClient>>>,
+    /// Per-worker message ID counter
+    pub message_counter: Arc<AtomicI64>,
+    /// Router generation (startup timestamp)
+    pub generation: i64,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -347,6 +411,7 @@ impl fmt::Debug for BasicWorker {
         f.debug_struct("BasicWorker")
             .field("metadata", &self.metadata)
             .field("healthy", &self.healthy.load(Ordering::Relaxed))
+            .field("pending_messages", &self.pending_messages.read().len())
             .field("circuit_breaker", &self.circuit_breaker)
             .field("has_grpc_client", &self.grpc_client.is_some())
             .finish()
@@ -501,6 +566,64 @@ impl Worker for BasicWorker {
         self.load_counter.store(0, Ordering::Relaxed);
     }
 
+    fn pending_message_count(&self) -> usize {
+        self.pending_messages.read().len()
+    }
+
+    fn add_pending_message(&self, message: PendingMessage) {
+        let mut pending = self.pending_messages.write();
+        pending.push(message);
+    }
+
+    fn remove_messages_up_to(&self, generation: i64, last_message_id: i64) -> Vec<PendingMessage> {
+        let mut removed = Vec::new();
+        let mut pending = self.pending_messages.write();
+        pending.retain(|msg| {
+            let should_remove = msg.generation == generation && msg.message_id <= last_message_id;
+            if should_remove {
+                removed.push(msg.clone());
+            }
+            !should_remove
+        });
+        removed
+    }
+
+    fn cleanup_stale_messages(&self, ttl: Duration) -> Vec<PendingMessage> {
+        let mut removed = Vec::new();
+        let mut pending = self.pending_messages.write();
+        let now = Instant::now();
+        pending.retain(|msg| {
+            let stale = now.duration_since(msg.timestamp) >= ttl;
+            if stale {
+                removed.push(msg.clone());
+            }
+            !stale
+        });
+        removed
+    }
+
+    fn next_message_id(&self) -> i64 {
+        self.message_counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn generation(&self) -> i64 {
+        self.generation
+    }
+
+    fn cleanup_pending_messages(&self, ttl: Duration) {
+        let removed = self.cleanup_stale_messages(ttl);
+        if !removed.is_empty() {
+            RouterMetrics::record_message_timeout(self.url(), removed.len());
+            RouterMetrics::set_pending_messages(self.url(), self.pending_message_count());
+            warn!(
+                worker = self.url(),
+                removed = removed.len(),
+                ttl_secs = ttl.as_secs(),
+                "Removed stale pending router messages due to TTL expiration"
+            );
+        }
+    }
+
     fn processed_requests(&self) -> usize {
         self.processed_counter.load(Ordering::Relaxed)
     }
@@ -594,6 +717,35 @@ impl Worker for DPAwareWorker {
 
     fn reset_load(&self) {
         self.base_worker.reset_load();
+    }
+
+    fn pending_message_count(&self) -> usize {
+        self.base_worker.pending_message_count()
+    }
+
+    fn add_pending_message(&self, message: PendingMessage) {
+        self.base_worker.add_pending_message(message);
+    }
+
+    fn remove_messages_up_to(&self, generation: i64, last_message_id: i64) -> Vec<PendingMessage> {
+        self.base_worker
+            .remove_messages_up_to(generation, last_message_id)
+    }
+
+    fn cleanup_stale_messages(&self, ttl: Duration) -> Vec<PendingMessage> {
+        self.base_worker.cleanup_stale_messages(ttl)
+    }
+
+    fn next_message_id(&self) -> i64 {
+        self.base_worker.next_message_id()
+    }
+
+    fn generation(&self) -> i64 {
+        self.base_worker.generation()
+    }
+
+    fn cleanup_pending_messages(&self, ttl: Duration) {
+        self.base_worker.cleanup_pending_messages(ttl)
     }
 
     fn processed_requests(&self) -> usize {
@@ -891,7 +1043,7 @@ mod tests {
     use super::*;
     use crate::core::CircuitBreakerConfig;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     // Test WorkerType
     #[test]
@@ -1771,5 +1923,137 @@ mod tests {
             }
         );
         assert_eq!(workers[5].worker_type(), WorkerType::Decode);
+    }
+
+    fn ledger_worker() -> BasicWorker {
+        BasicWorkerBuilder::new("http://ledger-worker:8080").build()
+    }
+
+    fn make_pending(id: i64) -> PendingMessage {
+        PendingMessage::new(id, 777, "/generate", Some(format!("req-{id}")))
+    }
+
+    #[test]
+    fn pending_message_count_reflects_entries() {
+        let worker = ledger_worker();
+        assert_eq!(worker.pending_message_count(), 0);
+
+        worker.add_pending_message(make_pending(1));
+        worker.add_pending_message(make_pending(2));
+
+        assert_eq!(worker.pending_message_count(), 2);
+    }
+
+    #[test]
+    fn remove_messages_up_to_returns_removed_entries() {
+        let worker = ledger_worker();
+        for id in 0..5 {
+            worker.add_pending_message(make_pending(id));
+        }
+
+        let removed = worker.remove_messages_up_to(777, 2);
+        assert_eq!(removed.len(), 3);
+        assert_eq!(worker.pending_message_count(), 2);
+
+        // Different generation should leave entries untouched
+        let removed_other = worker.remove_messages_up_to(778, 10);
+        assert!(removed_other.is_empty());
+        assert_eq!(worker.pending_message_count(), 2);
+    }
+
+    #[test]
+    fn cleanup_stale_messages_removes_entries_past_ttl() {
+        let worker = ledger_worker();
+        let fresh = make_pending(10);
+        let mut stale = make_pending(11);
+        stale.timestamp = Instant::now() - Duration::from_secs(120);
+
+        worker.add_pending_message(fresh.clone());
+        worker.add_pending_message(stale);
+
+        let removed = worker.cleanup_stale_messages(Duration::from_secs(60));
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].message_id, 11);
+        assert_eq!(worker.pending_message_count(), 1);
+
+        // Force the remaining entry to be stale and clean again
+        {
+            let mut guard = worker.pending_messages.write();
+            guard[0].timestamp = Instant::now() - Duration::from_secs(120);
+        }
+        let removed_again = worker.cleanup_stale_messages(Duration::from_secs(60));
+        assert_eq!(removed_again.len(), 1);
+        assert_eq!(worker.pending_message_count(), 0);
+    }
+
+    #[test]
+    fn test_per_worker_message_id_counter() {
+        const TEST_GEN: i64 = 12345;
+        let worker = BasicWorkerBuilder::new_with_generation("http://test:8080", TEST_GEN).build();
+
+        // Test that message IDs increment per worker
+        assert_eq!(worker.next_message_id(), 0);
+        assert_eq!(worker.next_message_id(), 1);
+        assert_eq!(worker.next_message_id(), 2);
+        assert_eq!(worker.next_message_id(), 3);
+
+        // Verify generation
+        assert_eq!(worker.generation(), TEST_GEN);
+    }
+
+    #[test]
+    fn test_multiple_workers_independent_counters() {
+        const TEST_GEN: i64 = 67890;
+        let worker1 = BasicWorkerBuilder::new_with_generation("http://w1:8080", TEST_GEN).build();
+        let worker2 = BasicWorkerBuilder::new_with_generation("http://w2:8080", TEST_GEN).build();
+        let worker3 = BasicWorkerBuilder::new_with_generation("http://w3:8080", TEST_GEN).build();
+
+        // Each worker should have independent counters starting at 0
+        assert_eq!(worker1.next_message_id(), 0);
+        assert_eq!(worker2.next_message_id(), 0);
+        assert_eq!(worker3.next_message_id(), 0);
+
+        assert_eq!(worker1.next_message_id(), 1);
+        assert_eq!(worker1.next_message_id(), 2);
+
+        assert_eq!(worker2.next_message_id(), 1);
+
+        assert_eq!(worker3.next_message_id(), 1);
+        assert_eq!(worker3.next_message_id(), 2);
+        assert_eq!(worker3.next_message_id(), 3);
+
+        // All workers share the same generation
+        assert_eq!(worker1.generation(), TEST_GEN);
+        assert_eq!(worker2.generation(), TEST_GEN);
+        assert_eq!(worker3.generation(), TEST_GEN);
+    }
+
+    #[test]
+    fn test_dp_aware_worker_message_ids() {
+        const TEST_GEN: i64 = 111222;
+        let dp_worker = DPAwareWorkerBuilder::new_with_generation("http://worker:8080", TEST_GEN, 0, 4)
+            .build();
+
+        // DP-aware workers should also have independent per-worker counters
+        assert_eq!(dp_worker.next_message_id(), 0);
+        assert_eq!(dp_worker.next_message_id(), 1);
+        assert_eq!(dp_worker.next_message_id(), 2);
+        assert_eq!(dp_worker.generation(), TEST_GEN);
+    }
+
+    #[test]
+    fn test_shared_router_generation() {
+        // Workers created without explicit generation should share ROUTER_GENERATION
+        let worker1 = BasicWorkerBuilder::new("http://w1:8080").build();
+        let worker2 = BasicWorkerBuilder::new("http://w2:8080").build();
+
+        // Both should have the same generation (ROUTER_GENERATION)
+        assert_eq!(worker1.generation(), worker2.generation());
+
+        // But independent message ID counters
+        assert_eq!(worker1.next_message_id(), 0);
+        assert_eq!(worker2.next_message_id(), 0);
+        assert_eq!(worker1.next_message_id(), 1);
+        assert_eq!(worker2.next_message_id(), 1);
     }
 }

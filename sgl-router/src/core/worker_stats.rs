@@ -46,6 +46,14 @@ pub struct WorkerStats {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_chunk_pairs: Option<Vec<(i64, i64)>>,
 
+    /// Router generation reported by the worker (for message acknowledgments)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub router_generation: Option<i64>,
+
+    /// Highest contiguous message ID received for the reported generation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_received_message_id: Option<i64>,
+
     /// Timestamp when stats were received (not serialized)
     #[serde(skip, default = "Instant::now")]
     pub timestamp: Instant,
@@ -86,7 +94,8 @@ impl WorkerStats {
             .and_then(|obj| {
                 let pending_req_num = obj.get("pending_req_num")?.as_i64()?;
                 let total_extend_len = obj.get("total_extend_len")?.as_i64()?;
-                let requests = obj.get("requests")?
+                let requests = obj
+                    .get("requests")?
                     .as_array()?
                     .iter()
                     .filter_map(|req| {
@@ -134,6 +143,11 @@ impl WorkerStats {
                     .collect()
             });
 
+        let router_generation = stats.get("router_generation").and_then(|v| v.as_i64());
+        let last_received_message_id = stats
+            .get("last_received_message_id")
+            .and_then(|v| v.as_i64());
+
         Ok(WorkerStats {
             worker_id,
             batch_size_tokens,
@@ -143,6 +157,8 @@ impl WorkerStats {
             forward_mode,
             iteration_num,
             prefill_chunk_pairs,
+            router_generation,
+            last_received_message_id,
             timestamp: Instant::now(),
         })
     }

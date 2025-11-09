@@ -12,9 +12,9 @@ pub mod metrics;
 pub mod middleware;
 pub mod policies;
 pub mod protocols;
-pub mod schedulers;
 pub mod reasoning_parser;
 pub mod routers;
+pub mod schedulers;
 pub mod server;
 pub mod service_discovery;
 pub mod tokenizer;
@@ -28,6 +28,7 @@ use crate::metrics::PrometheusConfig;
 pub enum PolicyType {
     Random,
     RoundRobin,
+    GatedRoundRobin,
     CacheAware,
     PowerOfTwo,
 }
@@ -136,6 +137,7 @@ impl Router {
             match policy {
                 PolicyType::Random => ConfigPolicyConfig::Random,
                 PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
+                PolicyType::GatedRoundRobin => ConfigPolicyConfig::GatedRoundRobin,
                 PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {
                     cache_threshold: self.cache_threshold,
                     balance_abs_threshold: self.balance_abs_threshold,
@@ -176,7 +178,10 @@ impl Router {
             SchedulerType::Eager => config::SchedulerConfig::Eager,
             SchedulerType::Gated => config::SchedulerConfig::Gated,
             SchedulerType::SloAware => config::SchedulerConfig::SloAware {
-                tpot_buckets: self.scheduler_tpot_buckets.clone().unwrap_or_else(|| vec![10.0, 50.0]),
+                tpot_buckets: self
+                    .scheduler_tpot_buckets
+                    .clone()
+                    .unwrap_or_else(|| vec![10.0, 50.0]),
             },
         };
 

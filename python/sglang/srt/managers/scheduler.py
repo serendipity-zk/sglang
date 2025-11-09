@@ -145,6 +145,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
 from sglang.srt.managers.session_controller import Session
+from sglang.srt.managers.router_message_tracker import RouterMessageAckTracker
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import DPBalanceMeta, validate_input_length
@@ -277,6 +278,7 @@ class Scheduler(
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.page_size = server_args.page_size
+        self.router_ack_tracker = RouterMessageAckTracker()
 
         # Timestamp of the last completed process_batch_result call
         self._last_process_result_end_time: Optional[float] = None
@@ -819,6 +821,13 @@ class Scheduler(
             "total_extend_len": total_extend_len,
             "requests": waiting_queue_requests,
         }
+
+        ack_generation, ack_last_id = self.router_ack_tracker.get_state()
+        if ack_generation is not None:
+            metrics["router_generation"] = ack_generation
+            metrics["last_received_message_id"] = (
+                ack_last_id if ack_last_id is not None else -1
+            )
 
         # Report (non-blocking)
         iteration_metrics.report_iteration(
@@ -1552,6 +1561,8 @@ class Scheduler(
                 target_tpot_ms=recv_req.target_tpot_ms,
                 chunked_prefill_start_pos=recv_req.chunked_prefill_start_pos,
                 chunked_prefill_length=recv_req.chunked_prefill_length,
+                router_generation=recv_req.router_generation,
+                router_message_id=recv_req.router_message_id,
             )
             req.tokenizer = self.tokenizer
 
@@ -1585,6 +1596,10 @@ class Scheduler(
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
+
+        self.router_ack_tracker.record(
+            recv_req.router_generation, recv_req.router_message_id
+        )
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:

@@ -24,26 +24,21 @@ impl SchedulerFactory {
         match config {
             SchedulerConfig::Eager => Arc::new(EagerScheduler::new()),
             SchedulerConfig::Gated => Arc::new(GatedScheduler::new()),
-            SchedulerConfig::SloAware { tpot_buckets } => {
-                Arc::new(SloAwareScheduler::new(policy_registry, tpot_buckets.clone()))
-            }
+            SchedulerConfig::SloAware { tpot_buckets } => Arc::new(SloAwareScheduler::new(
+                policy_registry,
+                tpot_buckets.clone(),
+            )),
         }
     }
 
     /// Creates a scheduler by name (useful for defaults or testing)
-    pub fn create_by_name(
-        name: &str,
-        policy_registry: Arc<PolicyRegistry>,
-    ) -> Arc<dyn Scheduler> {
+    pub fn create_by_name(name: &str, policy_registry: Arc<PolicyRegistry>) -> Arc<dyn Scheduler> {
         match name {
             "eager" => Arc::new(EagerScheduler::new()),
             "gated" => Arc::new(GatedScheduler::new()),
             "slo_aware" => {
                 // Default buckets: <10ms, 10-50ms, >50ms
-                Arc::new(SloAwareScheduler::new(
-                    policy_registry,
-                    vec![10.0, 50.0],
-                ))
+                Arc::new(SloAwareScheduler::new(policy_registry, vec![10.0, 50.0]))
             }
             _ => {
                 tracing::warn!("Unknown scheduler name '{}', defaulting to eager", name);

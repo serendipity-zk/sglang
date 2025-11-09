@@ -14,6 +14,7 @@ def policy_from_str(policy_str: Optional[str]) -> PolicyType:
         "round_robin": PolicyType.RoundRobin,
         "cache_aware": PolicyType.CacheAware,
         "power_of_two": PolicyType.PowerOfTwo,
+        "gated_round_robin": PolicyType.GatedRoundRobin,
     }
     return policy_map[policy_str]
 

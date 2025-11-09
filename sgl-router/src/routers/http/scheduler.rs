@@ -1,11 +1,11 @@
-use crate::core::{WorkerRegistry};
+use crate::core::WorkerRegistry;
 use crate::policies::PolicyRegistry;
 use crate::schedulers::{Scheduler, SchedulerRegistry};
-use tracing::info;
 use reqwest::Client;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+use tracing::info;
 
 /// Pending request metadata shared between the router entrypoint and scheduler loop.
 pub struct PendingRequest {

@@ -5,8 +5,8 @@
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
-    CacheAwareConfig, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
-    RoundRobinPolicy,
+    CacheAwareConfig, CacheAwarePolicy, GatedRoundRobinPolicy, LoadBalancingPolicy,
+    PowerOfTwoPolicy, RandomPolicy, RoundRobinPolicy,
 };
 use crate::config::types::PolicyConfig;
 use crate::core::{Worker, WorkerStats};
@@ -170,6 +170,7 @@ impl PolicyRegistry {
     fn create_policy_from_type(&self, policy_type: &str) -> Arc<dyn LoadBalancingPolicy> {
         match policy_type {
             "round_robin" => Arc::new(RoundRobinPolicy::new()),
+            "gated_round_robin" => Arc::new(GatedRoundRobinPolicy::new()),
             "random" => Arc::new(RandomPolicy::new()),
             "cache_aware" => Arc::new(CacheAwarePolicy::new()),
             "power_of_two" => Arc::new(PowerOfTwoPolicy::new()),
@@ -184,6 +185,7 @@ impl PolicyRegistry {
     fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
         match config {
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
+            PolicyConfig::GatedRoundRobin => Arc::new(GatedRoundRobinPolicy::new()),
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::CacheAware {
                 cache_threshold,
@@ -346,14 +348,21 @@ impl PolicyRegistry {
         {
             let policies = self.model_policies.read().unwrap();
             for (model_id, policy) in policies.iter() {
-                debug!("Updating stats for model {} policy: {}", model_id, policy.name());
+                debug!(
+                    "Updating stats for model {} policy: {}",
+                    model_id,
+                    policy.name()
+                );
                 policy.update_worker_stats(stats);
             }
         }
 
         // Update PD policies if present
         if let Some(prefill_policy) = self.prefill_policy.read().unwrap().as_ref() {
-            debug!("Updating stats for prefill policy: {}", prefill_policy.name());
+            debug!(
+                "Updating stats for prefill policy: {}",
+                prefill_policy.name()
+            );
             prefill_policy.update_worker_stats(stats);
         }
 

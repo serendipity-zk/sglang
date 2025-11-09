@@ -604,8 +604,7 @@ mod tests {
             &router_config.scheduler,
             policy_registry.clone(),
         );
-        let scheduler_registry =
-            Arc::new(crate::schedulers::SchedulerRegistry::new(scheduler));
+        let scheduler_registry = Arc::new(crate::schedulers::SchedulerRegistry::new(scheduler));
         let app_context = Arc::new(AppContext {
             client: reqwest::Client::new(),
             router_config: router_config.clone(),

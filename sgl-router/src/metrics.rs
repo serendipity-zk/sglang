@@ -235,6 +235,24 @@ pub fn init_metrics() {
         "Time per streaming decode step"
     );
 
+    // Router message tracking metrics
+    describe_gauge!(
+        "sgl_router_pending_messages",
+        "Number of pending router-tracked messages per worker"
+    );
+    describe_counter!(
+        "sgl_router_messages_acknowledged_total",
+        "Total number of router-tracked messages acknowledged per worker"
+    );
+    describe_counter!(
+        "sgl_router_messages_timeout_total",
+        "Total number of router-tracked messages evicted via TTL per worker"
+    );
+    describe_histogram!(
+        "sgl_router_message_ack_latency_seconds",
+        "Time between dispatch and worker acknowledgment of router-tracked messages"
+    );
+
     // Factory metrics
     describe_counter!(
         "sgl_tokenizer_factory_loads_total",
@@ -396,6 +414,35 @@ impl RouterMetrics {
             "route" => route.to_string()
         )
         .record(duration.as_secs_f64());
+    }
+
+    pub fn set_pending_messages(worker_url: &str, count: usize) {
+        gauge!("sgl_router_pending_messages",
+            "worker" => worker_url.to_string()
+        )
+        .set(count as f64);
+    }
+
+    pub fn record_message_ack(worker_url: &str, latency: Duration) {
+        counter!("sgl_router_messages_acknowledged_total",
+            "worker" => worker_url.to_string()
+        )
+        .increment(1);
+
+        histogram!("sgl_router_message_ack_latency_seconds",
+            "worker" => worker_url.to_string()
+        )
+        .record(latency.as_secs_f64());
+    }
+
+    pub fn record_message_timeout(worker_url: &str, count: usize) {
+        if count == 0 {
+            return;
+        }
+        counter!("sgl_router_messages_timeout_total",
+            "worker" => worker_url.to_string()
+        )
+        .increment(count as u64);
     }
 
     pub fn record_pd_prefill_request(worker: &str) {

@@ -3,11 +3,15 @@
 //! Provides centralized registry for workers with model-based indexing
 
 use crate::core::{ConnectionMode, Worker, WorkerStats, WorkerType};
+use crate::metrics::RouterMetrics;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use uuid::Uuid;
+use std::time::{Duration, Instant};
 use url::Url;
+use uuid::Uuid;
+
+const PENDING_MESSAGE_TTL: Duration = Duration::from_secs(60);
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -409,6 +413,8 @@ impl WorkerRegistry {
                     let _ = worker.check_health_async().await; // Use async version directly
                 }
 
+                Self::cleanup_pending_for_workers(&workers, PENDING_MESSAGE_TTL);
+
                 // Reset loads periodically
                 check_count += 1;
                 if check_count.is_multiple_of(LOAD_RESET_INTERVAL) {
@@ -425,7 +431,28 @@ impl WorkerRegistry {
 
     /// Update worker stats for a given worker URL
     pub fn update_stats(&self, worker_url: &str, stats: WorkerStats) {
+        if let Some(worker) = self.get_by_url(worker_url) {
+            if let (Some(generation), Some(last_id)) =
+                (stats.router_generation, stats.last_received_message_id)
+            {
+                let now = Instant::now();
+                let removed = worker.remove_messages_up_to(generation, last_id);
+                for message in removed.iter() {
+                    let latency = now.saturating_duration_since(message.timestamp);
+                    RouterMetrics::record_message_ack(worker.url(), latency);
+                }
+            }
+
+            RouterMetrics::set_pending_messages(worker.url(), worker.pending_message_count());
+        }
+
         self.worker_stats.insert(worker_url.to_string(), stats);
+    }
+
+    fn cleanup_pending_for_workers(workers: &[Arc<dyn Worker>], ttl: Duration) {
+        for worker in workers {
+            worker.cleanup_pending_messages(ttl);
+        }
     }
 
     /// Try to resolve a worker identifier (ID, URL, or `<host>:<port>[:dp#]`) to a registered URL
@@ -567,8 +594,13 @@ pub struct WorkerRegistryStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, CircuitBreakerConfig, DPAwareWorkerBuilder};
+    use crate::core::{
+        BasicWorkerBuilder, CircuitBreakerConfig, DPAwareWorkerBuilder, PendingMessage,
+    };
     use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    const TEST_GENERATION: i64 = 1234567890;
 
     #[test]
     fn test_worker_registry() {
@@ -581,7 +613,7 @@ mod tests {
         labels.insert("cost".to_string(), "0.8".to_string());
 
         let worker: Box<dyn Worker> = Box::new(
-            BasicWorkerBuilder::new("http://worker1:8080")
+            BasicWorkerBuilder::new_with_generation("http://worker1:8080", TEST_GENERATION)
                 .worker_type(WorkerType::Regular)
                 .labels(labels)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
@@ -617,7 +649,7 @@ mod tests {
         let mut labels1 = HashMap::new();
         labels1.insert("model_id".to_string(), "llama-3".to_string());
         let worker1: Box<dyn Worker> = Box::new(
-            BasicWorkerBuilder::new("http://worker1:8080")
+            BasicWorkerBuilder::new_with_generation("http://worker1:8080", TEST_GENERATION)
                 .worker_type(WorkerType::Regular)
                 .labels(labels1)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
@@ -628,7 +660,7 @@ mod tests {
         let mut labels2 = HashMap::new();
         labels2.insert("model_id".to_string(), "llama-3".to_string());
         let worker2: Box<dyn Worker> = Box::new(
-            BasicWorkerBuilder::new("http://worker2:8080")
+            BasicWorkerBuilder::new_with_generation("http://worker2:8080", TEST_GENERATION)
                 .worker_type(WorkerType::Regular)
                 .labels(labels2)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
@@ -639,7 +671,7 @@ mod tests {
         let mut labels3 = HashMap::new();
         labels3.insert("model_id".to_string(), "gpt-4".to_string());
         let worker3: Box<dyn Worker> = Box::new(
-            BasicWorkerBuilder::new("http://worker3:8080")
+            BasicWorkerBuilder::new_with_generation("http://worker3:8080", TEST_GENERATION)
                 .worker_type(WorkerType::Regular)
                 .labels(labels3)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
@@ -683,7 +715,7 @@ mod tests {
     fn test_resolve_worker_url_basic_identifier() {
         let registry = WorkerRegistry::new();
         let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://worker-basic:8080")
+            BasicWorkerBuilder::new_with_generation("http://worker-basic:8080", TEST_GENERATION)
                 .worker_type(WorkerType::Regular)
                 .build(),
         );
@@ -704,7 +736,7 @@ mod tests {
     fn test_resolve_worker_url_dp_identifier() {
         let registry = WorkerRegistry::new();
         let worker: Arc<dyn Worker> =
-            Arc::new(DPAwareWorkerBuilder::new("http://worker-dp:9090", 1, 2).build());
+            Arc::new(DPAwareWorkerBuilder::new_with_generation("http://worker-dp:9090", TEST_GENERATION, 1, 2).build());
         registry.register(worker);
 
         let resolved = registry
@@ -714,5 +746,56 @@ mod tests {
 
         // Missing dp rank is ambiguous across DP workers and should not resolve
         assert!(registry.resolve_worker_url("worker-dp:9090").is_none());
+    }
+
+    #[test]
+    fn test_update_stats_clears_acknowledged_messages() {
+        let registry = WorkerRegistry::new();
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new_with_generation("http://worker-ack:8080", TEST_GENERATION)
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        registry.register(worker.clone());
+
+        let pending = PendingMessage::new(1, 99, "/generate", Some("req-1".into()));
+        worker.add_pending_message(pending);
+        assert_eq!(worker.pending_message_count(), 1);
+
+        let stats = WorkerStats {
+            worker_id: worker.url().to_string(),
+            batch_size_tokens: 0,
+            num_requests: 0,
+            waiting_queue_size: 0,
+            waiting_queue_info: None,
+            forward_mode: "UNKNOWN".to_string(),
+            iteration_num: 0,
+            prefill_chunk_pairs: None,
+            router_generation: Some(99),
+            last_received_message_id: Some(1),
+            timestamp: Instant::now(),
+        };
+
+        registry.update_stats(worker.url(), stats);
+        assert_eq!(worker.pending_message_count(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_pending_messages_removes_stale_entries() {
+        let registry = WorkerRegistry::new();
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new_with_generation("http://worker-ttl:8080", TEST_GENERATION)
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        registry.register(worker.clone());
+
+        let mut pending = PendingMessage::new(1, 77, "/generate", None);
+        pending.timestamp = Instant::now() - Duration::from_secs(120);
+        worker.add_pending_message(pending);
+        assert_eq!(worker.pending_message_count(), 1);
+
+        worker.cleanup_pending_messages(Duration::from_secs(60));
+        assert_eq!(worker.pending_message_count(), 0);
     }
 }
