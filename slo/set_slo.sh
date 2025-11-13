@@ -6,7 +6,7 @@
 
 # Default values
 TPOT_MS=${1:-30}
-PORTS=${2:-"31001,31002"}
+PORTS=${2:-"31001,31002,31003,31004"}
 HOST=${HOST:-"localhost"}
 
 # Convert comma-separated ports to array

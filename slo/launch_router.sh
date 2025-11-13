@@ -12,4 +12,6 @@ python -m sglang_router.launch_router \
   --worker-urls \
     http://0.0.0.0:31001 \
     http://0.0.0.0:31002 \
+    http://0.0.0.0:31003 \
+    http://0.0.0.0:31004 \
   --scheduler gated

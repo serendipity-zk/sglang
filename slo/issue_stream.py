@@ -275,6 +275,34 @@ def send_streaming_request(
         # Keep first 10 intervals for printing/logging
         first_10_intervals = [round(x, 2) for x in all_intervals[:10]]
 
+        # SLO check: verify each token i arrives before start_time + ttft + i * tpot
+        slo_satisfied = None
+        slo_violations = 0
+        slo_tokens_checked = 0
+        if ttft is not None and tpot is not None and len(all_token_times) > 0:
+            slo_tokens_checked = len(all_token_times)
+            for i, token_time in enumerate(all_token_times):
+                # Token i should arrive by: start_time + ttft + i * tpot (in seconds)
+                deadline = start_time + (ttft / 1000.0) + (i * tpot / 1000.0)
+                if token_time > deadline:
+                    slo_violations += 1
+            slo_satisfied = (slo_violations == 0)
+
+        # Alternative SLO check with 100ms slack: ignore first token, then check
+        # each token i (i >= 1) arrives before first_token_time + 100ms + (i-1) * tpot
+        tpot_with_100_slack = None
+        tpot_slack_violations = 0
+        tpot_slack_tokens_checked = 0
+        if tpot is not None and len(all_token_times) > 1 and first_token_time is not None:
+            # Check tokens starting from index 1 (second token)
+            tpot_slack_tokens_checked = len(all_token_times) - 1
+            for i in range(1, len(all_token_times)):
+                # Token i should arrive by: first_token_time + 100ms + (i-1) * tpot (in seconds)
+                deadline = first_token_time + 0.1 + ((i - 1) * tpot / 1000.0)
+                if all_token_times[i] > deadline:
+                    tpot_slack_violations += 1
+            tpot_with_100_slack = (tpot_slack_violations == 0)
+
         # Build log record with logical field ordering
         record = {
             "request_id": request_id,
@@ -292,9 +320,19 @@ def send_streaming_request(
             record["target_ttft_ms"] = ttft
         if tpot is not None:
             record["target_tpot_ms"] = tpot
+        # Add SLO check results
+        if slo_satisfied is not None:
+            record["slo_satisfied"] = slo_satisfied
+            record["slo_violations"] = slo_violations
+            record["slo_tokens_checked"] = slo_tokens_checked
+        # Add alternative SLO check results
+        if tpot_with_100_slack is not None:
+            record["tpot_with_100_slack"] = tpot_with_100_slack
+            record["tpot_slack_violations"] = tpot_slack_violations
+            record["tpot_slack_tokens_checked"] = tpot_slack_tokens_checked
         # Append detailed timing and text at the end
         record["intervals"] = first_10_intervals
-        record["output_text"] = output_text
+        record["output_text"] = output_text[:100]  # Only log first 100 chars
 
         success = True
 
@@ -321,7 +359,7 @@ def send_streaming_request(
         if tpot is not None:
             record["target_tpot_ms"] = tpot
         # Append text at the end
-        record["output_text"] = output_text  # Partial output text before failure
+        record["output_text"] = output_text[:100]  # Partial output text before failure (first 100 chars)
 
     finally:
         # Log the result
