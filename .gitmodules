@@ -1,0 +1,3 @@
+[submodule "SLO-CSim"]
+	path = SLO-CSim
+	url = https://github.com/serendipity-zk/SLO-CSim.git

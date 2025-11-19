@@ -188,6 +188,11 @@ impl WorkerRegistry {
         self.url_to_id.get(url).and_then(|id| self.get(&id))
     }
 
+    /// Get worker ID by URL
+    pub fn get_worker_id_by_url(&self, url: &str) -> Option<WorkerId> {
+        self.url_to_id.get(url).map(|id| id.clone())
+    }
+
     /// Get all workers for a model
     pub fn get_by_model(&self, model_id: &str) -> Vec<Arc<dyn Worker>> {
         self.model_workers
@@ -765,11 +770,13 @@ mod tests {
         let stats = WorkerStats {
             worker_id: worker.url().to_string(),
             batch_size_tokens: 0,
+            kv_tokens_used: Some(0),
             num_requests: 0,
             waiting_queue_size: 0,
             waiting_queue_info: None,
             forward_mode: "UNKNOWN".to_string(),
             iteration_num: 0,
+            last_iteration_time_ms: None,
             prefill_chunk_pairs: None,
             router_generation: Some(99),
             last_received_message_id: Some(1),

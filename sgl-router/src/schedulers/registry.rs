@@ -22,6 +22,12 @@ impl SchedulerRegistry {
         self.scheduler.read().await.clone()
     }
 
+    /// Try to get the current active scheduler without blocking
+    /// Returns None if the lock is currently held
+    pub fn try_get_scheduler(&self) -> Option<Arc<dyn Scheduler>> {
+        self.scheduler.try_read().ok().map(|guard| guard.clone())
+    }
+
     /// Sets a new active scheduler
     pub async fn set_scheduler(&self, scheduler: Arc<dyn Scheduler>) {
         let mut guard = self.scheduler.write().await;

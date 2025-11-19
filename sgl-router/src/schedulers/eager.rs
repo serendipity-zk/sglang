@@ -109,4 +109,8 @@ impl Scheduler for EagerScheduler {
     fn name(&self) -> &'static str {
         "eager"
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }

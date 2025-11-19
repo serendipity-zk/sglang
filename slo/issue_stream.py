@@ -82,6 +82,21 @@ def sample_prompt_from_pool(token_pool: List[int], length: int, rng: random.Rand
     return token_pool[start : start + length]
 
 
+def format_slo_tier_label(tpot_ms: Optional[float]) -> Optional[str]:
+    """Human-readable label for grouping requests by TPOT target."""
+    if tpot_ms is None:
+        return None
+    try:
+        value = float(tpot_ms)
+    except (TypeError, ValueError):
+        return None
+    if abs(value - round(value)) < 1e-6:
+        value_str = f"{int(round(value))}"
+    else:
+        value_str = f"{value:.1f}"
+    return f"{value_str} ms"
+
+
 class StreamStats:
     """Thread-safe stats for streaming requests."""
 
@@ -92,6 +107,7 @@ class StreamStats:
         self._completed = 0
         self._failed = 0
         self._active = 0
+        self._slo_tier_stats = {}
 
     def record_submit(self):
         with self._lock:
@@ -106,14 +122,25 @@ class StreamStats:
             else:
                 self._failed += 1
 
+    def record_slo_result(self, tier_label: Optional[str], satisfied: bool):
+        if not tier_label:
+            return
+        with self._lock:
+            tier_stats = self._slo_tier_stats.setdefault(tier_label, {"attained": 0, "total": 0})
+            tier_stats["total"] += 1
+            if satisfied:
+                tier_stats["attained"] += 1
+
     def snapshot(self) -> dict:
         with self._lock:
+            slo_tiers = {tier: stats.copy() for tier, stats in self._slo_tier_stats.items()}
             return {
                 "submitted": self._submitted,
                 "completed": self._completed,
                 "failed": self._failed,
                 "active": self._active,
                 "expected_total": self.expected_total,
+                "slo_tiers": slo_tiers,
             }
 
     def all_done(self) -> bool:
@@ -318,6 +345,7 @@ def send_streaming_request(
         }
         if ttft is not None:
             record["target_ttft_ms"] = ttft
+        slo_tier_label = format_slo_tier_label(tpot)
         if tpot is not None:
             record["target_tpot_ms"] = tpot
         # Add SLO check results
@@ -325,6 +353,7 @@ def send_streaming_request(
             record["slo_satisfied"] = slo_satisfied
             record["slo_violations"] = slo_violations
             record["slo_tokens_checked"] = slo_tokens_checked
+            stats.record_slo_result(slo_tier_label, slo_satisfied)
         # Add alternative SLO check results
         if tpot_with_100_slack is not None:
             record["tpot_with_100_slack"] = tpot_with_100_slack
@@ -384,6 +413,12 @@ def status_display_thread(
     ui = CliStatusDisplay(enabled=sys.stdout.isatty())
     log_display_path = os.path.relpath(log_path)
 
+    def tier_sort_key(label: str) -> float:
+        try:
+            return float(label.split()[0])
+        except (ValueError, IndexError):
+            return float("inf")
+
     try:
         while not stop_event.is_set():
             for _ in range(5):
@@ -410,6 +445,7 @@ def status_display_thread(
             failed = snapshot["failed"]
             active = snapshot["active"]
             expected_total = snapshot["expected_total"]
+            slo_tiers = snapshot.get("slo_tiers") or {}
 
             percent_complete = (
                 (completed + failed) / expected_total * 100.0 if expected_total > 0 else 0.0
@@ -429,6 +465,17 @@ def status_display_thread(
                 f"Log File             : {log_display_path}",
                 "Ctrl+C twice to force stop",
             ]
+
+            if slo_tiers:
+                lines.append("")
+                lines.append("SLO Attainment (per TPOT tier)")
+                for tier_label in sorted(slo_tiers.keys(), key=tier_sort_key):
+                    tier_counts = slo_tiers[tier_label]
+                    total = tier_counts.get("total", 0)
+                    attained = tier_counts.get("attained", 0)
+                    percent = (attained / total * 100.0) if total > 0 else 0.0
+                    lines.append(f"  {tier_label:>8} : {attained}/{total} ({percent:.1f}%)")
+
             ui.render(lines)
 
             if stats.all_done():
@@ -446,6 +493,7 @@ def status_display_thread(
             failed = snapshot["failed"]
             active = snapshot["active"]
             expected_total = snapshot["expected_total"]
+            slo_tiers = snapshot.get("slo_tiers") or {}
             percent_complete = (
                 (completed + failed) / expected_total * 100.0 if expected_total > 0 else 0.0
             )
@@ -462,6 +510,15 @@ def status_display_thread(
                 "",
                 f"Log File             : {log_display_path}",
             ]
+            if slo_tiers:
+                lines.append("")
+                lines.append("SLO Attainment (per TPOT tier)")
+                for tier_label in sorted(slo_tiers.keys(), key=tier_sort_key):
+                    tier_counts = slo_tiers[tier_label]
+                    total = tier_counts.get("total", 0)
+                    attained = tier_counts.get("attained", 0)
+                    percent = (attained / total * 100.0) if total > 0 else 0.0
+                    lines.append(f"  {tier_label:>8} : {attained}/{total} ({percent:.1f}%)")
             ui.render(lines, final=True)
         except Exception:
             # Suppress errors during shutdown

@@ -605,6 +605,7 @@ class Scheduler(
         # Rolling history for iteration durations (ms) + derived target for next iteration
         self.iteration_time_history: deque = deque(maxlen=10)
         self.target_iteration_time_ms: Optional[float] = None
+        self.last_iteration_time_ms: Optional[float] = None
 
         # Cycle time predictor for SLO-aware scheduling (optional)
         self.cycle_time_predictor = None
@@ -829,7 +830,13 @@ class Scheduler(
         if iteration_time_ms is not None:
             # iteration_time_ms semantically represents elapsed iteration time; we now pass gpu_elapsed_ms here
             metrics["iteration_time_ms"] = round(iteration_time_ms, 2)
+            self.last_iteration_time_ms = float(iteration_time_ms)
             self._record_iteration_time(iteration_time_ms)
+
+        if self.last_iteration_time_ms is not None:
+            metrics["last_iteration_time_ms"] = round(
+                self.last_iteration_time_ms, 2
+            )
 
         avg_iteration = self._get_iteration_time_average()
         if avg_iteration is not None:

@@ -93,4 +93,8 @@ impl Scheduler for GatedScheduler {
     fn name(&self) -> &'static str {
         "gated"
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }

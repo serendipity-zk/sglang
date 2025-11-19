@@ -106,6 +106,9 @@ pub trait Scheduler: SchedulerBase {
     ) -> JoinHandle<()>;
 
     fn name(&self) -> &'static str;
+
+    /// Downcast support for accessing concrete scheduler types
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Result of attempting to select a worker for a pending request.

@@ -26,6 +26,10 @@ pub struct WorkerStats {
     /// Current batch size in tokens
     pub batch_size_tokens: i64,
 
+    /// Number of KV cache tokens currently used
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_tokens_used: Option<i64>,
+
     /// Number of requests currently being processed
     pub num_requests: i64,
 
@@ -41,6 +45,10 @@ pub struct WorkerStats {
 
     /// Iteration counter
     pub iteration_num: i64,
+
+    /// Duration of the last completed iteration in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_iteration_time_ms: Option<f64>,
 
     /// Prefill chunk pairs: [(chunk_size, cumulative_prefill), ...]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -126,6 +134,10 @@ impl WorkerStats {
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
 
+        let last_iteration_time_ms = stats
+            .get("last_iteration_time_ms")
+            .and_then(|v| v.as_f64());
+
         let prefill_chunk_pairs = stats
             .get("prefill_chunk_pairs")
             .and_then(|v| v.as_array())
@@ -143,6 +155,8 @@ impl WorkerStats {
                     .collect()
             });
 
+        let kv_tokens_used = stats.get("kv_tokens_used").and_then(|v| v.as_i64());
+
         let router_generation = stats.get("router_generation").and_then(|v| v.as_i64());
         let last_received_message_id = stats
             .get("last_received_message_id")
@@ -151,11 +165,13 @@ impl WorkerStats {
         Ok(WorkerStats {
             worker_id,
             batch_size_tokens,
+            kv_tokens_used,
             num_requests,
             waiting_queue_size,
             waiting_queue_info,
             forward_mode,
             iteration_num,
+            last_iteration_time_ms,
             prefill_chunk_pairs,
             router_generation,
             last_received_message_id,
