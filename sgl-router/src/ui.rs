@@ -162,6 +162,55 @@ impl RouterUi {
         }
     }
 
+    /// Get SLO queue information from SLO-aware scheduler
+    /// Returns Vec<(tier_idx, tpot_boundary, queue_size)> sorted by tier
+    fn get_slo_queue_info(app_state: &AppState) -> Option<Vec<(usize, Option<f32>, usize)>> {
+        // Get the scheduler (non-blocking)
+        let scheduler = app_state.context.scheduler_registry.try_get_scheduler()?;
+
+        // Check if it's SLO-aware
+        if scheduler.name() != "slo_aware" {
+            return None;
+        }
+
+        // Downcast to SloAwareScheduler
+        let slo_scheduler = scheduler.as_any().downcast_ref::<SloAwareScheduler>()?;
+
+        let tpot_buckets = &slo_scheduler.tpot_buckets;
+        let queue_sizes = slo_scheduler.get_tier_queue_sizes();
+
+        // Build list of (tier_idx, boundary, queue_size)
+        let mut queue_info: Vec<(usize, Option<f32>, usize)> = queue_sizes
+            .into_iter()
+            .map(|(tier_idx, queue_size)| {
+                let boundary = if tier_idx < tpot_buckets.len() {
+                    Some(tpot_buckets[tier_idx])
+                } else {
+                    None // Idle tier
+                };
+                (tier_idx, boundary, queue_size)
+            })
+            .collect();
+
+        // Sort by tier index
+        queue_info.sort_by_key(|(tier_idx, _, _)| *tier_idx);
+
+        Some(queue_info)
+    }
+
+    /// Get last scheduling iteration duration from SLO-aware scheduler
+    /// Returns duration in microseconds, or None if not using SLO-aware scheduler
+    fn get_schedule_duration_us(app_state: &AppState) -> Option<u64> {
+        let scheduler = app_state.context.scheduler_registry.try_get_scheduler()?;
+
+        if scheduler.name() != "slo_aware" {
+            return None;
+        }
+
+        let slo_scheduler = scheduler.as_any().downcast_ref::<SloAwareScheduler>()?;
+        Some(slo_scheduler.get_last_schedule_duration_us())
+    }
+
     /// Get worker tier mapping from SLO-aware scheduler
     /// Returns HashMap<worker_url, tpot_boundary>
     fn get_worker_tier_map(app_state: &AppState) -> Option<HashMap<String, Option<f32>>> {
@@ -203,16 +252,54 @@ impl RouterUi {
         Some(tier_map)
     }
 
-    /// Build worker ID mapping (S0, S1, S2, ...) based on alphabetical URL order
-    /// Returns HashMap<worker_url, worker_display_id>
-    fn build_worker_id_map(worker_urls: &[String]) -> HashMap<String, String> {
-        let mut urls = worker_urls.to_vec();
-        urls.sort();
+    /// Build worker ID mapping (S0, S1, S2, ...) based on scheduler's internal traversal order
+    /// Returns HashMap<worker_url, (worker_display_id, tier_position)>
+    /// If SLO-aware scheduler is active, uses tier_workers order; otherwise uses alphabetical order
+    fn build_worker_id_map(app_state: &AppState) -> HashMap<String, (String, usize)> {
+        let mut worker_id_map = HashMap::new();
+        let mut global_idx = 0;
 
-        urls.into_iter()
-            .enumerate()
-            .map(|(idx, url)| (url, format!("S{}", idx)))
-            .collect()
+        // Try to get SLO scheduler's tier order
+        if let Some(scheduler) = app_state.context.scheduler_registry.try_get_scheduler() {
+            if scheduler.name() == "slo_aware" {
+                if let Some(slo_scheduler) = scheduler.as_any().downcast_ref::<SloAwareScheduler>() {
+                    // Get all tiers in order
+                    let mut tier_indices: Vec<usize> = slo_scheduler.tier_workers.iter()
+                        .map(|entry| *entry.key())
+                        .collect();
+                    tier_indices.sort();
+
+                    // For each tier, assign IDs in the order workers appear in tier_workers
+                    for tier_idx in tier_indices {
+                        if let Some(worker_ids) = slo_scheduler.tier_workers.get(&tier_idx) {
+                            for (position, worker_id) in worker_ids.iter().enumerate() {
+                                if let Some(worker) = app_state.context.worker_registry.get(worker_id) {
+                                    worker_id_map.insert(
+                                        worker.url().to_string(),
+                                        (format!("S{}", global_idx), position)
+                                    );
+                                    global_idx += 1;
+                                }
+                            }
+                        }
+                    }
+                    return worker_id_map;
+                }
+            }
+        }
+
+        // Fallback: alphabetical order for non-SLO schedulers
+        let mut worker_urls: Vec<String> = app_state.context.worker_registry.get_all_stats()
+            .keys()
+            .cloned()
+            .collect();
+        worker_urls.sort();
+
+        for (idx, url) in worker_urls.into_iter().enumerate() {
+            worker_id_map.insert(url, (format!("S{}", idx), idx));
+        }
+
+        worker_id_map
     }
 
     /// Format worker metrics for display with aligned fields
@@ -287,22 +374,56 @@ impl RouterUi {
         let total = state.total_generate.load(Ordering::Relaxed);
         let finished = state.finished_generate.load(Ordering::Relaxed);
         let inflight = total.saturating_sub(finished);
-        let attempts = state.generate_attempts.load(Ordering::Relaxed);
         let failed = state.failed_generate.load(Ordering::Relaxed);
-        let mid_immediate = state.mid_to_generate_immediate.load(Ordering::Relaxed);
-        let mid_not_immediate = state.mid_not_immediate.load(Ordering::Relaxed);
-        let mid_struggle = state.mid_to_generate_struggle.load(Ordering::Relaxed);
-        let pending = state.pending_queue.load(Ordering::Relaxed);
-        let token_budget = f64::from_bits(state.token_bucket_tokens_bits.load(Ordering::Relaxed));
 
         let _ = writeln!(handle, "SGLang Router - Live Stats");
         let _ = writeln!(handle, "===========================");
-        let _ = writeln!(handle, "Pending Queue: {}", pending);
-        let _ = writeln!(handle, "Token Budget: {:.2}", token_budget);
-        let _ = writeln!(handle, "Generate Attempts: {}", attempts);
-        let _ = writeln!(handle, "Mid Immediate: {}", mid_immediate);
-        let _ = writeln!(handle, "Mid Not Immediate: {}", mid_not_immediate);
-        let _ = writeln!(handle, "Mid Struggle: {}", mid_struggle);
+
+        // Display scheduling iteration time if using SLO-aware scheduler
+        if let Some(app_state) = UI_APPSTATE.get() {
+            if let Some(duration_us) = Self::get_schedule_duration_us(app_state) {
+                // Convert microseconds to milliseconds for display
+                let duration_ms = duration_us as f64 / 1000.0;
+                let _ = writeln!(handle, "Schedule Iteration Time: {:.3} ms", duration_ms);
+            }
+        }
+
+        // Display per-SLO queue states if using SLO-aware scheduler
+        if let Some(app_state) = UI_APPSTATE.get() {
+            if let Some(slo_queue_info) = Self::get_slo_queue_info(app_state) {
+                let _ = writeln!(handle, "");
+                let _ = writeln!(handle, "Per-SLO Queue States:");
+                let num_slo_tiers = slo_queue_info.iter()
+                    .filter(|(_, boundary, _)| boundary.is_some())
+                    .count();
+
+                // Collect all SLO boundaries for range calculation
+                let mut slo_boundaries: Vec<f32> = slo_queue_info.iter()
+                    .filter_map(|(_, boundary, _)| *boundary)
+                    .collect();
+                slo_boundaries.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+                for (tier_idx, boundary, queue_size) in &slo_queue_info {
+                    if let Some(ms) = boundary {
+                        // SLO tier - format with boundary range
+                        let range_desc = if *tier_idx == 0 {
+                            format!("≤{:.1} ms", ms)
+                        } else {
+                            // Find previous boundary by position in sorted list
+                            let pos = slo_boundaries.iter().position(|&b| (b - ms).abs() < 0.01).unwrap_or(0);
+                            let prev_boundary = if pos > 0 { slo_boundaries[pos - 1] } else { 0.0 };
+                            format!(">{:.1} ms, ≤{:.1} ms", prev_boundary, ms)
+                        };
+                        let _ = writeln!(handle, "  Queue {} ({}): {} requests", tier_idx, range_desc, queue_size);
+                    } else if *tier_idx == num_slo_tiers {
+                        // Idle tier
+                        let _ = writeln!(handle, "  Queue {} (idle/autoscaling): {} requests", tier_idx, queue_size);
+                    }
+                }
+                let _ = writeln!(handle, "");
+            }
+        }
+
         let _ = writeln!(handle, "Accepted Generate: {}", total);
         let _ = writeln!(handle, "Finished Generate: {}", finished);
         let _ = writeln!(handle, "Failed: {}", failed);
@@ -327,9 +448,8 @@ impl RouterUi {
         // Get all worker stats
         let worker_stats = app_state.context.worker_registry.get_all_stats();
 
-        // Build worker ID mapping (S0, S1, S2, ...)
-        let worker_urls: Vec<String> = worker_stats.keys().cloned().collect();
-        let worker_id_map = Self::build_worker_id_map(&worker_urls);
+        // Build worker ID mapping (S0, S1, S2, ...) based on scheduler's traversal order
+        let worker_id_map = Self::build_worker_id_map(app_state);
 
         // Build reverse tier map for sorting: worker_url -> tier_index
         let worker_to_tier: HashMap<String, usize> = if let Some(scheduler) = app_state.context.scheduler_registry.try_get_scheduler() {
@@ -356,16 +476,18 @@ impl RouterUi {
         };
 
         // Build rows with formatted metrics and sorting keys
-        let mut rows: Vec<(String, usize, String)> = Vec::new(); // (metrics_str, tier_index, worker_id)
+        let mut rows: Vec<(String, usize, usize)> = Vec::new(); // (metrics_str, tier_index, tier_position)
         for (worker_url, stats) in worker_stats.iter() {
-            let worker_id = worker_id_map.get(worker_url).map(|s| s.as_str()).unwrap_or("S?");
+            let (worker_id, tier_position) = worker_id_map.get(worker_url)
+                .map(|(id, pos)| (id.as_str(), *pos))
+                .unwrap_or(("S?", usize::MAX));
             let tpot_boundary = tier_map.as_ref().and_then(|map| map.get(worker_url).copied());
             let metrics_str = Self::format_worker_metrics(worker_id, stats, tpot_boundary);
             let tier_idx = worker_to_tier.get(worker_url).copied().unwrap_or(usize::MAX); // Unknown tier goes last
-            rows.push((metrics_str, tier_idx, worker_id.to_string()));
+            rows.push((metrics_str, tier_idx, tier_position));
         }
 
-        // Sort by tier first, then by server ID (S0, S1, S2, ...)
+        // Sort by tier first, then by position within tier (matching scheduler's traversal order)
         rows.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.2.cmp(&b.2)));
 
         let _ = writeln!(handle, "Per-Worker Stats:");

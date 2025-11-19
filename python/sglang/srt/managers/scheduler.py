@@ -291,6 +291,9 @@ class Scheduler(
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.page_size = server_args.page_size
         self.router_ack_tracker = RouterMessageAckTracker()
+        # Track idle reporting cadence
+        self._last_idle_router_report_time: Optional[float] = None
+        self._idle_router_report_interval = 0.02  # seconds
 
         # Timestamp of the last completed process_batch_result call
         self._last_process_result_end_time: Optional[float] = None
@@ -753,6 +756,11 @@ class Scheduler(
         if not self.server_args.enable_iteration_metrics:
             return
 
+        num_batch_reqs = len(batch.reqs) if batch.reqs is not None else 0
+        if num_batch_reqs > 0:
+            # Activity observed; allow the next idle transition to report immediately
+            self._last_idle_router_report_time = None
+
         from sglang.srt.ui import iteration_metrics
 
         # Get KV cache stats
@@ -807,7 +815,7 @@ class Scheduler(
         # Build metrics payload (field names match router and UI expectations)
         metrics = {
             # UI expects: running_batch_size, queue_reqs, kv_tokens_used, token_capacity
-            "running_batch_size": len(batch.reqs),
+            "running_batch_size": num_batch_reqs,
             "queue_reqs": len(self.waiting_queue),
             "waiting_queue_size": len(self.waiting_queue),  # Router expects this name
             "kv_tokens_used": num_used,
@@ -822,7 +830,7 @@ class Scheduler(
             "prefill_chunk_pairs": prefill_chunk_pairs,
             # Keep some old names for compatibility
             "batch_size_tokens": total_tokens,
-            "num_requests": len(batch.reqs),
+            "num_requests": num_batch_reqs,
             "input_id_len": batch.input_ids.shape[0] if batch.input_ids is not None else 0,
         }
 
@@ -909,6 +917,23 @@ class Scheduler(
                     kv_tokens_used=num_used,
                     iteration_time_ms=iteration_time_ms,
                 )
+
+    def _report_idle_metrics_if_needed(self):
+        """Emit idle metrics updates to the router at a fixed cadence while idle."""
+        if not self.server_args.enable_iteration_metrics:
+            return
+
+        now = time.perf_counter()
+        if self._last_idle_router_report_time is not None:
+            elapsed = now - self._last_idle_router_report_time
+            if elapsed < self._idle_router_report_interval:
+                return
+
+        idle_batch = self.get_idle_batch()
+        self._collect_and_report_iteration_metrics(
+            idle_batch, iteration_time_ms=None, destinations=["router"]
+        )
+        self._last_idle_router_report_time = now
 
     def _record_iteration_time(self, iteration_time_ms: float):
         """Store the latest iteration and refresh derived targets."""
@@ -1229,6 +1254,7 @@ class Scheduler(
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
+                self._report_idle_metrics_if_needed()
 
             self.last_batch = batch
 
@@ -1322,6 +1348,7 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
+                self._report_idle_metrics_if_needed()
 
             self.last_batch = batch
 
@@ -1467,6 +1494,7 @@ class Scheduler(
             if server_is_idle:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
+                self._report_idle_metrics_if_needed()
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
