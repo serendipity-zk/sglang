@@ -236,6 +236,10 @@ class ServerArgs:
     router_metrics_url: Optional[str] = None
     iteration_metrics_interval: int = 1
 
+    # Cycle time predictor configuration
+    predictor_type: str = "grid"
+    predictor_grid_path: str = "/sgl-workspace/sglang/profile/grid3d.json"
+
     # API related
     api_key: Optional[str] = None
     served_model_name: Optional[str] = None
@@ -1643,6 +1647,21 @@ class ServerArgs:
             type=int,
             default=ServerArgs.iteration_metrics_interval,
             help="Report iteration metrics every N iterations (default: 1 = every iteration)",
+        )
+
+        # Cycle time predictor configuration
+        parser.add_argument(
+            "--predictor-type",
+            type=str,
+            default=ServerArgs.predictor_type,
+            choices=["grid", "mode_aware"],
+            help="Type of cycle time predictor: 'grid' (old, single model) or 'mode_aware' (multi-mode: DECODE/EXTEND/MIXED)",
+        )
+        parser.add_argument(
+            "--predictor-grid-path",
+            type=str,
+            default=ServerArgs.predictor_grid_path,
+            help="Path to grid3d.json file for cycle time predictor",
         )
 
         # API related

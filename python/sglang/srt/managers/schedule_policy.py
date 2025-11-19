@@ -29,10 +29,23 @@ from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import ServerArgs
 
 import logging
-logger = logging.getLogger(__name__) 
+logger = logging.getLogger(__name__)
+
+
+def _forward_mode_to_string(forward_mode: ForwardMode) -> Optional[str]:
+    """Convert ForwardMode enum to string for mode-aware predictor."""
+    mode_map = {
+        ForwardMode.DECODE: "DECODE",
+        ForwardMode.EXTEND: "EXTEND",
+        ForwardMode.MIXED: "MIXED",
+    }
+    return mode_map.get(forward_mode, None)
+
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
@@ -473,11 +486,28 @@ class PrefillAdder:
             test_pairs = prefill_pairs + [[mid_rounded, len(req.prefix_indices) + mid_rounded]]
             test_batch_tokens = batch_tokens + mid_rounded
 
-            predicted_time = self.cycle_time_predictor.predict(
-                batch_size_tokens=test_batch_tokens,
-                prefill_chunk_pairs=test_pairs,
-                kv_tokens_used=kv_used,
-            )
+            # Determine mode based on what will result from adding prefill
+            mode_str = None
+            if hasattr(self.cycle_time_predictor, 'is_multimode') and self.cycle_time_predictor.is_multimode:
+                if self.running_batch and len(self.running_batch.reqs) > 0:
+                    mode_str = "MIXED"  # Adding prefill to existing decode batch
+                else:
+                    mode_str = "EXTEND"  # Pure prefill batch
+
+            # Call predict with mode parameter if supported
+            if mode_str is not None:
+                predicted_time = self.cycle_time_predictor.predict(
+                    batch_size_tokens=test_batch_tokens,
+                    prefill_chunk_pairs=test_pairs,
+                    kv_tokens_used=kv_used,
+                    mode=mode_str,
+                )
+            else:
+                predicted_time = self.cycle_time_predictor.predict(
+                    batch_size_tokens=test_batch_tokens,
+                    prefill_chunk_pairs=test_pairs,
+                    kv_tokens_used=kv_used,
+                )
 
             target_limit = (
                 self.target_iteration_time_ms

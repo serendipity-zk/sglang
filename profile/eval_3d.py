@@ -122,7 +122,8 @@ def maybe_plot(resid, out, bins=100, title="Residual Distribution"):
 # ---------- Main ----------
 def main():
     ap = argparse.ArgumentParser(description="Evaluate 3D grid with online bias correction + residual plot.")
-    ap.add_argument("model_json"); ap.add_argument("csv")
+    ap.add_argument("model_json")
+    ap.add_argument("csv")
     ap.add_argument("--local-corr", choices=["none","bias"], default="bias")
     ap.add_argument("--alpha", type=float, default=0.6)
     ap.add_argument("--k", type=int, default=64)

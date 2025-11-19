@@ -160,9 +160,10 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
-# Import grid-based predictor for SLO-aware scheduling
+# Import cycle time predictors for SLO-aware scheduling
 sys.path.insert(0, "/sgl-workspace/sglang")
 from sglang_profile.grid_predictor import GridBasedCycleTimePredictor
+from sglang_profile.mode_aware_predictor import ModeAwarePredictor
 from sglang.srt.tracing.trace import (
     process_tracing_init,
     trace_event,
@@ -204,6 +205,16 @@ TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 _is_cpu = is_cpu()
+
+
+def _forward_mode_to_string(forward_mode: ForwardMode) -> Optional[str]:
+    """Convert ForwardMode enum to string for mode-aware predictor."""
+    mode_map = {
+        ForwardMode.DECODE: "DECODE",
+        ForwardMode.EXTEND: "EXTEND",
+        ForwardMode.MIXED: "MIXED",
+    }
+    return mode_map.get(forward_mode, None)
 
 
 @dataclass
@@ -595,19 +606,37 @@ class Scheduler(
         self.iteration_time_history: deque = deque(maxlen=10)
         self.target_iteration_time_ms: Optional[float] = None
 
-        # Grid-based cycle time predictor for SLO-aware scheduling (optional)
+        # Cycle time predictor for SLO-aware scheduling (optional)
         self.cycle_time_predictor = None
         if self.server_args.enable_iteration_metrics:
-            self.cycle_time_predictor = GridBasedCycleTimePredictor(
-                grid_path="/sgl-workspace/sglang/profile/grid3d.json",
-                log_every=100,
-                alpha=0.6,
-                k=64,
-                radius=0.30,
-                bandwidth=0.20,
-                half_life=50.0,
-                W0=4.0,
-            )
+            if self.server_args.predictor_type == "mode_aware":
+                logger.info(
+                    f"Initializing ModeAwarePredictor with grid: {self.server_args.predictor_grid_path}"
+                )
+                self.cycle_time_predictor = ModeAwarePredictor(
+                    grid_path=self.server_args.predictor_grid_path,
+                    log_every=100,
+                    alpha=0.6,
+                    k=64,
+                    radius=0.30,
+                    bandwidth=0.20,
+                    half_life=50.0,
+                    W0=4.0,
+                )
+            else:  # "grid" (old single-mode predictor)
+                logger.info(
+                    f"Initializing GridBasedCycleTimePredictor with grid: {self.server_args.predictor_grid_path}"
+                )
+                self.cycle_time_predictor = GridBasedCycleTimePredictor(
+                    grid_path=self.server_args.predictor_grid_path,
+                    log_every=100,
+                    alpha=0.6,
+                    k=64,
+                    radius=0.30,
+                    bandwidth=0.20,
+                    half_life=50.0,
+                    W0=4.0,
+                )
 
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
@@ -853,12 +882,26 @@ class Scheduler(
 
         # Train the online predictor with this iteration's data
         if self.cycle_time_predictor is not None and iteration_time_ms is not None:
-            self.cycle_time_predictor.submit(
-                batch_size_tokens=total_tokens,
-                prefill_chunk_pairs=prefill_chunk_pairs,
-                kv_tokens_used=num_used,
-                iteration_time_ms=iteration_time_ms,
-            )
+            # Get mode for mode-aware predictor
+            mode_str = _forward_mode_to_string(batch.forward_mode)
+
+            # Call submit with mode parameter (for mode-aware predictor) or without (for old predictor)
+            if isinstance(self.cycle_time_predictor, ModeAwarePredictor):
+                self.cycle_time_predictor.submit(
+                    batch_size_tokens=total_tokens,
+                    prefill_chunk_pairs=prefill_chunk_pairs,
+                    kv_tokens_used=num_used,
+                    iteration_time_ms=iteration_time_ms,
+                    mode=mode_str,
+                )
+            else:
+                # Old predictor without mode parameter
+                self.cycle_time_predictor.submit(
+                    batch_size_tokens=total_tokens,
+                    prefill_chunk_pairs=prefill_chunk_pairs,
+                    kv_tokens_used=num_used,
+                    iteration_time_ms=iteration_time_ms,
+                )
 
     def _record_iteration_time(self, iteration_time_ms: float):
         """Store the latest iteration and refresh derived targets."""
@@ -2171,7 +2214,33 @@ class Scheduler(
         #             f"Blocking new prefill: last_iteration_time={last_iteration_time:.2f}ms > tpot={self.tpot:.2f}ms"
         #         )
         #         return None
+        # estimate the time for running batch
+        pred = 0
+        if not self.running_batch.is_empty():
+            num_used, token_usage, available_size, evictable_size = self._get_token_info()
+            prefill_pairs = []
+            for req in self.running_batch.reqs:
+                if req.extend_input_len > 1:
+                    prefill_pairs.append([req.extend_input_len, len(req.prefix_indices) + req.extend_input_len])
 
+            if self.cycle_time_predictor is not None and hasattr(self.cycle_time_predictor, 'is_multimode') and self.cycle_time_predictor.is_multimode:
+                pred = self.cycle_time_predictor.predict(
+                    batch_size_tokens=sum([req.extend_input_len for req in self.running_batch.reqs]), 
+                    prefill_chunk_pairs=prefill_pairs, 
+                    kv_tokens_used=num_used,
+                    mode="MIXED"
+                )
+            else:
+                if self.cycle_time_predictor is not None:
+                    pred = self.cycle_time_predictor.predict(
+                    batch_size_tokens=sum([req.extend_input_len for req in self.running_batch.reqs]), 
+                        prefill_chunk_pairs=prefill_pairs, 
+                        kv_tokens_used=num_used
+                    )
+
+        if self.target_iteration_time_ms is not None and pred > self.target_iteration_time_ms:
+            return None
+        
         # Handle the cases where prefill is not allowed
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
@@ -2987,7 +3056,7 @@ class Scheduler(
     def set_tpot(self, recv_req: SetTPOTReqInput) -> SetTPOTReqOutput:
         """Set a global TPOT value on the scheduler. Logs for visibility."""
         try:
-            self.tpot = float(recv_req.tpot)
+            self.tpot = float(recv_req.tpot) - 1 # LEAVE SOME ROOM
             logger.info(f"[Scheduler] set_tpot received: tpot={self.tpot}")
             self._refresh_iteration_time_target()
             return SetTPOTReqOutput(success=True, tpot=self.tpot, message="ok")
