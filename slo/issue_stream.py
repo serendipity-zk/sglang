@@ -196,6 +196,7 @@ def send_streaming_request(
     sampling_params = {
         "max_new_tokens": max(0, int(decode_tokens)),
         "temperature": float(temperature),
+        "ignore_eos": True,
     }
     data = {
         "input_ids": [prompt_ids],

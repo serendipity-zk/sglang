@@ -36,7 +36,6 @@ import random
 import signal
 import sys
 import time
-from collections import deque
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 import tqdm
@@ -44,6 +43,21 @@ import tqdm
 import aiohttp
 
 from sglang.srt.hf_transformers_utils import get_tokenizer
+
+
+def format_slo_tier_label(tpot_ms: Optional[float]) -> Optional[str]:
+    """Human-readable label for grouping requests by TPOT target."""
+    if tpot_ms is None:
+        return None
+    try:
+        value = float(tpot_ms)
+    except (TypeError, ValueError):
+        return None
+    if abs(value - round(value)) < 1e-6:
+        value_str = f"{int(round(value))}"
+    else:
+        value_str = f"{value:.1f}"
+    return f"{value_str} ms"
 
 
 def build_token_pool(
@@ -88,12 +102,14 @@ class SharedStats:
 
     def __init__(self, expected_total: int, manager: mp.Manager):
         self.expected_total = expected_total
+        self._manager = manager
         self._lock = manager.Lock()
         self._dict = manager.dict()
         self._dict["submitted"] = 0
         self._dict["completed"] = 0
         self._dict["failed"] = 0
         self._dict["active"] = 0
+        self._slo_tier_stats = manager.dict()  # tier_label -> {"attained": count, "total": count}
 
     def record_submit(self):
         with self._lock:
@@ -108,14 +124,28 @@ class SharedStats:
             else:
                 self._dict["failed"] = self._dict["failed"] + 1
 
+    def record_slo_result(self, tier_label: Optional[str], satisfied: bool):
+        if not tier_label:
+            return
+        with self._lock:
+            # Get or create tier stats
+            if tier_label not in self._slo_tier_stats:
+                self._slo_tier_stats[tier_label] = self._manager.dict({"attained": 0, "total": 0})
+            tier_stats = self._slo_tier_stats[tier_label]
+            tier_stats["total"] = tier_stats.get("total", 0) + 1
+            if satisfied:
+                tier_stats["attained"] = tier_stats.get("attained", 0) + 1
+
     def snapshot(self) -> dict:
         with self._lock:
+            slo_tiers = {tier: dict(stats) for tier, stats in self._slo_tier_stats.items()}
             return {
                 "submitted": self._dict["submitted"],
                 "completed": self._dict["completed"],
                 "failed": self._dict["failed"],
                 "active": self._dict["active"],
                 "expected_total": self.expected_total,
+                "slo_tiers": slo_tiers,
             }
 
     def all_done(self) -> bool:
@@ -154,6 +184,7 @@ async def async_send_streaming_request(
     stats: SharedStats,
     ttft: Optional[float] = None,
     tpot: Optional[float] = None,
+    enqueue_timestamp: Optional[float] = None,
 ):
     """
     Async streaming request with low-latency readany() approach.
@@ -162,12 +193,14 @@ async def async_send_streaming_request(
     Preserves exact timing methodology from original issue_stream.py.
     """
 
-    submit_timestamp = time.time()
+    # Use enqueue timestamp from main process if available, otherwise record now
+    submit_timestamp = enqueue_timestamp if enqueue_timestamp is not None else time.time()
     start_time = time.perf_counter()
 
     sampling_params = {
         "max_new_tokens": max(0, int(decode_tokens)),
         "temperature": float(temperature),
+        "ignore_eos": True,
     }
     data = {
         "input_ids": [prompt_ids],
@@ -343,6 +376,7 @@ async def async_send_streaming_request(
         }
         if ttft is not None:
             record["target_ttft_ms"] = ttft
+        slo_tier_label = format_slo_tier_label(tpot)
         if tpot is not None:
             record["target_tpot_ms"] = tpot
         # Add SLO check results
@@ -350,6 +384,7 @@ async def async_send_streaming_request(
             record["slo_satisfied"] = slo_satisfied
             record["slo_violations"] = slo_violations
             record["slo_tokens_checked"] = slo_tokens_checked
+            stats.record_slo_result(slo_tier_label, slo_satisfied)
         # Add alternative SLO check results
         if tpot_with_100_slack is not None:
             record["tpot_with_100_slack"] = tpot_with_100_slack
@@ -410,6 +445,7 @@ async def worker_event_loop(
     stats: SharedStats,
     concurrency: int,
     seed: int,
+    ready_queue: mp.Queue,
 ):
     """
     Worker process event loop.
@@ -451,6 +487,8 @@ async def worker_event_loop(
     timeout_obj = aiohttp.ClientTimeout(total=None)  # Per-request timeout set individually
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout_obj) as session:
+        # Signal that this worker is ready
+        ready_queue.put(worker_id)
 
         async def process_request(req_data: Dict[str, Any]):
             """Process a single request with semaphore control."""
@@ -461,6 +499,7 @@ async def worker_event_loop(
                 decode = req_data["decode"]
                 ttft = req_data.get("ttft")
                 tpot = req_data.get("tpot")
+                enqueue_timestamp = req_data.get("enqueue_timestamp")  # Get enqueue time from main process
 
                 # Sample prompt
                 prompt_ids = sample_prompt_from_pool(token_pool, prefill, rng)
@@ -482,6 +521,7 @@ async def worker_event_loop(
                     stats=stats,
                     ttft=ttft,
                     tpot=tpot,
+                    enqueue_timestamp=enqueue_timestamp,
                 )
 
         # Process requests from queue
@@ -532,6 +572,7 @@ def worker_process_main(
     stats: SharedStats,
     concurrency: int,
     seed: int,
+    ready_queue: mp.Queue,
 ):
     """Entry point for worker process - sets up event loop."""
     try:
@@ -546,6 +587,7 @@ def worker_process_main(
             stats=stats,
             concurrency=concurrency,
             seed=seed,
+            ready_queue=ready_queue,
         ))
     except KeyboardInterrupt:
         pass
@@ -561,6 +603,12 @@ def status_display_thread(
 
     ui = CliStatusDisplay(enabled=sys.stdout.isatty())
     log_display_path = os.path.relpath(log_path)
+
+    def tier_sort_key(label: str) -> float:
+        try:
+            return float(label.split()[0])
+        except (ValueError, IndexError):
+            return float("inf")
 
     try:
         while not stop_event.is_set():
@@ -579,6 +627,7 @@ def status_display_thread(
             failed = snapshot["failed"]
             active = snapshot["active"]
             expected_total = snapshot["expected_total"]
+            slo_tiers = snapshot.get("slo_tiers") or {}
 
             # Calculate rates
             submit_speed = submitted / elapsed_s if elapsed_s > 0 else 0.0
@@ -603,6 +652,17 @@ def status_display_thread(
                 f"Log File             : {log_display_path}",
                 "Ctrl+C to stop",
             ]
+
+            if slo_tiers:
+                lines.append("")
+                lines.append("SLO Attainment (per TPOT tier)")
+                for tier_label in sorted(slo_tiers.keys(), key=tier_sort_key):
+                    tier_counts = slo_tiers[tier_label]
+                    total = tier_counts.get("total", 0)
+                    attained = tier_counts.get("attained", 0)
+                    percent = (attained / total * 100.0) if total > 0 else 0.0
+                    lines.append(f"  {tier_label:>8} : {attained}/{total} ({percent:.1f}%)")
+
             ui.render(lines)
 
             if stats.all_done():
@@ -620,6 +680,7 @@ def status_display_thread(
             failed = snapshot["failed"]
             active = snapshot["active"]
             expected_total = snapshot["expected_total"]
+            slo_tiers = snapshot.get("slo_tiers") or {}
             percent_complete = (
                 (completed + failed) / expected_total * 100.0 if expected_total > 0 else 0.0
             )
@@ -636,6 +697,15 @@ def status_display_thread(
                 "",
                 f"Log File             : {log_display_path}",
             ]
+            if slo_tiers:
+                lines.append("")
+                lines.append("SLO Attainment (per TPOT tier)")
+                for tier_label in sorted(slo_tiers.keys(), key=tier_sort_key):
+                    tier_counts = slo_tiers[tier_label]
+                    total = tier_counts.get("total", 0)
+                    attained = tier_counts.get("attained", 0)
+                    percent = (attained / total * 100.0) if total > 0 else 0.0
+                    lines.append(f"  {tier_label:>8} : {attained}/{total} ({percent:.1f}%)")
             ui.render(lines, final=True)
         except Exception:
             pass
@@ -655,6 +725,7 @@ def run_trace(
     num_workers: int,
     concurrency_per_worker: int,
     enable_ui: Optional[bool] = None,
+    log_path: Optional[str] = None,
 ):
     """Run the trace-driven streaming load test with multiprocessing."""
 
@@ -692,17 +763,23 @@ def run_trace(
     print(f"Total concurrent capacity: {num_workers * concurrency_per_worker}")
 
     # Setup logging
-    logs_dir = os.path.join(os.path.dirname(__file__), "logs")
-    os.makedirs(logs_dir, exist_ok=True)
-    log_path = os.path.join(
-        logs_dir, f"issue_stream_aiohttp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
-    )
+    if log_path:
+        logs_dir = os.path.dirname(log_path)
+        if logs_dir:
+            os.makedirs(logs_dir, exist_ok=True)
+    else:
+        logs_dir = os.path.join(os.path.dirname(__file__), "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        log_path = os.path.join(
+            logs_dir, f"issue_stream_aiohttp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
+        )
 
     # Create multiprocessing manager for shared state
     manager = mp.Manager()
     stats = SharedStats(expected_total=total_requests, manager=manager)
     request_queue = manager.Queue()
     stop_event = manager.Event()
+    ready_queue = manager.Queue()  # Workers signal when ready
 
     # UI setup
     if enable_ui is None:
@@ -741,11 +818,29 @@ def run_trace(
                 stats,
                 concurrency_per_worker,
                 seed,
+                ready_queue,
             ),
             daemon=False,
         )
         p.start()
         workers.append(p)
+
+    # Wait for all workers to signal readiness
+    print("Waiting for all workers to be ready...")
+    ready_workers = set()
+    timeout_start = time.perf_counter()
+    while len(ready_workers) < num_workers:
+        try:
+            worker_id = ready_queue.get(timeout=1.0)
+            ready_workers.add(worker_id)
+            if len(ready_workers) % 10 == 0 or len(ready_workers) == num_workers:
+                print(f"  {len(ready_workers)}/{num_workers} workers ready...")
+        except Exception:
+            # Check if we've been waiting too long
+            if time.perf_counter() - timeout_start > 30:
+                print(f"  WARNING: Only {len(ready_workers)}/{num_workers} workers ready after 30s, proceeding anyway...")
+                break
+    print(f"All {len(ready_workers)} workers ready! Starting request submission...")
 
     # Start status display thread in main process
     import threading
@@ -759,6 +854,7 @@ def run_trace(
         )
         status_thread.start()
 
+    start_time = time.perf_counter()
     try:
         # Submit requests to queue according to schedule
         print("Submitting requests to queue...")
@@ -768,16 +864,13 @@ def run_trace(
 
             # Wait until scheduled time
             target_s = row["scaled_arrival_ms"] / 1000.0
-            now_s = time.perf_counter() - start_time
-            if now_s < target_s:
+            while True:
+                now_s = time.perf_counter() - start_time
+                if now_s >= target_s or stop_event.is_set():
+                    break
                 sleep_time = target_s - now_s
-                while sleep_time > 0 and not stop_event.is_set():
-                    chunk_sleep = min(0.1, sleep_time)
-                    time.sleep(chunk_sleep)
-                    sleep_time -= chunk_sleep
-
-            if stop_event.is_set():
-                break
+                chunk_sleep = min(0.1, sleep_time)
+                time.sleep(chunk_sleep)
 
             # Extract request parameters
             prefill = int(float(row["prefill"]))
@@ -787,13 +880,14 @@ def run_trace(
             ttft = float(ttft_val) if ttft_val not in (None, "") else None
             tpot = float(tpot_val) if tpot_val not in (None, "") else None
 
-            # Put request in queue
+            # Put request in queue (record enqueue time for accurate rate tracking)
             req_data = {
                 "idx": idx,
                 "prefill": prefill,
                 "decode": decode,
                 "ttft": ttft,
                 "tpot": tpot,
+                "enqueue_timestamp": time.time(),  # Record when main process enqueues
             }
             request_queue.put(req_data)
 
@@ -860,6 +954,7 @@ def parse_args():
     p.add_argument("--concurrency-per-worker", type=int, default=50,
                    help="Max concurrent requests per worker (default: 50)")
     p.add_argument("--no-ui", action="store_true", help="Disable live dashboard UI")
+    p.add_argument("--log-path", help="Optional path for the JSONL log output")
     return p.parse_args()
 
 
@@ -894,6 +989,7 @@ def main():
         num_workers=args.num_workers,
         concurrency_per_worker=args.concurrency_per_worker,
         enable_ui=ui_enabled,
+        log_path=args.log_path,
     )
     print(f"\nSubmitted={submitted}, Completed={completed}, Failed={failed}")
 
