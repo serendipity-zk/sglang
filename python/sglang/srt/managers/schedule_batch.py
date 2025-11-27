@@ -464,6 +464,7 @@ class Req:
         chunked_prefill_length: Optional[int] = None,
         router_generation: Optional[int] = None,
         router_message_id: Optional[int] = None,
+        arrival_time_ms: Optional[float] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -669,6 +670,9 @@ class Req:
         # Chunked prefill scheduling metadata (set by scheduler)
         self.chunked_prefill_start_pos = chunked_prefill_start_pos
         self.chunked_prefill_length = chunked_prefill_length
+
+        # Router-observed arrival time in milliseconds since unix epoch
+        self.arrival_time_ms = arrival_time_ms
 
     @property
     def seqlen(self):

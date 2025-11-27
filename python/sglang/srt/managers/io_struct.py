@@ -157,6 +157,9 @@ class GenerateReqInput:
     # Length of chunked prefill (set by scheduler)
     chunked_prefill_length: Optional[int] = None
 
+    # Router-observed arrival time in milliseconds since unix epoch
+    arrival_time_ms: Optional[float] = None
+
     # Router-provided metadata for message tracking
     router_generation: Optional[int] = None
     router_message_id: Optional[int] = None
@@ -651,6 +654,9 @@ class TokenizedGenerateReqInput:
     # Router-provided message tracking metadata
     router_generation: Optional[int] = None
     router_message_id: Optional[int] = None
+
+    # Router-observed arrival time in milliseconds since unix epoch
+    arrival_time_ms: Optional[float] = None
 
 
 @dataclass

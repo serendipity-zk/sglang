@@ -22,7 +22,7 @@ use axum::{
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
@@ -493,6 +493,12 @@ impl Router {
         let headers_owned = headers.cloned();
         let (response_tx, response_rx) = oneshot::channel();
 
+        let arrival_time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+            * 1000.0;
+
         // Extract SLO fields from the request
         let target_ttft_ms = typed_req.get_target_ttft_ms();
         let target_tpot_ms = typed_req.get_target_tpot_ms();
@@ -505,6 +511,7 @@ impl Router {
             is_stream,
             text,
             enqueue_started: Instant::now(),
+            arrival_time_ms,
             response_tx,
             target_ttft_ms,
             target_tpot_ms,

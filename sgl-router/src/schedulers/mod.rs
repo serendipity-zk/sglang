@@ -182,6 +182,7 @@ async fn process_pending<S: SchedulerBase + ?Sized>(
         is_stream,
         text: _,
         enqueue_started: _,
+        arrival_time_ms,
         response_tx,
         target_ttft_ms: _,
         target_tpot_ms: _,
@@ -200,6 +201,7 @@ async fn process_pending<S: SchedulerBase + ?Sized>(
         worker,
         message_id,
         generation,
+        arrival_time_ms,
     )
     .await;
 
@@ -237,15 +239,12 @@ fn prepare_request_payload<'a>(
     body_json: &'a serde_json::Value,
     message_id: Option<i64>,
     generation: Option<i64>,
+    arrival_time_ms: f64,
 ) -> RequestPayload<'a> {
-    if route != "/generate" || message_id.is_none() || generation.is_none() {
-        return RequestPayload::Borrowed(body_json);
-    }
-
     if !body_json.is_object() {
         warn!(
             route = route,
-            "Expected JSON object for /generate, skipping router message metadata injection"
+            "Expected JSON object, skipping router metadata injection"
         );
         return RequestPayload::Borrowed(body_json);
     }
@@ -253,8 +252,13 @@ fn prepare_request_payload<'a>(
     let mut owned = body_json.clone();
 
     if let Some(map) = owned.as_object_mut() {
-        map.insert("router_generation".to_string(), json!(generation.unwrap()));
-        map.insert("router_message_id".to_string(), json!(message_id.unwrap()));
+        if route == "/generate" {
+            if let (Some(msg_id), Some(gen)) = (message_id, generation) {
+                map.insert("router_generation".to_string(), json!(gen));
+                map.insert("router_message_id".to_string(), json!(msg_id));
+            }
+            map.insert("arrival_time_ms".to_string(), json!(arrival_time_ms));
+        }
 
         RequestPayload::Owned(owned)
     } else {
@@ -273,6 +277,7 @@ async fn dispatch_request<S: SchedulerBase + ?Sized>(
     worker: Arc<dyn Worker>,
     message_id: Option<i64>,
     generation: Option<i64>,
+    arrival_time_ms: f64,
 ) -> Response {
     info!(
         "Selected worker for model: {} worker_url={}",
@@ -297,7 +302,8 @@ async fn dispatch_request<S: SchedulerBase + ?Sized>(
 
     RouterUi::inc_worker_issued(worker.url());
 
-    let request_payload = prepare_request_payload(route, body_json, message_id, generation);
+    let request_payload =
+        prepare_request_payload(route, body_json, message_id, generation, arrival_time_ms);
 
     let response = scheduler
         .send_http_request(

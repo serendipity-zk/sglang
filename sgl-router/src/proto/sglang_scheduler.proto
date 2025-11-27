@@ -135,6 +135,9 @@ message GenerateRequest {
 
   // Length of chunked prefill (set by scheduler)
   int32 chunked_prefill_length = 21;
+
+  // Router-observed arrival time in milliseconds since unix epoch (for slack)
+  double arrival_time_ms = 22;
 }
 
 message TokenizedInput {

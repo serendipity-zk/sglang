@@ -16,6 +16,8 @@ pub struct PendingRequest {
     pub is_stream: bool,
     pub text: String,
     pub enqueue_started: std::time::Instant,
+    /// Arrival time recorded at router ingress (ms since Unix epoch)
+    pub arrival_time_ms: f64,
     pub response_tx: oneshot::Sender<axum::response::Response>,
     /// Target time to first token (SLO) in milliseconds
     #[allow(dead_code)]

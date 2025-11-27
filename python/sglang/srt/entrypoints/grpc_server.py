@@ -317,6 +317,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 logprob_start_len=-1,
                 top_logprobs_num=0,
                 token_ids_logprob=None,
+                arrival_time_ms=None,
             )
 
             logger.info(f"Sending health check request to request manager...")
@@ -409,6 +410,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             token_ids_logprob=(
                 list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else None
             ),
+            arrival_time_ms=grpc_req.arrival_time_ms if grpc_req.arrival_time_ms != 0 else None,
         )
 
     def _convert_embed_request(

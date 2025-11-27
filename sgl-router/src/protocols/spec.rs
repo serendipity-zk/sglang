@@ -1824,6 +1824,10 @@ pub struct GenerateRequest {
     /// Length of chunked prefill (set by scheduler)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunked_prefill_length: Option<i32>,
+
+    /// Router-observed arrival time in milliseconds since unix epoch
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arrival_time_ms: Option<f64>,
 }
 
 impl GenerationRequest for GenerateRequest {

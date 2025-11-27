@@ -758,6 +758,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 chunked_prefill_length=obj.chunked_prefill_length,
                 router_generation=obj.router_generation,
                 router_message_id=obj.router_message_id,
+                arrival_time_ms=obj.arrival_time_ms,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(

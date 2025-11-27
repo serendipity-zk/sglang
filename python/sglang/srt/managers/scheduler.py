@@ -834,6 +834,49 @@ class Scheduler(
             "input_id_len": batch.input_ids.shape[0] if batch.input_ids is not None else 0,
         }
 
+        # Compute slack for running batch and waiting queue using router arrival time and SLO hints.
+        now_ms = time.time() * 1000.0
+        running_slacks: List[Tuple[str, float]] = []
+        queue_slacks: List[Tuple[str, float]] = []
+
+        for req in batch.reqs or []:
+            slack = self._compute_req_slack_ms(req, now_ms=now_ms)
+            if slack is not None:
+                running_slacks.append((req.rid, slack))
+
+        for req in self.waiting_queue:
+            slack = self._compute_req_slack_ms(req, now_ms=now_ms)
+            if slack is not None:
+                queue_slacks.append((req.rid, slack))
+
+        def _slack_stats(entries: List[Tuple[str, float]]):
+            if not entries:
+                return None
+            values = [s for _, s in entries]
+            return {
+                "min_ms": round(min(values), 2),
+                "max_ms": round(max(values), 2),
+                "avg_ms": round(sum(values) / len(values), 2),
+            }
+
+        batch_slack_stats = _slack_stats(running_slacks)
+        queue_slack_stats = _slack_stats(queue_slacks)
+        if batch_slack_stats:
+            metrics["running_slack_ms"] = batch_slack_stats
+        if queue_slack_stats:
+            metrics["queue_slack_ms"] = queue_slack_stats
+
+        if running_slacks or queue_slacks:
+            combined = [("running", rid, slack) for rid, slack in running_slacks] + [
+                ("waiting", rid, slack) for rid, slack in queue_slacks
+            ]
+            combined.sort(key=lambda x: x[2])  # most negative / worst slack first
+            worst_samples = [
+                {"rid": rid, "stage": stage, "slack_ms": round(slack, 2)}
+                for stage, rid, slack in combined[:5]
+            ]
+            metrics["slack_worst_samples"] = worst_samples
+
         # Add timing fields only if iteration_time_ms is provided (finishing batch)
         if iteration_time_ms is not None:
             # iteration_time_ms semantically represents elapsed iteration time; we now pass gpu_elapsed_ms here
@@ -882,6 +925,8 @@ class Scheduler(
             "total_extend_len": total_extend_len,
             "requests": waiting_queue_requests,
         }
+        if queue_slack_stats:
+            metrics["waiting_queue_info"]["slack_ms"] = queue_slack_stats
 
         ack_generation, ack_last_id = self.router_ack_tracker.get_state()
         if ack_generation is not None:
@@ -969,6 +1014,29 @@ class Scheduler(
                 new_target,
             )
         self.target_iteration_time_ms = new_target
+
+    def _compute_req_slack_ms(self, req: Req, now_ms: Optional[float] = None) -> Optional[float]:
+        """Compute slack for a request based on router arrival and SLO hints."""
+        arrival_ms = getattr(req, "arrival_time_ms", None)
+        if arrival_ms is None:
+            return None
+
+        if now_ms is None:
+            now_ms = time.time() * 1000.0
+
+        expected_ms = 0.0
+        if req.target_ttft_ms is not None:
+            expected_ms += float(req.target_ttft_ms)
+        if req.target_tpot_ms is not None:
+            expected_ms += float(len(req.output_ids) * req.target_tpot_ms)
+
+        slack_ms = (now_ms - arrival_ms) - expected_ms
+
+        # Cache on the request for reuse in scheduling decisions.
+        req.last_slack_ms = slack_ms
+        req.last_slack_computed_at_ms = now_ms
+
+        return slack_ms
 
     def init_deterministic_inference_config(self):
         """Initialize deterministic inference configuration for different attention backends."""
@@ -1648,6 +1716,10 @@ class Scheduler(
     ):
         self.maybe_update_dp_balance_data(recv_req)
 
+        arrival_time_ms = getattr(recv_req, "arrival_time_ms", None)
+        if arrival_time_ms is None:
+            arrival_time_ms = time.time() * 1000.0
+
         # Create a new request
         if (
             recv_req.session_params is None
@@ -1693,6 +1765,7 @@ class Scheduler(
                 chunked_prefill_length=recv_req.chunked_prefill_length,
                 router_generation=recv_req.router_generation,
                 router_message_id=recv_req.router_message_id,
+                arrival_time_ms=arrival_time_ms,
             )
             req.tokenizer = self.tokenizer
 
@@ -2322,6 +2395,11 @@ class Scheduler(
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+
+        # Pre-compute slack for waiting requests so scheduling logic can reuse it.
+        now_ms = time.time() * 1000.0
+        for req in self.waiting_queue:
+            self._compute_req_slack_ms(req, now_ms=now_ms)
 
         if self.enable_lora:
             lora_set = set([req.lora_id for req in self.running_batch.reqs])
