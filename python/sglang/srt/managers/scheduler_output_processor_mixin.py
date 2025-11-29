@@ -713,20 +713,20 @@ class SchedulerOutputProcessorMixin:
                 return
 
             now = time.time()
-            delta_ms = (
-                None
-                if self._last_detokenizer_submit_time is None
-                else (now - self._last_detokenizer_submit_time) * 1000
-            )
-            total_new_tokens = sum(len(ids) for ids in output_ids)
-            delta_str = "n/a" if delta_ms is None else f"{delta_ms:.3f}"
-            logger.info(
-                "Detokenizer submit @ %.6f sec (Δ %s ms) for %d request(s), %d token(s)",
-                now,
-                delta_str,
-                len(rids),
-                total_new_tokens,
-            )
+            # delta_ms = (
+            #     None
+            #     if self._last_detokenizer_submit_time is None
+            #     else (now - self._last_detokenizer_submit_time) * 1000
+            # )
+            # total_new_tokens = sum(len(ids) for ids in output_ids)
+            # delta_str = "n/a" if delta_ms is None else f"{delta_ms:.3f}"
+            # logger.info(
+            #     "Detokenizer submit @ %.6f sec (Δ %s ms) for %d request(s), %d token(s)",
+            #     now,
+            #     delta_str,
+            #     len(rids),
+            #     total_new_tokens,
+            # )
             self._last_detokenizer_submit_time = now
 
             self.send_to_detokenizer.send_pyobj(

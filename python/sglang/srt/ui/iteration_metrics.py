@@ -95,11 +95,51 @@ class _IterationMetricsState:
             metrics["timestamp"] = time.time()
             metrics["iteration_num"] = iteration_num
             metrics["accepted_requests"] = self._accepted_requests
-
+            
             # Log to standard logger (will be redirected to log file)
             if "log" in destinations:
-                json_line = json.dumps(metrics, separators=(",", ":"))
-                logger.info(f"STAT_METRICS: {json_line}")
+                min_decode_slack = metrics.get("min_decode_slack_ms")
+                kv_usage_pct = metrics.get("kv_usage_pct")
+                tpot_ms = metrics.get("tpot_ms")
+                min_decode_slack_str = (
+                    f"{min_decode_slack:.2f}ms"
+                    if isinstance(min_decode_slack, (int, float))
+                    else "n/a"
+                )
+                kv_usage_str = (
+                    f"{kv_usage_pct:.2f}%"
+                    if isinstance(kv_usage_pct, (int, float))
+                    else "n/a"
+                )
+                tpot_str = (
+                    f"tpot:{tpot_ms:.0f}ms" if isinstance(tpot_ms, (int, float)) else "n/a"
+                )
+                iter_section = f"Iter:{iteration_num}".ljust(12)
+                token_section = (
+                    f"Token:{metrics.get('prefill_tokens', 0)}P+"
+                    f"{metrics.get('decode_tokens', 0)}D="
+                    f"{metrics.get('token_batch_size', 0)}"
+                ).ljust(22)
+                req_section = (
+                    f"Req:{metrics.get('num_requests', 0)}R+"
+                    f"{metrics.get('queue_reqs', 0)}W"
+                ).ljust(15)
+                kv_section = (
+                    f"KV:{metrics.get('kv_tokens_used', 0)} ({kv_usage_str})"
+                ).ljust(22)
+                slack_section = f"Slack:{min_decode_slack_str}".ljust(18)
+                tpot_section = f"tpot:{tpot_str}".ljust(10)
+                prefill_section = f"prefill:{metrics.get('prefill_chunk_pairs', [])}"
+                log_line = (
+                    f"{iter_section}| "
+                    f"{tpot_section}| "
+                    f"{token_section}| "
+                    f"{req_section}| "
+                    f"{kv_section}| "
+                    f"{slack_section}| "
+                    f"{prefill_section}"
+                )
+                logger.info(f"STAT_METRICS: {log_line}")
 
             # Debug log with different prefix
             if "debug" in destinations:

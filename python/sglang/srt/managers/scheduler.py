@@ -771,6 +771,7 @@ class Scheduler(
 
         prefill_tokens = 0
         decode_tokens = 0
+        decoding_reqs = set(batch.decoding_reqs) if getattr(batch, "decoding_reqs", None) else None
         if batch.forward_mode == ForwardMode.EXTEND:
             prefill_tokens = batch.extend_num_tokens if batch.extend_num_tokens else 0
         elif batch.forward_mode == ForwardMode.DECODE:
@@ -792,7 +793,6 @@ class Scheduler(
             prefix_lens = getattr(batch, "prefix_lens", None)
             extend_lens = getattr(batch, "extend_lens", None)
             if prefix_lens is not None and extend_lens is not None and batch.reqs is not None:
-                decoding_reqs = set(batch.decoding_reqs) if getattr(batch, "decoding_reqs", None) else None
                 for i, req in enumerate(batch.reqs):
                     if batch.forward_mode == ForwardMode.MIXED and decoding_reqs and req in decoding_reqs:
                         continue
@@ -802,7 +802,6 @@ class Scheduler(
                         prefill_chunk_pairs.append([int(current_chunk), int(cumulative_prefill)])
             else:
                 # Fallback: derive from possibly mutable reqs (non-overlap paths)
-                decoding_reqs = set(batch.decoding_reqs) if getattr(batch, "decoding_reqs", None) else None
                 for req in batch.reqs or []:
                     if batch.forward_mode == ForwardMode.MIXED and decoding_reqs and req in decoding_reqs:
                         continue
@@ -836,23 +835,46 @@ class Scheduler(
 
         # Compute slack for running batch and waiting queue using router arrival time and SLO hints.
         now_ms = time.time() * 1000.0
-        running_slacks: List[Tuple[str, float]] = []
-        queue_slacks: List[Tuple[str, float]] = []
+        running_slacks: List[Dict[str, Union[str, float]]] = []
+        queue_slacks: List[Dict[str, Union[str, float]]] = []
+        decode_slacks: List[float] = []
 
         for req in batch.reqs or []:
             slack = self._compute_req_slack_ms(req, now_ms=now_ms)
             if slack is not None:
-                running_slacks.append((req.rid, slack))
+                running_slacks.append({
+                    "rid": req.rid,
+                    "slack": slack,
+                    "output_len": len(req.output_ids),
+                    "arrival_time_ms": req.arrival_time_ms,
+                    "current_time_ms": now_ms,
+                    "target_ttft_ms": req.target_ttft_ms,
+                    "target_tpot_ms": req.target_tpot_ms,
+                })
+                is_decode = (
+                    batch.forward_mode == ForwardMode.DECODE
+                    or (batch.forward_mode == ForwardMode.MIXED and decoding_reqs and req in decoding_reqs)
+                )
+                if is_decode:
+                    decode_slacks.append(slack)
 
         for req in self.waiting_queue:
             slack = self._compute_req_slack_ms(req, now_ms=now_ms)
             if slack is not None:
-                queue_slacks.append((req.rid, slack))
+                queue_slacks.append({
+                    "rid": req.rid,
+                    "slack": slack,
+                    "output_len": len(req.output_ids),
+                    "arrival_time_ms": req.arrival_time_ms,
+                    "current_time_ms": now_ms,
+                    "target_ttft_ms": req.target_ttft_ms,
+                    "target_tpot_ms": req.target_tpot_ms,
+                })
 
-        def _slack_stats(entries: List[Tuple[str, float]]):
+        def _slack_stats(entries: List[Dict[str, Union[str, float]]]):
             if not entries:
                 return None
-            values = [s for _, s in entries]
+            values = [entry["slack"] for entry in entries]
             return {
                 "min_ms": round(min(values), 2),
                 "max_ms": round(max(values), 2),
@@ -865,15 +887,21 @@ class Scheduler(
             metrics["running_slack_ms"] = batch_slack_stats
         if queue_slack_stats:
             metrics["queue_slack_ms"] = queue_slack_stats
+        if decode_slacks:
+            metrics["min_decode_slack_ms"] = round(min(decode_slacks), 2)
 
         if running_slacks or queue_slacks:
-            combined = [("running", rid, slack) for rid, slack in running_slacks] + [
-                ("waiting", rid, slack) for rid, slack in queue_slacks
+            combined = [
+                ("running", entry["rid"], entry["slack"], entry["arrival_time_ms"], entry["current_time_ms"], entry["output_len"], entry["target_ttft_ms"], entry["target_tpot_ms"])
+                for entry in running_slacks
+            ] + [
+                ("waiting", entry["rid"], entry["slack"], entry["arrival_time_ms"], entry["current_time_ms"], entry["output_len"], entry["target_ttft_ms"], entry["target_tpot_ms"])
+                for entry in queue_slacks
             ]
             combined.sort(key=lambda x: x[2])  # most negative / worst slack first
             worst_samples = [
-                {"rid": rid, "stage": stage, "slack_ms": round(slack, 2)}
-                for stage, rid, slack in combined[:5]
+                {"rid": rid, "stage": stage, "arrival_time_ms": arrival_time_ms, "current_time_ms": current_time_ms, "diff": current_time_ms - arrival_time_ms, "slack_ms": round(slack, 2), "output_len": output_len, "target_ttft_ms": target_ttft_ms, "target_tpot_ms": target_tpot_ms}
+                for stage, rid, slack, arrival_time_ms, current_time_ms, output_len, target_ttft_ms, target_tpot_ms in combined[:1]
             ]
             metrics["slack_worst_samples"] = worst_samples
 
@@ -897,10 +925,12 @@ class Scheduler(
             metrics["target_iteration_time_ms"] = round(
                 self.target_iteration_time_ms, 2
             )
-            # Optional scheduler interval between last two process_batch_result completions (overlap only)
-            scheduler_interval = getattr(batch, "scheduler_interval_ms", None) or getattr(batch, "since_last_process_ms", None)
-            if scheduler_interval is not None:
-                metrics["scheduler_interval_ms"] = round(scheduler_interval, 2)
+        if self.tpot is not None:
+            metrics["tpot_ms"] = round(self.tpot, 2)
+        # Optional scheduler interval between last two process_batch_result completions (overlap only)
+        scheduler_interval = getattr(batch, "scheduler_interval_ms", None) or getattr(batch, "since_last_process_ms", None)
+        if scheduler_interval is not None:
+            metrics["scheduler_interval_ms"] = round(scheduler_interval, 2)
 
         # Collect waiting queue information
         waiting_queue_requests = []
@@ -1030,7 +1060,7 @@ class Scheduler(
         if req.target_tpot_ms is not None:
             expected_ms += float(len(req.output_ids) * req.target_tpot_ms)
 
-        slack_ms = (now_ms - arrival_ms) - expected_ms
+        slack_ms = expected_ms - (now_ms - arrival_ms)
 
         # Cache on the request for reuse in scheduling decisions.
         req.last_slack_ms = slack_ms
@@ -1333,10 +1363,28 @@ class Scheduler(
         self.result_queue = deque()
 
         while True:
-            recv_reqs = self.recv_requests()
-            self.process_input_requests(recv_reqs)
+            recv_time_ms = process_input_time_ms = 0.0
+            run_batch_time_ms = 0.0
+            metrics_running_time_ms = 0.0
+            metrics_debug_time_ms = 0.0
+            metrics_complete_time_ms = 0.0
+            process_result_dummy_time_ms = 0.0
+            process_result_main_time_ms = 0.0
+            get_batch_time_ms = 0.0
+            gpu_elapsed_ms = 0.0
+            since_last_ms = 0.0
 
+            recv_start = time.perf_counter()
+            recv_reqs = self.recv_requests()
+            recv_time_ms = (time.perf_counter() - recv_start) * 1000
+
+            process_input_start = time.perf_counter()
+            self.process_input_requests(recv_reqs)
+            process_input_time_ms = (time.perf_counter() - process_input_start) * 1000
+
+            get_batch_start = time.perf_counter()
             batch = self.get_next_batch_to_run()
+            get_batch_time_ms = (time.perf_counter() - get_batch_start) * 1000
             self.cur_batch = batch
 
             if batch:
@@ -1347,23 +1395,33 @@ class Scheduler(
                 batch.launch_done = threading.Event()
                 # Mark the start time for this batch
                 batch.iteration_start_time = time.perf_counter()
+                run_start = time.perf_counter()
                 result = self.run_batch(batch)
+                run_batch_time_ms = (time.perf_counter() - run_start) * 1000
                 self.result_queue.append((batch.copy(), result))
 
                 # Send running batch state to router (no timing information)
+                metrics_running_start = time.perf_counter()
                 self._collect_and_report_iteration_metrics(
                     batch,
                     iteration_time_ms=None,  # No timing for running batch
                     destinations=["router"]   # Router only
                 )
+                metrics_running_time_ms = (
+                    time.perf_counter() - metrics_running_start
+                ) * 1000
 
                 # Optional: Debug log running batch snapshot
                 if getattr(self.server_args, "enable_debug_metrics", False):
+                    metrics_debug_start = time.perf_counter()
                     self._collect_and_report_iteration_metrics(
                         batch,
                         iteration_time_ms=None,
                         destinations=["debug"]  # Debug log only
                     )
+                    metrics_debug_time_ms = (
+                        time.perf_counter() - metrics_debug_start
+                    ) * 1000
 
                 if self.last_batch is None:
                     # Create a dummy first batch to start the pipeline for overlap schedule.
@@ -1374,7 +1432,11 @@ class Scheduler(
                         next_batch_sampling_info=self.tp_worker.cur_sampling_info,
                     )
                     tmp_batch.iteration_start_time = time.perf_counter()
+                    process_result_dummy_start = time.perf_counter()
                     self.process_batch_result(tmp_batch, None, batch.launch_done)
+                    process_result_dummy_time_ms = (
+                        time.perf_counter() - process_result_dummy_start
+                    ) * 1000
 
             if self.last_batch:
                 # Process the results of the last batch
@@ -1383,42 +1445,90 @@ class Scheduler(
                     self.tp_worker.cur_sampling_info if batch else None
                 )
                 # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
+                process_result_main_start = time.perf_counter()
                 self.process_batch_result(
                     tmp_batch, tmp_result, batch.launch_done if batch else None
                 )
+                process_result_main_time_ms = (
+                    time.perf_counter() - process_result_main_start
+                ) * 1000
 
                 # Report metrics for the batch that just completed using precise GPU time if available
                 # Send to log/UI only (router already got running batch state)
-                gpu_elapsed_ms = getattr(tmp_batch, 'gpu_elapsed_ms', None)
-                if gpu_elapsed_ms is not None:
+                gpu_elapsed = getattr(tmp_batch, 'gpu_elapsed_ms', None)
+                if gpu_elapsed is not None:
+                    gpu_elapsed_ms = gpu_elapsed
                     # Increment iteration counter for completed iteration
                     self.iteration_count += 1
                     # Attach scheduler interval since last process result if available
-                    since_last_ms = getattr(tmp_batch, 'since_last_process_ms', None)
-                    if since_last_ms is not None:
-                        tmp_batch.scheduler_interval_ms = since_last_ms
+                    since_last = getattr(tmp_batch, 'since_last_process_ms', None)
+                    if since_last is not None:
+                        since_last_ms = since_last
+                        tmp_batch.scheduler_interval_ms = since_last
+                    metrics_complete_start = time.perf_counter()
                     self._collect_and_report_iteration_metrics(
                         tmp_batch,
                         gpu_elapsed_ms,
                         destinations=["log", "ui"]  # Skip router
                     )
+                    metrics_complete_time_ms = (
+                        time.perf_counter() - metrics_complete_start
+                    ) * 1000
                 elif hasattr(tmp_batch, 'iteration_start_time'):
                     # Increment iteration counter for completed iteration
                     self.iteration_count += 1
                     # Fallback to wall-clock time if GPU elapsed is unavailable
                     batch_end_time = time.perf_counter()
                     iteration_time_ms = (batch_end_time - tmp_batch.iteration_start_time) * 1000
+                    since_last = getattr(tmp_batch, 'since_last_process_ms', None)
+                    if since_last is not None:
+                        since_last_ms = since_last
+                        tmp_batch.scheduler_interval_ms = since_last
+                    metrics_complete_start = time.perf_counter()
                     self._collect_and_report_iteration_metrics(
                         tmp_batch,
                         iteration_time_ms,
                         destinations=["log", "ui"]  # Skip router
                     )
+                    metrics_complete_time_ms = (
+                        time.perf_counter() - metrics_complete_start
+                    ) * 1000
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
                 self._report_idle_metrics_if_needed()
 
             self.last_batch = batch
+
+            loop_total_ms = (
+                recv_time_ms
+                + process_input_time_ms
+                + get_batch_time_ms
+                + run_batch_time_ms
+                + metrics_running_time_ms
+                + metrics_debug_time_ms
+                + metrics_complete_time_ms
+                + process_result_dummy_time_ms
+            )
+            if self.last_batch is not None or batch is not None:
+                logger.info(
+                    "\033[94m[TIME]: since_last=%.3f gpu=%.3f loop=%.3f "
+                    "recv=%.3f input=%.3f batch=%.3f run=%.3f mr=%.3f md=%.3f mc=%.3f pd=%.3f pm=%.3f\033[0m",
+                    since_last_ms,
+                    gpu_elapsed_ms,
+                    loop_total_ms,
+                    recv_time_ms,
+                    process_input_time_ms,
+                    get_batch_time_ms,
+                    run_batch_time_ms,
+                    metrics_running_time_ms,
+                    metrics_debug_time_ms,
+                    metrics_complete_time_ms,
+                    process_result_dummy_time_ms,
+                    process_result_main_time_ms,
+                )
+
+
 
     @DynamicGradMode()
     def event_loop_pp(self):
@@ -2302,6 +2412,45 @@ class Scheduler(
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
+    def predict_batch(self, batch: Optional[ScheduleBatch], mode: Optional[str] = None) -> float:
+        """Predict cycle time for a batch; return 0 for edge cases."""
+        if (
+            batch is None
+            or batch.is_empty()
+            or self.cycle_time_predictor is None
+        ):
+            return 0.0
+
+        num_used, token_usage, available_size, evictable_size = self._get_token_info()
+
+        total_tokens = 0
+        prefill_pairs: List[List[int]] = []
+        for req in batch.reqs:
+            extend_len = getattr(req, "extend_input_len", 0)
+            total_tokens += extend_len
+            if extend_len > 1:
+                prefix_len = len(getattr(req, "prefix_indices", []))
+                prefill_pairs.append([extend_len, prefix_len + extend_len])
+
+        if total_tokens <= 0:
+            return 0.0
+
+        inferred_mode = mode
+        if inferred_mode is None and getattr(self.cycle_time_predictor, "is_multimode", False):
+            # If there are no prefill pairs, treat as decode-only; otherwise mixed/prefill.
+            inferred_mode = "DECODE" if not prefill_pairs else "MIXED"
+
+        predictor = self.cycle_time_predictor
+        kwargs = dict(
+            batch_size_tokens=total_tokens,
+            prefill_chunk_pairs=prefill_pairs,
+            kv_tokens_used=num_used,
+        )
+        if getattr(predictor, "is_multimode", False) and inferred_mode is not None:
+            kwargs["mode"] = inferred_mode
+
+        return predictor.predict(**kwargs)
+
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
@@ -2323,28 +2472,7 @@ class Scheduler(
         #         )
         #         return None
         # estimate the time for running batch
-        pred = 0
-        if not self.running_batch.is_empty():
-            num_used, token_usage, available_size, evictable_size = self._get_token_info()
-            prefill_pairs = []
-            for req in self.running_batch.reqs:
-                if req.extend_input_len > 1:
-                    prefill_pairs.append([req.extend_input_len, len(req.prefix_indices) + req.extend_input_len])
-
-            if self.cycle_time_predictor is not None and hasattr(self.cycle_time_predictor, 'is_multimode') and self.cycle_time_predictor.is_multimode:
-                pred = self.cycle_time_predictor.predict(
-                    batch_size_tokens=sum([req.extend_input_len for req in self.running_batch.reqs]), 
-                    prefill_chunk_pairs=prefill_pairs, 
-                    kv_tokens_used=num_used,
-                    mode="MIXED"
-                )
-            else:
-                if self.cycle_time_predictor is not None:
-                    pred = self.cycle_time_predictor.predict(
-                    batch_size_tokens=sum([req.extend_input_len for req in self.running_batch.reqs]), 
-                        prefill_chunk_pairs=prefill_pairs, 
-                        kv_tokens_used=num_used
-                    )
+        pred = self.predict_batch(self.running_batch)
 
         if self.target_iteration_time_ms is not None and pred > self.target_iteration_time_ms:
             return None
