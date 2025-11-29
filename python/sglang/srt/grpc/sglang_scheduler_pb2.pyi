@@ -83,7 +83,7 @@ class DisaggregatedParams(_message.Message):
     def __init__(self, bootstrap_host: _Optional[str] = ..., bootstrap_port: _Optional[int] = ..., bootstrap_room: _Optional[int] = ...) -> None: ...
 
 class GenerateRequest(_message.Message):
-    __slots__ = ("request_id", "tokenized", "mm_inputs", "sampling_params", "return_logprob", "logprob_start_len", "top_logprobs_num", "token_ids_logprob", "return_hidden_states", "disaggregated_params", "custom_logit_processor", "timestamp", "log_metrics", "input_embeds", "lora_id", "data_parallel_rank", "dp_balance_id")
+    __slots__ = ("request_id", "tokenized", "mm_inputs", "sampling_params", "return_logprob", "logprob_start_len", "top_logprobs_num", "token_ids_logprob", "return_hidden_states", "disaggregated_params", "custom_logit_processor", "timestamp", "log_metrics", "input_embeds", "lora_id", "data_parallel_rank", "dp_balance_id", "target_ttft_ms", "target_tpot_ms", "arrival_time_ms")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     TOKENIZED_FIELD_NUMBER: _ClassVar[int]
     MM_INPUTS_FIELD_NUMBER: _ClassVar[int]
@@ -101,6 +101,9 @@ class GenerateRequest(_message.Message):
     LORA_ID_FIELD_NUMBER: _ClassVar[int]
     DATA_PARALLEL_RANK_FIELD_NUMBER: _ClassVar[int]
     DP_BALANCE_ID_FIELD_NUMBER: _ClassVar[int]
+    TARGET_TTFT_MS_FIELD_NUMBER: _ClassVar[int]
+    TARGET_TPOT_MS_FIELD_NUMBER: _ClassVar[int]
+    ARRIVAL_TIME_MS_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     tokenized: TokenizedInput
     mm_inputs: MultimodalInputs
@@ -118,7 +121,10 @@ class GenerateRequest(_message.Message):
     lora_id: str
     data_parallel_rank: int
     dp_balance_id: int
-    def __init__(self, request_id: _Optional[str] = ..., tokenized: _Optional[_Union[TokenizedInput, _Mapping]] = ..., mm_inputs: _Optional[_Union[MultimodalInputs, _Mapping]] = ..., sampling_params: _Optional[_Union[SamplingParams, _Mapping]] = ..., return_logprob: bool = ..., logprob_start_len: _Optional[int] = ..., top_logprobs_num: _Optional[int] = ..., token_ids_logprob: _Optional[_Iterable[int]] = ..., return_hidden_states: bool = ..., disaggregated_params: _Optional[_Union[DisaggregatedParams, _Mapping]] = ..., custom_logit_processor: _Optional[str] = ..., timestamp: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., log_metrics: bool = ..., input_embeds: _Optional[_Iterable[float]] = ..., lora_id: _Optional[str] = ..., data_parallel_rank: _Optional[int] = ..., dp_balance_id: _Optional[int] = ...) -> None: ...
+    target_ttft_ms: float
+    target_tpot_ms: float
+    arrival_time_ms: float
+    def __init__(self, request_id: _Optional[str] = ..., tokenized: _Optional[_Union[TokenizedInput, _Mapping]] = ..., mm_inputs: _Optional[_Union[MultimodalInputs, _Mapping]] = ..., sampling_params: _Optional[_Union[SamplingParams, _Mapping]] = ..., return_logprob: bool = ..., logprob_start_len: _Optional[int] = ..., top_logprobs_num: _Optional[int] = ..., token_ids_logprob: _Optional[_Iterable[int]] = ..., return_hidden_states: bool = ..., disaggregated_params: _Optional[_Union[DisaggregatedParams, _Mapping]] = ..., custom_logit_processor: _Optional[str] = ..., timestamp: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ..., log_metrics: bool = ..., input_embeds: _Optional[_Iterable[float]] = ..., lora_id: _Optional[str] = ..., data_parallel_rank: _Optional[int] = ..., dp_balance_id: _Optional[int] = ..., target_ttft_ms: _Optional[float] = ..., target_tpot_ms: _Optional[float] = ..., arrival_time_ms: _Optional[float] = ...) -> None: ...
 
 class TokenizedInput(_message.Message):
     __slots__ = ("original_text", "input_ids")

@@ -1817,14 +1817,6 @@ pub struct GenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_tpot_ms: Option<f32>,
 
-    /// Starting position for chunked prefill (set by scheduler)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chunked_prefill_start_pos: Option<i32>,
-
-    /// Length of chunked prefill (set by scheduler)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chunked_prefill_length: Option<i32>,
-
     /// Router-observed arrival time in milliseconds since unix epoch
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arrival_time_ms: Option<f64>,

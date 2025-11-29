@@ -754,8 +754,6 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 priority=obj.priority,
                 target_ttft_ms=obj.target_ttft_ms,
                 target_tpot_ms=obj.target_tpot_ms,
-                chunked_prefill_start_pos=obj.chunked_prefill_start_pos,
-                chunked_prefill_length=obj.chunked_prefill_length,
                 router_generation=obj.router_generation,
                 router_message_id=obj.router_message_id,
                 arrival_time_ms=obj.arrival_time_ms,

@@ -460,8 +460,6 @@ class Req:
         extra_key: Optional[str] = None,
         target_ttft_ms: Optional[float] = None,
         target_tpot_ms: Optional[float] = None,
-        chunked_prefill_start_pos: Optional[int] = None,
-        chunked_prefill_length: Optional[int] = None,
         router_generation: Optional[int] = None,
         router_message_id: Optional[int] = None,
         arrival_time_ms: Optional[float] = None,
@@ -666,10 +664,6 @@ class Req:
         # SLO requirements from client
         self.target_ttft_ms = target_ttft_ms
         self.target_tpot_ms = target_tpot_ms
-        
-        # Chunked prefill scheduling metadata (set by scheduler)
-        self.chunked_prefill_start_pos = chunked_prefill_start_pos
-        self.chunked_prefill_length = chunked_prefill_length
 
         # Router-observed arrival time in milliseconds since unix epoch
         self.arrival_time_ms = arrival_time_ms

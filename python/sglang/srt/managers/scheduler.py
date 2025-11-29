@@ -1895,8 +1895,6 @@ class Scheduler(
                 ),
                 target_ttft_ms=recv_req.target_ttft_ms,
                 target_tpot_ms=recv_req.target_tpot_ms,
-                chunked_prefill_start_pos=recv_req.chunked_prefill_start_pos,
-                chunked_prefill_length=recv_req.chunked_prefill_length,
                 router_generation=recv_req.router_generation,
                 router_message_id=recv_req.router_message_id,
                 arrival_time_ms=arrival_time_ms,
