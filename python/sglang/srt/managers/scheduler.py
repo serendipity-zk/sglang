@@ -164,6 +164,7 @@ from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 sys.path.insert(0, "/sgl-workspace/sglang")
 from sglang_profile.grid_predictor import GridBasedCycleTimePredictor
 from sglang_profile.mode_aware_predictor import ModeAwarePredictor
+from exp.length_sim_algo import MonteCarloOutputEst
 from sglang.srt.tracing.trace import (
     process_tracing_init,
     trace_event,
@@ -642,6 +643,16 @@ class Scheduler(
                     W0=4.0,
                 )
 
+        # Track output length observations + forecast future KV peak/slack
+        self.output_estimator = (
+            MonteCarloOutputEst(predictor=self.cycle_time_predictor)
+            if self.is_generation
+            else None
+        )
+        self._last_kv_forecast: Optional[Tuple[float, float]] = None
+        self._last_kv_forecast_gt: Optional[Tuple[float, float]] = None
+        self._last_kv_forecast_time_ms: Optional[float] = None
+
         # Init request dispatcher
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -825,6 +836,12 @@ class Scheduler(
             "decode_tokens": decode_tokens,
             "token_batch_size": total_tokens,
             "forward_mode": batch.forward_mode.name if batch.forward_mode else "UNKNOWN",
+            # KV forecast (predicted + ground truth upper bound) captured during scheduling
+            "kv_forecast_peak": self._last_kv_forecast[0] if self._last_kv_forecast else None,
+            "kv_forecast_slack_ms": self._last_kv_forecast[1] if self._last_kv_forecast else None,
+            "kv_forecast_peak_gt": self._last_kv_forecast_gt[0] if self._last_kv_forecast_gt else None,
+            "kv_forecast_slack_ms_gt": self._last_kv_forecast_gt[1] if self._last_kv_forecast_gt else None,
+            "kv_forecast_time_ms": round(self._last_kv_forecast_time_ms, 3) if self._last_kv_forecast_time_ms is not None else None,
             # Prefill chunk pairs: list of [current_chunk, cumulative_prefill]
             "prefill_chunk_pairs": prefill_chunk_pairs,
             # Keep some old names for compatibility
@@ -1510,10 +1527,16 @@ class Scheduler(
                 + metrics_complete_time_ms
                 + process_result_dummy_time_ms
             )
+            kv_forecast_time_ms = (
+                self._last_kv_forecast_time_ms
+                if self._last_kv_forecast_time_ms is not None
+                else 0.0
+            )
             if self.last_batch is not None or batch is not None:
                 logger.info(
                     "\033[94m[TIME]: since_last=%.3f gpu=%.3f loop=%.3f "
-                    "recv=%.3f input=%.3f batch=%.3f run=%.3f mr=%.3f md=%.3f mc=%.3f pd=%.3f pm=%.3f\033[0m",
+                    "recv=%.3f input=%.3f batch=%.3f run=%.3f mr=%.3f md=%.3f "
+                    "mc=%.3f pd=%.3f pm=%.3f kvf=%.3f\033[0m",
                     since_last_ms,
                     gpu_elapsed_ms,
                     loop_total_ms,
@@ -1526,6 +1549,7 @@ class Scheduler(
                     metrics_complete_time_ms,
                     process_result_dummy_time_ms,
                     process_result_main_time_ms,
+                    kv_forecast_time_ms,
                 )
 
 
@@ -2320,7 +2344,81 @@ class Scheduler(
             swa_evictable_size,
         )
 
+    def _submit_decode_length_observations(self, finished_reqs: List[Req]) -> None:
+        """Push finished decode lengths into the estimator for future sampling."""
+        if self.output_estimator is None or not finished_reqs:
+            return
+
+        lengths = [
+            len(req.output_ids)
+            for req in finished_reqs
+            if not getattr(req, "is_retracted", False)
+            and not isinstance(req.finished_reason, FINISH_ABORT)
+        ]
+        # Skip empty observations to avoid log bucket edge cases.
+        lengths = [l for l in lengths if l > 0]
+        if lengths:
+            self.output_estimator.submit_decode_length_observation(lengths)
+
+    def _predict_future_kv_usage(self) -> None:
+        """Estimate future KV peak/slack for active decode batch (currently unused)."""
+        if (
+            self.output_estimator is None
+            or self.running_batch is None
+            or self.running_batch.is_empty()
+            or self.running_batch.forward_mode is None
+            or not self.running_batch.forward_mode.is_decode()
+        ):
+            return
+
+        active_reqs = [req for req in self.running_batch.reqs if not req.finished()]
+        if not active_reqs:
+            return
+
+        t0 = time.perf_counter()
+        # Prefill/context length should exclude locally evicted KV.
+        prefill_tokens = [
+            max(len(req.origin_input_ids) - getattr(req, "evicted_seqlen_local", 0), 0)
+            for req in active_reqs
+        ]
+        current_decode_tokens = [len(req.output_ids) for req in active_reqs]
+        ground_truth_remaining = [
+            max(getattr(req.sampling_params, "max_new_tokens", 0) - len(req.output_ids), 0)
+            for req in active_reqs
+        ]
+
+        try:
+            self._last_kv_forecast = self.output_estimator.estimate_peak_and_slack(
+                prefill_tokens,
+                current_decode_tokens,
+                tpot=self.tpot,
+            )
+            # Ground truth using max_new_tokens upper bounds; can be used to assess predictor bias.
+            self._last_kv_forecast_gt = (
+                self.output_estimator.estimate_peak_and_slack_with_ground_truth(
+                    prefill_tokens,
+                    current_decode_tokens,
+                    ground_truth_remaining,
+                    tpot=self.tpot,
+                )
+            )
+            self._last_kv_forecast_time_ms = (time.perf_counter() - t0) * 1000.0
+        except Exception:
+            logger.exception("Failed to predict future KV usage/slack")
+
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        # Gather finished requests before they are filtered out of batches.
+        finished_for_observation: List[Req] = []
+        if self.last_batch is not None:
+            finished_for_observation.extend(
+                [req for req in self.last_batch.reqs if req.finished()]
+            )
+        if self.running_batch is not None:
+            finished_for_observation.extend(
+                [req for req in self.running_batch.reqs if req.finished()]
+            )
+        self._submit_decode_length_observations(finished_for_observation)
+
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
         if self.chunked_req:
@@ -2383,6 +2481,9 @@ class Scheduler(
         if need_dp_attn_preparation:
             self.maybe_handle_dp_balance_data()
             ret = self.prepare_mlp_sync_batch(ret)
+
+        # Run future KV peak/slack prediction for active decode batch (result unused for now).
+        self._predict_future_kv_usage()
         
         # log the batch infomation
         # if ret is not None:

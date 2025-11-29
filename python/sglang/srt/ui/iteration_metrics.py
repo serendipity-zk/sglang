@@ -111,6 +111,20 @@ class _IterationMetricsState:
                     if isinstance(kv_usage_pct, (int, float))
                     else "n/a"
                 )
+                kv_forecast_peak = metrics.get("kv_forecast_peak")
+                kv_forecast_slack = metrics.get("kv_forecast_slack_ms")
+                kv_forecast_peak_gt = metrics.get("kv_forecast_peak_gt")
+                kv_forecast_slack_gt = metrics.get("kv_forecast_slack_ms_gt")
+                kvf_pred_section = (
+                    f"kvf:{kv_forecast_peak:.0f}/{kv_forecast_slack:.1f}ms"
+                    if kv_forecast_peak is not None and kv_forecast_slack is not None
+                    else "kvf:n/a"
+                ).ljust(24)
+                kvf_gt_section = (
+                    f"gt:{kv_forecast_peak_gt:.0f}/{kv_forecast_slack_gt:.1f}ms"
+                    if kv_forecast_peak_gt is not None and kv_forecast_slack_gt is not None
+                    else "gt:n/a"
+                ).ljust(18)
                 tpot_str = (
                     f"tpot:{tpot_ms:.0f}ms" if isinstance(tpot_ms, (int, float)) else "n/a"
                 )
@@ -137,6 +151,8 @@ class _IterationMetricsState:
                     f"{req_section}| "
                     f"{kv_section}| "
                     f"{slack_section}| "
+                    f"{kvf_pred_section}| "
+                    f"{kvf_gt_section}| "
                     f"{prefill_section}"
                 )
                 logger.info(f"STAT_METRICS: {log_line}")
