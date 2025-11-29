@@ -72,10 +72,10 @@ class ProposedPlan:
     Represents a specific chunking strategy (e.g. [128, 128, 64]) for a specific set of requests.
     Responsibility: Calculate the token schedule and prepare raw inputs for prediction.
     """
-    def __init__(self, chunks: List[int], req_lens: List[int], prefilled_lens: Optional[List[int]] = None):
+    def __init__(self, chunks: List[int], total_prefill_lens: List[int], prefilled_lens: Optional[List[int]] = None):
         self.chunks = chunks
-        self.req_lens = req_lens
-        self.prefilled_lens = prefilled_lens if prefilled_lens is not None else [0] * len(req_lens)
+        self.req_lens = total_prefill_lens
+        self.prefilled_lens = prefilled_lens if prefilled_lens is not None else [0] * len(total_prefill_lens)
 
         if len(self.prefilled_lens) != len(self.req_lens):
             raise ValueError("Length of prefilled_lens must match req_lens")
@@ -146,24 +146,31 @@ class SimulationScenario:
     Represents a User Scenario (Set of requests and slacks).
     Responsibility: Normalization (Align/Sort) and Plan Generation.
     """
-    def __init__(self, raw_lens: Sequence[int], raw_slacks: Sequence[float], already_prefilled_lens: Optional[Sequence[int]] = None):
-        if len(raw_lens) != len(raw_slacks):
+    def __init__(
+        self,
+        total_prefill_lens: Sequence[int],
+        raw_slacks: Sequence[float],
+        already_prefilled_lens: Optional[Sequence[int]] = None,
+        sort_by_slack: bool = True,
+    ):
+        if len(total_prefill_lens) != len(raw_slacks):
             raise ValueError("Lengths and slacks must match")
 
         if already_prefilled_lens is None:
-            already_prefilled_lens = [0] * len(raw_lens)
+            already_prefilled_lens = [0] * len(total_prefill_lens)
 
-        if len(raw_lens) != len(already_prefilled_lens):
+        if len(total_prefill_lens) != len(already_prefilled_lens):
             raise ValueError("Lengths and already_prefilled_lens must match")
         
         # 1. Align to granularity and Sort by slack (Tightest first)
         zipped = []
-        for l, s, p in zip(raw_lens, raw_slacks, already_prefilled_lens):
+        for l, s, p in zip(total_prefill_lens, raw_slacks, already_prefilled_lens):
             clamped_prefilled = max(0, min(int(p), int(l)))
             remaining_tokens = max(int(l) - clamped_prefilled, 0)
             aligned_remaining = (remaining_tokens + GRANULARITY - 1) // GRANULARITY * GRANULARITY if remaining_tokens > 0 else 0
             zipped.append((aligned_remaining, float(s), clamped_prefilled))
-        zipped.sort(key=lambda x: x[1])
+        if sort_by_slack:
+            zipped.sort(key=lambda x: x[1])
         
         self.req_lens = [z[0] for z in zipped]
         self.prefilled_lens = [z[2] for z in zipped]
@@ -255,7 +262,7 @@ class SimulationScenario:
         dedup_time = (t_create_start - t_dedup_start) * 1000
         create_time = (t_end - t_create_start) * 1000
         # Debug: print number of plans generated (uncomment if needed)
-        print(f"[PERF] generate_plans: {(t_end - t_start)*1000:.3f} ms (pow2: {pow2_time:.3f}, group: {group_time:.3f}, rnd: {random_time:.3f}, dedup: {dedup_time:.3f}, create: {create_time:.3f}) - {len(self.plans)} plans")
+        # print(f"[PERF] generate_plans: {(t_end - t_start)*1000:.3f} ms (pow2: {pow2_time:.3f}, group: {group_time:.3f}, rnd: {random_time:.3f}, dedup: {dedup_time:.3f}, create: {create_time:.3f}) - {len(self.plans)} plans")
 
 
 class GlobalBatchPredictor:
@@ -323,7 +330,7 @@ class GlobalBatchPredictor:
             cursor += count
 
         t_end = time.perf_counter()
-        print(f"[PERF] predict_all: {(t_end - t_start)*1000:.3f} ms (collect: {(t_collect - t_start)*1000:.3f} ms, predict: {(t_predict - t_collect)*1000:.3f} ms, distribute: {(t_end - t_predict)*1000:.3f} ms) - {len(all_batches)} predictions")
+        # print(f"[PERF] predict_all: {(t_end - t_start)*1000:.3f} ms (collect: {(t_collect - t_start)*1000:.3f} ms, predict: {(t_predict - t_collect)*1000:.3f} ms, distribute: {(t_end - t_predict)*1000:.3f} ms) - {len(all_batches)} predictions")
 
 
 class TimelineSimulator:
@@ -439,14 +446,28 @@ class PrefillSimulatorEngine:
         tpot_ms: float,
         slack_decode_ms: float,
     ) -> None:
-        self.config = SimulatorConfig(
+        new_config = SimulatorConfig(
             decode_batch=decode_batch,
             kv_cache=kv_cache,
             tpot_ms=tpot_ms,
             slack_decode_ms=slack_decode_ms,
             grid_path=self.grid_path,
         )
-        self.predictor = GlobalBatchPredictor(self.config)
+
+        # Only create predictor once, or if grid_path changes
+        if self.predictor is None or (self.config is not None and self.config.grid_path != new_config.grid_path):
+            self.predictor = GlobalBatchPredictor(new_config)
+        # If decode_batch or kv_cache changed, update base_decode_ms
+        elif self.config is None or self.config.decode_batch != new_config.decode_batch or self.config.kv_cache != new_config.kv_cache:
+            self.predictor.config = new_config
+            self.predictor.base_decode_ms = float(
+                self.predictor.predictor.predict(new_config.decode_batch, [], new_config.kv_cache, mode="DECODE")
+            )
+        else:
+            # Just update the config (tpot_ms, slack_decode_ms changed)
+            self.predictor.config = new_config
+
+        self.config = new_config
 
     def _ensure_ready(self) -> None:
         if self.config is None or self.predictor is None:
@@ -454,18 +475,50 @@ class PrefillSimulatorEngine:
 
     def evaluate_extras(
         self,
-        base_lens: Sequence[int],
+        base_total_prefill_lens: Sequence[int],
         base_slacks: Sequence[float],
         extra_lens: Sequence[int],
         already_prefilled_lens: Optional[Sequence[int]] = None
     ) -> List[BatchPlanResult]:
+        """
+        Evaluate multiple scenarios by adding extra requests to a base set of requests.
+
+        Args:
+            base_total_prefill_lens: Token lengths for base requests (can be empty)
+            base_slacks: Slack times for base requests (must match base_total_prefill_lens length, can be empty)
+            extra_lens: Extra request lengths to test (each creates a separate scenario)
+            already_prefilled_lens: Tokens already prefilled for base requests (optional, must be empty if base is empty)
+
+        Returns:
+            List of BatchPlanResult, one per extra length tested
+
+        Edge Cases:
+            - Empty base + extra=0: Returns trivial success (0ms, no work, no iterations)
+            - Empty base + extra>0: Evaluates only the extra request as a single-request scenario
+            - Empty base with already_prefilled_lens: Raises ValueError
+        """
         self._ensure_ready()
         assert self.config is not None
         assert self.predictor is not None
 
-        base_prefilled = already_prefilled_lens if already_prefilled_lens is not None else [0] * len(base_lens)
-        if len(base_prefilled) != len(base_lens):
-            raise ValueError("already_prefilled_lens must match base_lens length")
+        # Validate input lengths match
+        if len(base_total_prefill_lens) != len(base_slacks):
+            raise ValueError(
+                f"base_total_prefill_lens (length {len(base_total_prefill_lens)}) and "
+                f"base_slacks (length {len(base_slacks)}) must have same length"
+            )
+
+        # Handle already_prefilled_lens
+        base_prefilled = already_prefilled_lens if already_prefilled_lens is not None else [0] * len(base_total_prefill_lens)
+        if len(base_prefilled) != len(base_total_prefill_lens):
+            raise ValueError(
+                f"already_prefilled_lens (length {len(base_prefilled)}) must match "
+                f"base_lens (length {len(base_total_prefill_lens)})"
+            )
+
+        # Special validation for empty base case
+        if len(base_total_prefill_lens) == 0 and already_prefilled_lens is not None and len(already_prefilled_lens) > 0:
+            raise ValueError("already_prefilled_lens must be empty when base_total_prefill_lens is empty")
 
         t_scenario_start = time.perf_counter()
         # 1. Create Scenarios
@@ -477,13 +530,14 @@ class PrefillSimulatorEngine:
             t_sc_start = time.perf_counter()
             if extra == 0:
                 # Base Case: Use original lists
-                sc = SimulationScenario(base_lens, base_slacks, base_prefilled)
+                sc = SimulationScenario(base_total_prefill_lens, base_slacks, base_prefilled, sort_by_slack=False)
             else:
                 # Extra Case: Copy and append
                 sc = SimulationScenario(
-                    list(base_lens) + [extra],
+                    list(base_total_prefill_lens) + [extra],
                     list(base_slacks) + [float('inf')],
-                    list(base_prefilled) + [0]
+                    list(base_prefilled) + [0],
+                    sort_by_slack=False,
                 )
             t_sc_end = time.perf_counter()
             total_sc_init += (t_sc_end - t_sc_start)
@@ -496,7 +550,7 @@ class PrefillSimulatorEngine:
             scenarios.append(sc)
 
         t_scenario_end = time.perf_counter()
-        print(f"[PERF] scenario_creation+plan_generation: {(t_scenario_end - t_scenario_start)*1000:.3f} ms (sc_init: {total_sc_init*1000:.3f} ms, plan_gen: {total_plan_gen*1000:.3f} ms)")
+        # print(f"[PERF] scenario_creation+plan_generation: {(t_scenario_end - t_scenario_start)*1000:.3f} ms (sc_init: {total_sc_init*1000:.3f} ms, plan_gen: {total_plan_gen*1000:.3f} ms)")
 
         # 2. Predict All (Super-Batch)
         self.predictor.predict_all(scenarios)
@@ -528,7 +582,7 @@ class PrefillSimulatorEngine:
             final_results.append(best)
 
         t_sim_end = time.perf_counter()
-        print(f"[PERF] simulate+select: {(t_sim_end - t_sim_start)*1000:.3f} ms (simulate: {total_sim_time*1000:.3f} ms, select: {total_select_time*1000:.3f} ms) - {total_plans_simulated} plans")
+        # print(f"[PERF] simulate+select: {(t_sim_end - t_sim_start)*1000:.3f} ms (simulate: {total_sim_time*1000:.3f} ms, select: {total_select_time*1000:.3f} ms) - {total_plans_simulated} plans")
 
         return final_results
 
@@ -570,8 +624,10 @@ class PrefillSimulatorEngine:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Refactored Batch Simulator")
-    parser.add_argument("--prefill-lens", type=int, nargs="+", required=True)
-    parser.add_argument("--prefill-slacks", type=float, nargs="+", required=True)
+    parser.add_argument("--prefill-lens", type=int, nargs="*", default=[],
+                        help="Token lengths for each prefill request (can be empty)")
+    parser.add_argument("--prefill-slacks", type=float, nargs="*", default=[],
+                        help="Slack times (ms) for each prefill request (must match prefill-lens length, can be empty)")
     parser.add_argument(
         "--already-prefilled-lens",
         type=int,
@@ -589,6 +645,27 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
+
+    # Validate input consistency
+    if len(args.prefill_lens) != len(args.prefill_slacks):
+        print(f"Error: --prefill-lens (length {len(args.prefill_lens)}) and "
+              f"--prefill-slacks (length {len(args.prefill_slacks)}) must have the same length")
+        sys.exit(1)
+
+    # Validate already-prefilled-lens if provided
+    if args.already_prefilled_lens is not None:
+        if len(args.already_prefilled_lens) != len(args.prefill_lens):
+            print(f"Error: --already-prefilled-lens (length {len(args.already_prefilled_lens)}) "
+                  f"must match --prefill-lens (length {len(args.prefill_lens)})")
+            sys.exit(1)
+        if len(args.prefill_lens) == 0:
+            print("Warning: --already-prefilled-lens ignored because --prefill-lens is empty")
+            args.already_prefilled_lens = None
+
+    # Informative message for empty base case
+    if len(args.prefill_lens) == 0:
+        print("Note: Running with empty prefill list (base case has no requests)")
+
     engine = PrefillSimulatorEngine(
         grid_path=args.grid_path,
     )

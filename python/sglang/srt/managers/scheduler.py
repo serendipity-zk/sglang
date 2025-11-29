@@ -34,6 +34,8 @@ import torch
 import zmq
 from torch.distributed import barrier
 
+PREFILL_SIM_EXTRAS = [0, 128, 256, 384, 512, 768, 1024, 2048, 4096]
+
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constrained.base_grammar_backend import (
@@ -164,6 +166,7 @@ from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 sys.path.insert(0, "/sgl-workspace/sglang")
 from sglang_profile.grid_predictor import GridBasedCycleTimePredictor
 from sglang_profile.mode_aware_predictor import ModeAwarePredictor
+from exp.prefill_multi_sim import PrefillSimulatorEngine
 from exp.length_sim_algo import MonteCarloOutputEst
 from sglang.srt.tracing.trace import (
     process_tracing_init,
@@ -649,6 +652,14 @@ class Scheduler(
             if self.is_generation
             else None
         )
+        self.prefill_sim_engine: Optional[PrefillSimulatorEngine] = None
+        self._last_prefill_sim_results: Optional[List] = None
+        self._last_prefill_sim_time_ms: Optional[float] = None
+        self._last_prefill_sim_metrics: Optional[Dict[int, float]] = None
+        # Track last scenario to avoid duplicate logging
+        self._last_prefill_sim_decode_batch: Optional[int] = None
+        self._last_prefill_sim_kv_cache: Optional[int] = None
+        self._last_prefill_sim_prefill_lens: Optional[List[int]] = None
         self._last_kv_forecast: Optional[Tuple[float, float]] = None
         self._last_kv_forecast_gt: Optional[Tuple[float, float]] = None
         self._last_kv_forecast_time_ms: Optional[float] = None
@@ -842,8 +853,10 @@ class Scheduler(
             "kv_forecast_peak_gt": self._last_kv_forecast_gt[0] if self._last_kv_forecast_gt else None,
             "kv_forecast_slack_ms_gt": self._last_kv_forecast_gt[1] if self._last_kv_forecast_gt else None,
             "kv_forecast_time_ms": round(self._last_kv_forecast_time_ms, 3) if self._last_kv_forecast_time_ms is not None else None,
+            "prefill_sim_time_ms": round(self._last_prefill_sim_time_ms, 3) if self._last_prefill_sim_time_ms is not None else None,
             # Prefill chunk pairs: list of [current_chunk, cumulative_prefill]
             "prefill_chunk_pairs": prefill_chunk_pairs,
+            "prefill_sim_results": self._last_prefill_sim_metrics,
             # Keep some old names for compatibility
             "batch_size_tokens": total_tokens,
             "num_requests": num_batch_reqs,
@@ -1532,11 +1545,16 @@ class Scheduler(
                 if self._last_kv_forecast_time_ms is not None
                 else 0.0
             )
+            prefill_sim_time_ms = (
+                self._last_prefill_sim_time_ms
+                if self._last_prefill_sim_time_ms is not None
+                else 0.0
+            )
             if self.last_batch is not None or batch is not None:
                 logger.info(
                     "\033[94m[TIME]: since_last=%.3f gpu=%.3f loop=%.3f "
                     "recv=%.3f input=%.3f batch=%.3f run=%.3f mr=%.3f md=%.3f "
-                    "mc=%.3f pd=%.3f pm=%.3f kvf=%.3f\033[0m",
+                    "mc=%.3f pd=%.3f pm=%.3f kvf=%.3f psim=%.3f\033[0m",
                     since_last_ms,
                     gpu_elapsed_ms,
                     loop_total_ms,
@@ -1550,6 +1568,7 @@ class Scheduler(
                     process_result_dummy_time_ms,
                     process_result_main_time_ms,
                     kv_forecast_time_ms,
+                    prefill_sim_time_ms,
                 )
 
 
@@ -2404,6 +2423,258 @@ class Scheduler(
         except Exception:
             logger.exception("Failed to predict future KV usage/slack")
 
+    def _maybe_run_prefill_simulation(self) -> None:
+        """Run prefill simulator for chunked + queued requests to guide batch formation.
+
+        Overlap Model (Conservative Assumptions):
+        ---------------------------------------
+        This function simulates prefill scheduling while accounting for an overlapping
+        batch execution. The model makes these conservative assumptions:
+
+        1. Mixed-chunk mode is enabled (--enable-mixed-chunk):
+           - Either DECODE or MIXED forward mode for batches
+           - Decode requests participate and are serviced in every iteration
+           - Pure EXTEND batches should not exist with mixed-chunk enabled
+
+        2. Conservative timing:
+           - Assume last_batch just started execution (use full predicted time)
+           - This provides safety margin for scheduling decisions
+
+        Overlap Slack Adjustments:
+        --------------------------
+        - Decode slack: min_decode_slack - pred_last + TPOT
+          * Decode requests lose pred_last ms waiting for last_batch to complete
+          * But recover TPOT budget from last_batch's iteration
+          * Net effect: -(pred_last - TPOT)
+
+        - Prefill slack: max(raw_slack - pred_last, 0)
+          * Waiting requests simply lose pred_last ms (no TPOT recovery)
+          * They're not being served during overlap period
+
+        Why last_batch (not running_batch):
+        -----------------------------------
+        last_batch = the batch currently executing (or just finished) on GPU
+                     (can be DECODE, EXTEND, or MIXED mode)
+
+        After merge at line 2626, running_batch = merged batch for future iterations.
+        We must predict last_batch (current GPU batch) to get correct overlap time.
+        Predicting merged running_batch would include future requests, overcounting overlap.
+
+        Results Stored:
+        --------------
+        - self._last_prefill_sim_results: List[BatchPlanResult]
+        - self._last_prefill_sim_metrics: Dict[int, float] (extra_len -> time_ms)
+        """
+        t_sim_start = time.perf_counter()
+        self._last_prefill_sim_time_ms = 0.0
+        try:
+            grid_path = getattr(self.server_args, "predictor_grid_path", None)
+            if grid_path is None:
+                self._last_prefill_sim_time_ms = (time.perf_counter() - t_sim_start) * 1000.0
+                return
+
+            # Lazily create engine and update dynamic config each iteration.
+            if self.prefill_sim_engine is None:
+                self.prefill_sim_engine = PrefillSimulatorEngine(grid_path=grid_path)
+
+            num_used, _, _, _ = self._get_token_info()
+
+            # Decode batch uses the most active batch available.
+            if self.last_batch is not None and self.last_batch.reqs is not None:
+                decode_batch = max(len(self.last_batch.reqs), 1)
+            elif self.running_batch is not None and self.running_batch.reqs is not None:
+                decode_batch = max(len(self.running_batch.reqs), 1)
+            else:
+                decode_batch = 1
+
+            # Overlap adjustment: predict last_batch execution time.
+            # IMPORTANT: Use last_batch (the batch currently on GPU), NOT running_batch.
+            # last_batch = current GPU batch (can be DECODE, EXTEND, or MIXED mode)
+            # running_batch = merged batch for future iterations (after line 2666 merge)
+            # We need the current GPU batch time for correct overlap calculation.
+            tpot_effective = self.tpot if self.tpot not in (None, 0) else 1000.0
+            pred_last = self.predict_batch(self.last_batch)
+
+            # Decode slack seeds from current decoding requests if available.
+            from sglang.srt.managers.schedule_batch import ForwardMode  # local import to avoid cycle at module load
+            min_decode_slack = None
+            min_slack_req_tpot = tpot_effective  # Track TPOT of request with minimum slack
+            if self.last_batch is not None and getattr(self.last_batch, "reqs", None):
+                decoding_reqs = (
+                    set(self.last_batch.decoding_reqs)
+                    if getattr(self.last_batch, "decoding_reqs", None)
+                    else None
+                )
+                for req in self.last_batch.reqs:
+                    is_decode = (
+                        self.last_batch.forward_mode == ForwardMode.DECODE
+                        or (
+                            self.last_batch.forward_mode == ForwardMode.MIXED
+                            and decoding_reqs
+                            and req in decoding_reqs
+                        )
+                    )
+                    if not is_decode:
+                        continue
+                    slack_val = getattr(req, "last_slack_ms", None)
+                    if slack_val is None:
+                        slack_val = self._compute_req_slack_ms(req, now_ms=time.time() * 1000.0)
+                    if slack_val is None:
+                        continue
+                    # Update min slack and track the TPOT of that request
+                    if min_decode_slack is None or slack_val < min_decode_slack:
+                        min_decode_slack = slack_val
+                        # Use per-request TPOT if available, otherwise fall back to global
+                        req_tpot = req.target_tpot_ms
+                        min_slack_req_tpot = float(req_tpot) if req_tpot not in (None, 0) else tpot_effective
+
+            min_decode_slack = 0.0 if min_decode_slack is None else float(min_decode_slack)
+
+            # Decode slack formula: min_slack - overlap_time + TPOT_budget
+            # - Subtract pred_last: time consumed waiting for last_batch
+            # - Add min_slack_req_tpot: TPOT budget recovered from last_batch iteration (using the TPOT of the request with minimum slack)
+            # Assumes mixed-chunk mode: decode requests are serviced during last_batch
+            decode_slack_ms = min_decode_slack - pred_last + min_slack_req_tpot
+
+            # Edge cases handled by this formula:
+            # 1. pred_last = 0 (no overlap): decode_slack_ms = min_decode_slack + tpot
+            #    Correct: TPOT budget for the first iteration is included
+            # 2. pred_last >> TPOT (slow batch): decode_slack_ms may be negative
+            #    Correct: signals overspending, simulator will inject wait cycles
+            # 3. pred_last << TPOT (fast batch): decode_slack_ms increases
+            #    Correct: underspending creates slack budget for next iteration
+
+            # Only log update_decode if decode parameters changed
+            if (
+                self._last_prefill_sim_decode_batch != decode_batch
+                or self._last_prefill_sim_kv_cache != num_used
+            ):
+                logger.info(
+                    "[PREFILL-SIM] update_decode: decode_batch=%d kv_cache=%d tpot_ms=%.2f slack_decode_ms=%.2f (pred_last=%.2f min_decode_slack=%.2f min_slack_req_tpot=%.2f)",
+                    decode_batch,
+                    num_used,
+                    tpot_effective,
+                    decode_slack_ms,
+                    pred_last,
+                    min_decode_slack,
+                    min_slack_req_tpot,
+                )
+            self.prefill_sim_engine.update_decode(
+                decode_batch=decode_batch,
+                kv_cache=num_used,
+                tpot_ms=tpot_effective,
+                slack_decode_ms=decode_slack_ms,
+            )
+
+            now_ms = time.time() * 1000.0
+
+            # Build candidates in FIFO order: chunked req first (if any), then current queue as-is.
+            candidates: List[Req] = []
+            if self.chunked_req is not None:
+                candidates.append(self.chunked_req)
+            if self.waiting_queue:
+                candidates.extend(self.waiting_queue)
+
+            total_prefill_lens: List[int] = []
+            already_prefilled_lens: List[int] = []
+            prefill_slacks: List[float] = []
+
+            for req in candidates:
+                extend_len = max(int(getattr(req, "extend_input_len", 0)), 0)
+                if extend_len == 0 and not req.finished():
+                    try:
+                        req.init_next_round_input(self.tree_cache)
+                        extend_len = max(int(getattr(req, "extend_input_len", 0)), 0)
+                    except Exception:
+                        extend_len = 0
+
+                prefetched = max(len(getattr(req, "prefix_indices", [])), 0)
+                total_len = prefetched + extend_len
+
+                slack_raw = getattr(req, "last_slack_ms", None)
+                if slack_raw is None:
+                    slack_raw = self._compute_req_slack_ms(req, now_ms=now_ms)
+                slack_raw = 0.0 if slack_raw is None else float(slack_raw)
+                # Prefill slack: subtract overlap time; do not add TPOT here.
+                # Waiting requests are not serviced during overlap, so they just lose time.
+                slack_adj = max(slack_raw - pred_last, 0.0)
+
+                if total_len <= 0:
+                    continue
+
+                total_prefill_lens.append(total_len)
+                already_prefilled_lens.append(prefetched)
+                prefill_slacks.append(slack_adj)
+
+            # Check if scenario changed from last iteration to avoid duplicate logging
+            scenario_changed = (
+                self._last_prefill_sim_decode_batch != decode_batch
+                or self._last_prefill_sim_kv_cache != num_used
+                or self._last_prefill_sim_prefill_lens != total_prefill_lens
+            )
+
+            if scenario_changed:
+                logger.info(
+                    "[PREFILL-SIM] evaluate_extras: candidates=%d total_lens=%s prefill_slacks=%s already_prefilled=%s extras=%s%s",
+                    len(total_prefill_lens),
+                    total_prefill_lens if total_prefill_lens else "[]",
+                    [f"{s:.1f}" for s in prefill_slacks] if prefill_slacks else "[]",
+                    already_prefilled_lens if already_prefilled_lens else "[]",
+                    PREFILL_SIM_EXTRAS,
+                    " (empty base)" if not total_prefill_lens else "",
+                )
+                # Update last scenario
+                self._last_prefill_sim_decode_batch = decode_batch
+                self._last_prefill_sim_kv_cache = num_used
+                self._last_prefill_sim_prefill_lens = total_prefill_lens.copy()
+            self._last_prefill_sim_results = self.prefill_sim_engine.evaluate_extras(
+                total_prefill_lens,
+                prefill_slacks,
+                PREFILL_SIM_EXTRAS,
+                already_prefilled_lens=already_prefilled_lens,
+            )
+            self._last_prefill_sim_time_ms = (time.perf_counter() - t_sim_start) * 1000.0
+            try:
+                # Build compact metrics-friendly summary: map extra_len -> time_ms (or inf on fail)
+                metrics_summary = {}
+                # Log summary of simulation results; keep concise to avoid log spam.
+                summaries = []
+                for idx, res in enumerate(self._last_prefill_sim_results or []):
+                    extra_len = PREFILL_SIM_EXTRAS[idx] if idx < len(PREFILL_SIM_EXTRAS) else None
+                    status = "PASS" if res.success else ("LATE" if res.decode_feasible else "FAIL")
+                    # Since another batch is running, include pred_last in reported times for visibility.
+                    # reported_time = time from NOW until new_batch completes
+                    #               = pred_last (last_batch completes) + res.total_time_ms (new_batch executes)
+                    reported_time = res.total_time_ms + pred_last
+                    reported_padded = res.padded_total_time_ms + pred_last
+                    if idx == 0:
+                        # Base case
+                        timeline = res.execution_flow if res.execution_flow else res.base_plan
+                        if scenario_changed:
+                            logger.info(
+                                "[PREFILL-SIM] base extra=0 status=%s time=%.2fms padded=%.2fms timeline=%s",
+                                status,
+                                reported_time,
+                                reported_padded,
+                                timeline,
+                            )
+                        metrics_summary[0] = None if status == "FAIL" else reported_time
+                    else:
+                        if status == "FAIL":
+                            summaries.append(f"({extra_len}, FAIL)")
+                            metrics_summary[extra_len] = None
+                        else:
+                            summaries.append(f"({extra_len}, {round(reported_time)}ms)")
+                            metrics_summary[extra_len] = reported_time
+                if summaries and scenario_changed:
+                    logger.info("[PREFILL-SIM] extras: %s", ", ".join(summaries))
+                self._last_prefill_sim_metrics = metrics_summary
+            except Exception:
+                logger.exception("Failed to log prefill simulation results")
+        except Exception:
+            self._last_prefill_sim_time_ms = (time.perf_counter() - t_sim_start) * 1000.0
+            logger.exception("Failed to run prefill simulator")
+
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Gather finished requests before they are filtered out of batches.
         finished_for_observation: List[Req] = []
@@ -2454,6 +2725,10 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
+        # Run predictions BEFORE batch formation to guide scheduling decisions
+        self._maybe_run_prefill_simulation()
+        self._predict_future_kv_usage()
+
         new_batch = self.get_new_batch_prefill()
 
         need_dp_attn_preparation = require_mlp_sync(self.server_args)
@@ -2480,9 +2755,6 @@ class Scheduler(
             self.maybe_handle_dp_balance_data()
             ret = self.prepare_mlp_sync_batch(ret)
 
-        # Run future KV peak/slack prediction for active decode batch (result unused for now).
-        self._predict_future_kv_usage()
-        
         # log the batch infomation
         # if ret is not None:
         #     logger.info(f"running batch len reqs: {len(ret.reqs)}")
