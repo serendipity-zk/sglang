@@ -12,6 +12,7 @@ Features:
 Interface compatible with OnlineLinearCycleTime:
 - predict(batch_size_tokens, prefill_chunk_pairs, kv_tokens_used, mode) -> float
 - submit(batch_size_tokens, prefill_chunk_pairs, kv_tokens_used, iteration_time_ms, mode) -> (prediction, abs_error)
+- predict_batch(batch_size_tokens_list, prefill_chunk_pairs_list, kv_tokens_used_list, modes) -> List[float]
 """
 
 import json
@@ -353,6 +354,97 @@ class ModeAwarePredictor:
         final_pred = max(0.0, grid_pred + correction)
 
         return final_pred
+
+    def predict_batch(
+        self,
+        batch_size_tokens_list: List[int],
+        prefill_chunk_pairs_list: List[List[List[int]]],
+        kv_tokens_used_list: List[int],
+        modes: List[str] = None,
+    ) -> List[float]:
+        """
+        Batched variant of predict with identical semantics per element.
+
+        Args:
+            batch_size_tokens_list: List of batch sizes
+            prefill_chunk_pairs_list: List of prefill_chunk_pairs per sample
+            kv_tokens_used_list: List of KV tokens used per sample
+            modes: List of modes (required for multi-mode grids; ignored otherwise)
+
+        Returns:
+            List of predicted iteration times (ms), one per input
+        """
+        if not (
+            len(batch_size_tokens_list)
+            == len(prefill_chunk_pairs_list)
+            == len(kv_tokens_used_list)
+        ):
+            raise ValueError("All input lists must have the same length")
+
+        if len(batch_size_tokens_list) == 0:
+            return []
+
+        preds: List[float] = [0.0] * len(batch_size_tokens_list)
+
+        if self.is_multimode:
+            if modes is None or len(modes) != len(batch_size_tokens_list):
+                raise ValueError(
+                    "modes must be provided and match input length for multi-mode predictor"
+                )
+
+            available_modes = set(self.grids.keys())
+            invalid_modes = [m for m in modes if m not in available_modes]
+            if invalid_modes:
+                raise ValueError(
+                    f"Mode(s) {invalid_modes} not found. Available modes: {list(self.grids.keys())}"
+                )
+
+            # Group indices by mode to reuse vectorized grid lookup per mode.
+            mode_to_indices = {}
+            for idx, mode in enumerate(modes):
+                mode_to_indices.setdefault(mode, []).append(idx)
+
+            for mode_name, indices in mode_to_indices.items():
+                X_knots = self.X_knots_dict[mode_name]
+                Y_knots = self.Y_knots_dict[mode_name]
+                Z_knots = self.Z_knots_dict[mode_name]
+                grid = self.grids[mode_name]
+                bias_corrector = self.bias_correctors[mode_name]
+
+                xs = np.array([float(batch_size_tokens_list[i]) for i in indices])
+                ys = np.array(
+                    [self._compute_y_scalar(prefill_chunk_pairs_list[i]) for i in indices]
+                )
+                zs = np.array([float(kv_tokens_used_list[i]) for i in indices])
+
+                grid_preds = trilinear_predict(xs, ys, zs, X_knots, Y_knots, Z_knots, grid)
+
+                for offset, idx in enumerate(indices):
+                    correction, _ = bias_corrector.correction(
+                        float(xs[offset]), float(ys[offset]), float(zs[offset])
+                    )
+                    preds[idx] = max(0.0, float(grid_preds[offset]) + correction)
+
+        else:
+            X_knots = self.X_knots
+            Y_knots = self.Y_knots
+            Z_knots = self.Z_knots
+            grid = self.grid
+            bias_corrector = self.bias_corrector
+
+            xs = np.array([float(x) for x in batch_size_tokens_list])
+            ys = np.array([self._compute_y_scalar(pairs) for pairs in prefill_chunk_pairs_list])
+            zs = np.array([float(z) for z in kv_tokens_used_list])
+
+            grid_preds = trilinear_predict(xs, ys, zs, X_knots, Y_knots, Z_knots, grid)
+
+            for idx in range(len(batch_size_tokens_list)):
+                correction, _ = bias_corrector.correction(
+                    float(xs[idx]), float(ys[idx]), float(zs[idx])
+                )
+                preds[idx] = max(0.0, float(grid_preds[idx]) + correction)
+
+        return preds
 
     def submit(
         self,
