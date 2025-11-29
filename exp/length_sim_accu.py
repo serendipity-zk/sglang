@@ -15,7 +15,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from exp.length_sim_algo import MonteCarloOutputEst
-from exp.length_monitor import RequestOutputLengthProfile
 from sglang_profile.mode_aware_predictor import ModeAwarePredictor
 
 
@@ -473,17 +472,17 @@ def main():
     )
     parser.add_argument(
         "--bin-counts",
-        default="16,32,64",
+        default="16,32",
         help="Comma separated bin counts to test.",
     )
     parser.add_argument(
         "--req-counts",
-        default="8,32,128,256",
+        default="8,32,128,256,512",
         help="Comma separated request counts to sample per run.",
     )
     parser.add_argument(
         "--sim-counts",
-        default="100,200,400",
+        default="25,50,100",
         help="Comma separated n_simulations values to test.",
     )
     parser.add_argument(

@@ -247,3 +247,4 @@ learn_rust/
 .github/
 openspec/
 *.md
+tmp/
