@@ -72,9 +72,13 @@ class ProposedPlan:
     Represents a specific chunking strategy (e.g. [128, 128, 64]) for a specific set of requests.
     Responsibility: Calculate the token schedule and prepare raw inputs for prediction.
     """
-    def __init__(self, chunks: List[int], req_lens: List[int]):
+    def __init__(self, chunks: List[int], req_lens: List[int], prefilled_lens: Optional[List[int]] = None):
         self.chunks = chunks
         self.req_lens = req_lens
+        self.prefilled_lens = prefilled_lens if prefilled_lens is not None else [0] * len(req_lens)
+
+        if len(self.prefilled_lens) != len(self.req_lens):
+            raise ValueError("Length of prefilled_lens must match req_lens")
 
         # Derived attributes (computed in one pass)
         self.schedule_segments, self.cycle_inputs = self._build_schedule_and_inputs()
@@ -104,16 +108,22 @@ class ProposedPlan:
             chunk_len = 0
 
             while left > 0 and req_idx < len(self.req_lens):
+                if remaining == 0:
+                    req_idx += 1
+                    if req_idx < len(self.req_lens):
+                        remaining = self.req_lens[req_idx]
+                    continue
+
                 alloc = min(left, remaining)
 
                 # Build schedule segment
                 chunk_segs.append((req_idx, alloc))
 
                 # Build predictor input (reuse alloc, avoid recomputing)
-                start_pos = temp_progress[req_idx]
+                start_pos = self.prefilled_lens[req_idx] + temp_progress[req_idx]
                 end_pos = start_pos + alloc
                 pairs.append([alloc, end_pos])
-                temp_progress[req_idx] = end_pos
+                temp_progress[req_idx] += alloc
 
                 chunk_len += alloc
                 remaining -= alloc
@@ -136,18 +146,27 @@ class SimulationScenario:
     Represents a User Scenario (Set of requests and slacks).
     Responsibility: Normalization (Align/Sort) and Plan Generation.
     """
-    def __init__(self, raw_lens: Sequence[int], raw_slacks: Sequence[float]):
+    def __init__(self, raw_lens: Sequence[int], raw_slacks: Sequence[float], already_prefilled_lens: Optional[Sequence[int]] = None):
         if len(raw_lens) != len(raw_slacks):
             raise ValueError("Lengths and slacks must match")
+
+        if already_prefilled_lens is None:
+            already_prefilled_lens = [0] * len(raw_lens)
+
+        if len(raw_lens) != len(already_prefilled_lens):
+            raise ValueError("Lengths and already_prefilled_lens must match")
         
         # 1. Align to granularity and Sort by slack (Tightest first)
         zipped = []
-        for l, s in zip(raw_lens, raw_slacks):
-            aligned_len = (int(l) + GRANULARITY - 1) // GRANULARITY * GRANULARITY
-            zipped.append((aligned_len, float(s)))
+        for l, s, p in zip(raw_lens, raw_slacks, already_prefilled_lens):
+            clamped_prefilled = max(0, min(int(p), int(l)))
+            remaining_tokens = max(int(l) - clamped_prefilled, 0)
+            aligned_remaining = (remaining_tokens + GRANULARITY - 1) // GRANULARITY * GRANULARITY if remaining_tokens > 0 else 0
+            zipped.append((aligned_remaining, float(s), clamped_prefilled))
         zipped.sort(key=lambda x: x[1])
         
         self.req_lens = [z[0] for z in zipped]
+        self.prefilled_lens = [z[2] for z in zipped]
         self.req_slacks = [z[1] for z in zipped]
         self.total_len = sum(self.req_lens)
         
@@ -184,7 +203,7 @@ class SimulationScenario:
 
         # Edge case: If total_len is 0, make a dummy plan
         if self.total_len == 0:
-            self.plans = [ProposedPlan([0], self.req_lens)]
+            self.plans = [ProposedPlan([0], self.req_lens, self.prefilled_lens)]
             return
 
         raw_plans = []
@@ -227,7 +246,7 @@ class SimulationScenario:
                 unique_plans.append(plan)
 
         t_create_start = time.perf_counter()
-        self.plans = [ProposedPlan(p, self.req_lens) for p in unique_plans]
+        self.plans = [ProposedPlan(p, self.req_lens, self.prefilled_lens) for p in unique_plans]
 
         t_end = time.perf_counter()
         pow2_time = (t_pow2_end - t_pow2_start) * 1000
@@ -437,11 +456,16 @@ class PrefillSimulatorEngine:
         self,
         base_lens: Sequence[int],
         base_slacks: Sequence[float],
-        extra_lens: Sequence[int]
+        extra_lens: Sequence[int],
+        already_prefilled_lens: Optional[Sequence[int]] = None
     ) -> List[BatchPlanResult]:
         self._ensure_ready()
         assert self.config is not None
         assert self.predictor is not None
+
+        base_prefilled = already_prefilled_lens if already_prefilled_lens is not None else [0] * len(base_lens)
+        if len(base_prefilled) != len(base_lens):
+            raise ValueError("already_prefilled_lens must match base_lens length")
 
         t_scenario_start = time.perf_counter()
         # 1. Create Scenarios
@@ -453,12 +477,13 @@ class PrefillSimulatorEngine:
             t_sc_start = time.perf_counter()
             if extra == 0:
                 # Base Case: Use original lists
-                sc = SimulationScenario(base_lens, base_slacks)
+                sc = SimulationScenario(base_lens, base_slacks, base_prefilled)
             else:
                 # Extra Case: Copy and append
                 sc = SimulationScenario(
                     list(base_lens) + [extra],
-                    list(base_slacks) + [float('inf')]
+                    list(base_slacks) + [float('inf')],
+                    list(base_prefilled) + [0]
                 )
             t_sc_end = time.perf_counter()
             total_sc_init += (t_sc_end - t_sc_start)
@@ -547,6 +572,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Refactored Batch Simulator")
     parser.add_argument("--prefill-lens", type=int, nargs="+", required=True)
     parser.add_argument("--prefill-slacks", type=float, nargs="+", required=True)
+    parser.add_argument(
+        "--already-prefilled-lens",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Tokens already prefetched for each request (same length as --prefill-lens).",
+    )
     parser.add_argument("--decode-batch", type=int, default=256)
     parser.add_argument("--kv-cache", type=int, default=50_000)
     parser.add_argument("--tpot", type=float, default=30.0)
@@ -574,7 +606,8 @@ def main():
     results = engine.evaluate_extras(
         args.prefill_lens, 
         args.prefill_slacks, 
-        extras
+        extras,
+        already_prefilled_lens=args.already_prefilled_lens,
     )
     t_end = time.perf_counter()
     print(f"[PERF] TOTAL TIME: {(t_end - t_start)*1000:.3f} ms")
