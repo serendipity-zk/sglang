@@ -1,0 +1,12 @@
+{
+  "type": "slo_aware",
+  "tpot_buckets": [10.0, 50.0],
+  "worker_selection_policy": {
+    "type": "TTFTAware",
+    "margin_ms": 50.0
+  },
+  "auto_scaling": {
+    "enabled": true,
+    "idle_slo_ms": 1000.0
+  }
+}

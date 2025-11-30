@@ -89,6 +89,7 @@ class RouterArgs:
     # Scheduler configuration
     scheduler: str = "eager"
     scheduler_tpot_buckets: Optional[List[float]] = None
+    worker_selection_policy_file: Optional[str] = None
 
     @staticmethod
     def add_cli_args(
@@ -463,6 +464,12 @@ class RouterArgs:
             nargs="*",
             default=None,
             help="TPOT bucket boundaries in ms for slo_aware scheduler (e.g., 10.0 50.0 100.0 creates 4 buckets: <10, 10-50, 50-100, >100)",
+        )
+        parser.add_argument(
+            f"--{prefix}worker-selection-policy-file",
+            type=str,
+            default=None,
+            help="Path to JSON file specifying worker selection policy configuration",
         )
 
     @classmethod

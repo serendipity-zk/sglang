@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::Instant;
 
 /// Individual waiting queue request information
@@ -53,6 +54,11 @@ pub struct WorkerStats {
     /// Prefill chunk pairs: [(chunk_size, cumulative_prefill), ...]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_chunk_pairs: Option<Vec<(i64, i64)>>,
+
+    /// Prefill simulation metrics: maps extra token count to estimated execution time in ms
+    /// Python sends this as "prefill_sim_results" with integer keys (0, 128, 256, ..., 4096)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_sim_metrics: Option<HashMap<i64, f64>>,
 
     /// Router generation reported by the worker (for message acknowledgments)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,6 +161,21 @@ impl WorkerStats {
                     .collect()
             });
 
+        let prefill_sim_metrics = stats
+            .get("prefill_sim_results")
+            .and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| {
+                        // Parse key as i64 (Python sends integer keys as strings in JSON)
+                        let key = k.parse::<i64>().ok()?;
+                        // Get value as f64 (skip null values)
+                        let value = v.as_f64()?;
+                        Some((key, value))
+                    })
+                    .collect()
+            });
+
         let kv_tokens_used = stats.get("kv_tokens_used").and_then(|v| v.as_i64());
 
         let router_generation = stats.get("router_generation").and_then(|v| v.as_i64());
@@ -173,6 +194,7 @@ impl WorkerStats {
             iteration_num,
             last_iteration_time_ms,
             prefill_chunk_pairs,
+            prefill_sim_metrics,
             router_generation,
             last_received_message_id,
             timestamp: Instant::now(),

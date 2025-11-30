@@ -160,6 +160,7 @@ mod tests {
             WorkerStats {
                 worker_id: "http://worker1:8080".to_string(),
                 batch_size_tokens: 100,
+                kv_tokens_used: None,
                 num_requests: 2,
                 waiting_queue_size: 3,
                 waiting_queue_info: None,
@@ -167,6 +168,7 @@ mod tests {
                 iteration_num: 10,
                 last_iteration_time_ms: None,
                 prefill_chunk_pairs: None,
+                prefill_sim_metrics: None,
                 router_generation: None,
                 last_received_message_id: None,
                 timestamp: std::time::Instant::now(),
@@ -177,6 +179,7 @@ mod tests {
             WorkerStats {
                 worker_id: "http://worker2:8080".to_string(),
                 batch_size_tokens: 100,
+                kv_tokens_used: None,
                 num_requests: 1,
                 waiting_queue_size: 2,
                 waiting_queue_info: None,
@@ -184,6 +187,7 @@ mod tests {
                 iteration_num: 10,
                 last_iteration_time_ms: None,
                 prefill_chunk_pairs: None,
+                prefill_sim_metrics: None,
                 router_generation: None,
                 last_received_message_id: None,
                 timestamp: std::time::Instant::now(),
@@ -221,6 +225,7 @@ mod tests {
             WorkerStats {
                 worker_id: "http://worker1:8080".to_string(),
                 batch_size_tokens: 100,
+                kv_tokens_used: None,
                 num_requests: 2,
                 waiting_queue_size: 3,
                 waiting_queue_info: None,
@@ -228,6 +233,7 @@ mod tests {
                 iteration_num: 10,
                 last_iteration_time_ms: None,
                 prefill_chunk_pairs: None,
+                prefill_sim_metrics: None,
                 router_generation: None,
                 last_received_message_id: None,
                 timestamp: std::time::Instant::now(),
@@ -238,6 +244,7 @@ mod tests {
             WorkerStats {
                 worker_id: "http://worker2:8080".to_string(),
                 batch_size_tokens: 0,
+                kv_tokens_used: None,
                 num_requests: 0,
                 waiting_queue_size: 0,
                 waiting_queue_info: None,
@@ -245,6 +252,7 @@ mod tests {
                 iteration_num: 10,
                 last_iteration_time_ms: None,
                 prefill_chunk_pairs: None,
+                prefill_sim_metrics: None,
                 router_generation: None,
                 last_received_message_id: None,
                 timestamp: std::time::Instant::now(),

@@ -2,13 +2,14 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{info, warn};
 
+use crate::config::types::WorkerSelectionPolicy;
 use crate::core::{Worker, WorkerId, WorkerStats};
 use crate::routers::http::scheduler::{PendingRequest, SchedulerConfig};
 use crate::ui::RouterUi;
@@ -30,12 +31,15 @@ pub struct SloAwareScheduler {
     tier_queue_sizes: Arc<DashMap<usize, AtomicUsize>>,
     /// Last scheduling iteration duration in microseconds
     last_schedule_duration_us: AtomicU64,
+    /// Worker selection policy configuration
+    policy: WorkerSelectionPolicy,
 }
 
 impl SloAwareScheduler {
     pub fn new(
         _policy_registry: Arc<crate::policies::PolicyRegistry>,
         tpot_buckets: Vec<f32>,
+        policy: WorkerSelectionPolicy,
     ) -> Self {
         let tier_workers = Arc::new(DashMap::new());
         let tier_queue_sizes = Arc::new(DashMap::new());
@@ -55,6 +59,7 @@ impl SloAwareScheduler {
             worker_stats: RwLock::new(HashMap::new()),
             tier_queue_sizes,
             last_schedule_duration_us: AtomicU64::new(0),
+            policy,
         }
     }
 
@@ -285,6 +290,182 @@ impl SloAwareScheduler {
         None
     }
 
+    /// Linear interpolation to estimate prefill time for a given token count
+    /// Uses prefill simulation metrics which map token counts to execution times
+    fn interpolate_prefill_time(
+        &self,
+        sim_metrics: &HashMap<i64, f64>,
+        target_tokens: i64,
+    ) -> Option<f64> {
+        // Convert to sorted vector
+        let mut points: Vec<(i64, f64)> = sim_metrics.iter().map(|(&k, &v)| (k, v)).collect();
+        points.sort_by_key(|&(k, _)| k);
+
+        if points.is_empty() {
+            return None;
+        }
+
+        // Exact match
+        if let Some(&(_, time)) = points.iter().find(|(k, _)| *k == target_tokens) {
+            return Some(time);
+        }
+
+        // Interpolation between two points
+        for window in points.windows(2) {
+            let (k1, t1) = window[0];
+            let (k2, t2) = window[1];
+
+            if k1 < target_tokens && target_tokens < k2 {
+                let ratio = (target_tokens - k1) as f64 / (k2 - k1) as f64;
+                return Some(t1 + ratio * (t2 - t1));
+            }
+        }
+
+        // Extrapolation (use closest point)
+        if target_tokens < points[0].0 {
+            return Some(points[0].1);
+        }
+        if target_tokens > points.last().unwrap().0 {
+            return Some(points.last().unwrap().1);
+        }
+
+        None
+    }
+
+    /// Calculate total pending tokens for a worker (queue + pending messages)
+    fn calculate_pending_tokens(&self, worker: &dyn Worker, worker_stats: &WorkerStats) -> i64 {
+        // Sum tokens from waiting queue
+        let queue_tokens = worker_stats
+            .waiting_queue_info
+            .as_ref()
+            .map(|info| info.total_extend_len)
+            .unwrap_or(0);
+
+        // Add tokens from pending router messages (estimate)
+        let pending_msg_count = worker.pending_message_count() as i64;
+        // Estimate: assume average request has ~512 tokens
+        let pending_msg_tokens = pending_msg_count * 512;
+
+        queue_tokens + pending_msg_tokens
+    }
+
+    /// Estimate TTFT for a worker given a new request
+    fn estimate_ttft(
+        &self,
+        worker: &dyn Worker,
+        new_request_tokens: i64,
+        margin_ms: f64,
+    ) -> Option<f64> {
+        // Get worker stats
+        let stats = self.worker_stats.read().ok()?;
+        let worker_stats = stats.get(worker.url())?;
+
+        // Get prefill sim metrics
+        let sim_metrics = worker_stats.prefill_sim_metrics.as_ref()?;
+
+        // Calculate pending tokens
+        let pending_tokens = self.calculate_pending_tokens(worker, worker_stats);
+
+        // Total tokens = pending + new request
+        let total_tokens = pending_tokens + new_request_tokens;
+
+        // Interpolate to get estimated time
+        let estimated_ms = self.interpolate_prefill_time(sim_metrics, total_tokens)?;
+
+        // Add safety margin
+        Some(estimated_ms + margin_ms)
+    }
+
+    /// Check if request's TTFT deadline has been violated
+    fn is_ttft_violated(&self, req: &PendingRequest) -> bool {
+        let Some(target_ttft) = req.target_ttft_ms else {
+            return false; // No TTFT target specified, consider not violated
+        };
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as f64;
+        let elapsed_ms = now_ms - req.arrival_time_ms;
+        elapsed_ms > target_ttft as f64
+    }
+
+    /// TTFT-aware worker selection (without fallback)
+    /// Returns worker that can meet TTFT target, or None to retry later
+    fn select_worker_ttft_aware(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_tokens: i64,
+        target_ttft_ms: f64,
+        margin_ms: f64,
+    ) -> Option<Arc<dyn Worker>> {
+        if workers.is_empty() {
+            return None;
+        }
+
+        // Phase 1: Find first worker that can meet TTFT target
+        // This maintains a load gradient similar to first-available policy
+        for worker in workers {
+            if let Some(estimated_ttft) = self.estimate_ttft(worker.as_ref(), request_tokens, margin_ms) {
+                if estimated_ttft <= target_ttft_ms {
+                    return Some(Arc::clone(worker));
+                }
+            }
+        }
+
+        // Phase 2: No worker can meet target -> return None (retry next tick)
+        None
+    }
+
+    /// TTFT-aware worker selection with fallback strategy
+    fn select_worker_ttft_aware_with_fallback(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_tokens: i64,
+        target_ttft_ms: f64,
+        ttft_violated: bool,
+        margin_ms: f64,
+    ) -> Option<Arc<dyn Worker>> {
+        if workers.is_empty() {
+            return None;
+        }
+
+        // If TTFT already violated, use fallback strategy
+        if ttft_violated {
+            // Phase 3: Select worker with minimal estimated latency
+            let mut all_with_estimates: Vec<(Arc<dyn Worker>, f64)> = workers
+                .iter()
+                .filter_map(|w| {
+                    let estimated = self.estimate_ttft(w.as_ref(), request_tokens, margin_ms)?;
+                    Some((Arc::clone(w), estimated))
+                })
+                .collect();
+
+            if !all_with_estimates.is_empty() {
+                all_with_estimates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                return Some(all_with_estimates[0].0.clone());
+            }
+
+            // Phase 4: No metrics available -> random selection
+            if !workers.is_empty() {
+                use rand::Rng;
+                let mut rng = rand::rng();
+                let idx = rng.random_range(0..workers.len());
+                return Some(workers[idx].clone());
+            }
+            return None;
+        }
+
+        // Normal case: try to meet target
+        if let Some(worker) = self.select_worker_ttft_aware(workers, request_tokens, target_ttft_ms, margin_ms) {
+            return Some(worker);
+        }
+
+        // If TTFT-aware selection failed (typically because prefill_sim_metrics unavailable),
+        // fall back to FirstAvailable logic to preserve admission control
+        self.select_worker_first_available(workers)
+    }
+
     async fn drain_all_queues(
         self: &Arc<Self>,
         config: &Arc<SchedulerConfig>,
@@ -352,12 +533,36 @@ impl SloAwareScheduler {
                 break;
             }
 
-            let Some(worker) = self.select_worker_first_available(&tier_filtered) else {
-                // All workers in this tier have pending work - defer scheduling (admission control)
+            // Select worker based on configured policy
+            let worker = match &self.policy {
+                WorkerSelectionPolicy::FirstAvailable => {
+                    self.select_worker_first_available(&tier_filtered)
+                }
+                WorkerSelectionPolicy::TTFTAware { margin_ms } => {
+                    // Get request info for TTFT estimation
+                    // Rough token estimate: text length / 4 (common heuristic for English text)
+                    let request_tokens = (front.text.len() / 4) as i64;
+
+                    // Convert Option<f32> to f64 with default
+                    let target_ttft_ms = front.target_ttft_ms.unwrap_or(1000.0) as f64;
+                    let ttft_violated = self.is_ttft_violated(front);
+
+                    self.select_worker_ttft_aware_with_fallback(
+                        &tier_filtered,
+                        request_tokens,
+                        target_ttft_ms,
+                        ttft_violated,
+                        *margin_ms,
+                    )
+                }
+            };
+
+            let Some(worker) = worker else {
+                // No suitable worker found - defer scheduling (admission control or retry)
                 info!(
-                    "Queue {}: All {} tier workers have pending work, keeping request in queue (admission control)",
+                    "Queue {}: No suitable worker found (policy: {:?}), keeping request in queue",
                     queue_idx,
-                    tier_filtered.len()
+                    self.policy
                 );
                 break;
             };

@@ -111,6 +111,7 @@ struct Router {
     // Scheduler configuration
     scheduler: SchedulerType,
     scheduler_tpot_buckets: Option<Vec<f32>>,
+    worker_selection_policy: Option<String>,
 }
 
 impl Router {
@@ -177,12 +178,28 @@ impl Router {
         let scheduler = match &self.scheduler {
             SchedulerType::Eager => config::SchedulerConfig::Eager,
             SchedulerType::Gated => config::SchedulerConfig::Gated,
-            SchedulerType::SloAware => config::SchedulerConfig::SloAware {
-                tpot_buckets: self
-                    .scheduler_tpot_buckets
-                    .clone()
-                    .unwrap_or_else(|| vec![10.0, 50.0]),
-            },
+            SchedulerType::SloAware => {
+                // Parse worker selection policy from JSON string if provided
+                let policy = match &self.worker_selection_policy {
+                    Some(json_str) => {
+                        Some(serde_json::from_str::<config::WorkerSelectionPolicy>(json_str)
+                            .map_err(|e| config::ConfigError::InvalidValue {
+                                field: "worker_selection_policy".to_string(),
+                                value: json_str.clone(),
+                                reason: format!("Failed to parse JSON: {}", e),
+                            })?)
+                    }
+                    None => None,
+                };
+
+                config::SchedulerConfig::SloAware {
+                    tpot_buckets: self
+                        .scheduler_tpot_buckets
+                        .clone()
+                        .unwrap_or_else(|| vec![10.0, 50.0]),
+                    worker_selection_policy: policy,
+                }
+            }
         };
 
         // Service discovery configuration
@@ -331,6 +348,7 @@ impl Router {
         // Scheduler defaults
         scheduler = SchedulerType::Eager,
         scheduler_tpot_buckets = None,
+        worker_selection_policy = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -392,6 +410,7 @@ impl Router {
         tokenizer_path: Option<String>,
         scheduler: SchedulerType,
         scheduler_tpot_buckets: Option<Vec<f32>>,
+        worker_selection_policy: Option<String>,
     ) -> PyResult<Self> {
         // Determine connection mode from worker URLs
         let mut all_urls = worker_urls.clone();
@@ -470,6 +489,7 @@ impl Router {
             tokenizer_path,
             scheduler,
             scheduler_tpot_buckets,
+            worker_selection_policy,
         })
     }
 

@@ -21,7 +21,7 @@ python3 -m issue_stream_aiohttp \
   --tokenizer meta-llama/Llama-3.1-8B-Instruct \
   --base-url http://0.0.0.0:40010/v1 \
   --model meta-llama/Llama-3.1-8B-Instruct \
-  --rate 40.0 \
+  --rate 23.75 \
   --max-requests 0 \
   --num-workers 64 \
   --concurrency-per-worker 500

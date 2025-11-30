@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 from typing import Optional
 
 from sglang_router.router_args import RouterArgs
@@ -131,8 +133,22 @@ class Router:
         args_dict["decode_policy"] = policy_from_str(args_dict["decode_policy"])
         args_dict["scheduler"] = scheduler_from_str(args_dict["scheduler"])
 
-        # remove mini_lb parameter
+        # Load worker selection policy from JSON file if provided
+        if args_dict.get("worker_selection_policy_file"):
+            policy_path = Path(args_dict["worker_selection_policy_file"])
+            if policy_path.exists():
+                with policy_path.open("r", encoding="utf-8") as f:
+                    policy_config = json.load(f)
+                # Pass as JSON string to Rust
+                args_dict["worker_selection_policy"] = json.dumps(policy_config)
+            else:
+                raise ValueError(f"Worker selection policy file not found: {policy_path}")
+        else:
+            args_dict["worker_selection_policy"] = None
+
+        # remove mini_lb parameter and policy file path (we converted it to policy dict)
         args_dict.pop("mini_lb")
+        args_dict.pop("worker_selection_policy_file", None)
 
         return Router(_Router(**args_dict))
 

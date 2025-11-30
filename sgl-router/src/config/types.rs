@@ -215,6 +215,26 @@ impl PolicyConfig {
     }
 }
 
+/// Worker selection policy for SLO-aware scheduler
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkerSelectionPolicy {
+    /// Select first available worker with no pending work
+    FirstAvailable,
+    /// TTFT-aware selection using prefill simulation metrics
+    #[serde(rename = "TTFTAware")]
+    TTFTAware {
+        /// Safety margin in milliseconds added to estimated TTFT
+        margin_ms: f64,
+    },
+}
+
+impl Default for WorkerSelectionPolicy {
+    fn default() -> Self {
+        WorkerSelectionPolicy::FirstAvailable
+    }
+}
+
 /// Scheduler configuration for different scheduling strategies
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -232,6 +252,9 @@ pub enum SchedulerConfig {
     SloAware {
         /// TPOT bucket boundaries in milliseconds (e.g., [10.0, 50.0] creates 3 buckets: <10ms, 10-50ms, >50ms)
         tpot_buckets: Vec<f32>,
+        /// Worker selection policy configuration (optional, defaults to FirstAvailable)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        worker_selection_policy: Option<WorkerSelectionPolicy>,
     },
 }
 

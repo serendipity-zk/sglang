@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::config::types::SchedulerConfig;
+use crate::config::types::{SchedulerConfig, WorkerSelectionPolicy};
 use crate::policies::PolicyRegistry;
 
 use super::{EagerScheduler, GatedScheduler, Scheduler, SloAwareScheduler};
@@ -24,10 +24,15 @@ impl SchedulerFactory {
         match config {
             SchedulerConfig::Eager => Arc::new(EagerScheduler::new()),
             SchedulerConfig::Gated => Arc::new(GatedScheduler::new()),
-            SchedulerConfig::SloAware { tpot_buckets } => Arc::new(SloAwareScheduler::new(
-                policy_registry,
-                tpot_buckets.clone(),
-            )),
+            SchedulerConfig::SloAware { tpot_buckets, worker_selection_policy } => {
+                let policy = worker_selection_policy.clone()
+                    .unwrap_or(WorkerSelectionPolicy::FirstAvailable);
+                Arc::new(SloAwareScheduler::new(
+                    policy_registry,
+                    tpot_buckets.clone(),
+                    policy,
+                ))
+            },
         }
     }
 
@@ -38,7 +43,12 @@ impl SchedulerFactory {
             "gated" => Arc::new(GatedScheduler::new()),
             "slo_aware" => {
                 // Default buckets: <10ms, 10-50ms, >50ms
-                Arc::new(SloAwareScheduler::new(policy_registry, vec![10.0, 50.0]))
+                // Default policy: FirstAvailable
+                Arc::new(SloAwareScheduler::new(
+                    policy_registry,
+                    vec![10.0, 50.0],
+                    WorkerSelectionPolicy::FirstAvailable,
+                ))
             }
             _ => {
                 tracing::warn!("Unknown scheduler name '{}', defaulting to eager", name);

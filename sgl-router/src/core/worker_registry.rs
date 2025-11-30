@@ -778,6 +778,7 @@ mod tests {
             iteration_num: 0,
             last_iteration_time_ms: None,
             prefill_chunk_pairs: None,
+            prefill_sim_metrics: None,
             router_generation: Some(99),
             last_received_message_id: Some(1),
             timestamp: Instant::now(),

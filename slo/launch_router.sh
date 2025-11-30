@@ -15,4 +15,5 @@ python -m sglang_router.launch_router \
     http://0.0.0.0:31003 \
     http://0.0.0.0:31004 \
   --scheduler slo_aware \
-  --scheduler-tpot-buckets 15 25 40
+  --scheduler-tpot-buckets 15 25 40 \
+  --worker-selection-policy-file /sgl-workspace/sglang/slo/worker_policy_TTFT_aware.json
