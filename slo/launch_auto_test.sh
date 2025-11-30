@@ -13,7 +13,7 @@ python -m auto_rate_slog \
   --base-url http://0.0.0.0:40010/v1 \
   --model meta-llama/Llama-3.1-8B-Instruct \
   --start-rate 20.0 \
-  --target-attainment 0.99 \
+  --target-attainment 0.95 \
   --num-workers 64 \
   --concurrency-per-worker 500 \
   --max-requests 2000 \

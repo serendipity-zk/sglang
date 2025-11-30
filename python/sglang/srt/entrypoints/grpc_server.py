@@ -395,6 +395,18 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         # Convert sampling params
         sampling_params = self._convert_sampling_params(grpc_req.sampling_params)
 
+        # Apply SLO target margin if configured
+        target_ttft_ms = None
+        target_tpot_ms = None
+        if grpc_req.target_ttft_ms != 0:
+            target_ttft_ms = grpc_req.target_ttft_ms
+            if self.server_args.slo_target_margin > 0:
+                target_ttft_ms *= (1 - self.server_args.slo_target_margin)
+        if grpc_req.target_tpot_ms != 0:
+            target_tpot_ms = grpc_req.target_tpot_ms
+            if self.server_args.slo_target_margin > 0:
+                target_tpot_ms *= (1 - self.server_args.slo_target_margin)
+
         # Create request
         return TokenizedGenerateReqInput(
             rid=grpc_req.request_id,
@@ -411,6 +423,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else None
             ),
             arrival_time_ms=grpc_req.arrival_time_ms if grpc_req.arrival_time_ms != 0 else None,
+            target_ttft_ms=target_ttft_ms,
+            target_tpot_ms=target_tpot_ms,
         )
 
     def _convert_embed_request(

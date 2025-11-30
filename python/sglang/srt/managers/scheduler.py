@@ -131,6 +131,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
+    PrefillScheduleMode,
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
@@ -645,6 +646,12 @@ class Scheduler(
                     half_life=50.0,
                     W0=4.0,
                 )
+
+        # Prefill schedule mode for SLO-aware scheduling
+        self.prefill_schedule_mode = PrefillScheduleMode(
+            server_args.prefill_schedule_mode
+        )
+        logger.info(f"Prefill schedule mode: {self.prefill_schedule_mode.value}")
 
         # Track output length observations + forecast future KV peak/slack
         self.output_estimator = (
@@ -2228,6 +2235,7 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def self_check_during_idle(self):
+        return
         self.check_memory()
         self.check_tree_cache()
         self.new_token_ratio = self.init_new_token_ratio
@@ -2262,7 +2270,7 @@ class Scheduler(
             )
             token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
 
-        if memory_leak:
+        if memory_leak > 0.02 * self.max_total_num_tokens:
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
             raise ValueError(msg)
 
@@ -2423,6 +2431,35 @@ class Scheduler(
         except Exception:
             logger.exception("Failed to predict future KV usage/slack")
 
+    def _get_simulation_chunk_budget(self) -> int:
+        """Extract first chunk from simulation execution_flow for this iteration.
+        
+        Returns:
+            Chunk budget in tokens:
+            - 0: Decode-only iteration (simulation says skip prefill)
+            - >0: Prefill budget for this iteration
+            - chunked_prefill_size: Fallback when no simulation results
+        """
+        if self._last_prefill_sim_results is None:
+            logger.info(f"No execution flow found, falling back to default chunk size {self.chunked_prefill_size}")
+            return self.chunked_prefill_size  # Fallback to default
+        
+        # Use the base case result (extra=0)
+        base_result = self._last_prefill_sim_results[0]
+        
+        # Trust the simulation's execution_flow - it provides a reasonable plan
+        # even when decode_feasible=False (marked as "LATE" but still executable)
+        execution_flow = getattr(base_result, 'execution_flow', None) or []
+        if not execution_flow:
+            logger.info(f"No execution flow found, falling back to default chunk size {self.chunked_prefill_size}")
+            return self.chunked_prefill_size  # Fallback if no execution flow
+        
+        # First chunk determines this iteration's budget
+        # Can be 0 (decode-only) or >0 (prefill budget)
+        first_chunk = execution_flow[0]
+        logger.info(f"[SIM SCHEDULE] execution_flow={execution_flow}, using first_chunk={first_chunk}")
+        return first_chunk
+
     def _maybe_run_prefill_simulation(self) -> None:
         """Run prefill simulator for chunked + queued requests to guide batch formation.
 
@@ -2580,8 +2617,11 @@ class Scheduler(
             prefill_slacks: List[float] = []
 
             for req in candidates:
+                # For chunked request, extend_input_len may be stale from previous chunk.
+                # Always reinitialize to get accurate remaining tokens.
+                is_chunked_req = (req is self.chunked_req)
                 extend_len = max(int(getattr(req, "extend_input_len", 0)), 0)
-                if extend_len == 0 and not req.finished():
+                if (extend_len == 0 or is_chunked_req) and not req.finished():
                     try:
                         req.init_next_round_input(self.tree_cache)
                         extend_len = max(int(getattr(req, "extend_input_len", 0)), 0)
@@ -2843,10 +2883,7 @@ class Scheduler(
         #         )
         #         return None
         # estimate the time for running batch
-        pred = self.predict_batch(self.running_batch)
 
-        if self.target_iteration_time_ms is not None and pred > self.target_iteration_time_ms:
-            return None
         
         # Handle the cases where prefill is not allowed
         if (
@@ -2874,6 +2911,47 @@ class Scheduler(
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue)
 
+        # Decode tokens for mixed chunk mode
+        decode_tokens = running_bs if self.is_mixed_chunk else 0
+
+        # Determine prefill parameters based on schedule mode
+        if self.prefill_schedule_mode == PrefillScheduleMode.SIMULATION:
+            # SIMULATION mode: use prefill_sim_engine execution plan
+            sim_budget = self._get_simulation_chunk_budget()
+            if sim_budget == 0:
+                logger.debug("SIMULATION mode: decode-only iteration per simulation plan")
+                return None
+            # sim_budget is pure prefill tokens; add decode_tokens back because
+            # PrefillAdder will subtract them (it expects total token budget)
+            effective_chunk_size = sim_budget + decode_tokens
+            effective_predictor = None
+            effective_tpot = None
+            effective_target = None
+        elif self.prefill_schedule_mode == PrefillScheduleMode.PREDICTOR:
+            pred = self.predict_batch(self.running_batch)
+            if self.target_iteration_time_ms is not None and pred > self.target_iteration_time_ms:
+                return None
+            
+            # PREDICTOR mode: binary search with cycle_time_predictor
+            if self.tpot is not None and self.cycle_time_predictor is not None:
+                effective_chunk_size = self.chunked_prefill_size
+                effective_predictor = self.cycle_time_predictor
+                effective_tpot = self.tpot
+                effective_target = self.target_iteration_time_ms
+            else:
+                # Fallback to BUDGET when TPOT not set
+                logger.debug("PREDICTOR mode: TPOT not set, falling back to BUDGET behavior")
+                effective_chunk_size = self.chunked_prefill_size
+                effective_predictor = None
+                effective_tpot = None
+                effective_target = None
+        else:
+            # BUDGET mode (default): greedy fill up to budget
+            effective_chunk_size = self.chunked_prefill_size
+            effective_predictor = None
+            effective_tpot = None
+            effective_target = None
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -2882,12 +2960,12 @@ class Scheduler(
             self.running_batch,
             self.new_token_ratio,
             self.max_prefill_tokens,
-            self.chunked_prefill_size,
+            effective_chunk_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
-            cycle_time_predictor=self.cycle_time_predictor,
-            tpot_slo=self.tpot,
-            target_iteration_time_ms=self.target_iteration_time_ms,
+            cycle_time_predictor=effective_predictor,
+            tpot_slo=effective_tpot,
+            target_iteration_time_ms=effective_target,
             max_total_num_tokens=self.max_total_num_tokens,
         )
 

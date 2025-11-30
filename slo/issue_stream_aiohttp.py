@@ -25,6 +25,11 @@ python -m slo.issue_stream_aiohttp \
   --concurrency-per-worker 50
 """
 
+# Disable tokenizers parallelism BEFORE any imports to avoid fork warnings
+# Must be set at module level before tokenizer library is loaded
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import argparse
 import asyncio
 import csv
@@ -337,29 +342,41 @@ async def async_send_streaming_request(
         slo_satisfied = None
         slo_violations = 0
         slo_tokens_checked = 0
+        slo_badness_ms = None
         if ttft is not None and tpot is not None and len(all_token_times) > 0:
             slo_tokens_checked = len(all_token_times)
+            max_delay = 0.0  # Track maximum delay beyond deadline (in seconds)
             for i, token_time in enumerate(all_token_times):
                 # Token i should arrive by: start_time + ttft + i * tpot (in seconds)
                 deadline = start_time + (ttft / 1000.0) + (i * tpot / 1000.0)
-                if token_time > deadline:
+                delay = token_time - deadline
+                if delay > 0:
                     slo_violations += 1
+                    if delay > max_delay:
+                        max_delay = delay
             slo_satisfied = (slo_violations == 0)
+            slo_badness_ms = max_delay * 1000.0  # Convert to milliseconds
 
         # Alternative SLO check with 100ms slack: ignore first token, then check
         # each token i (i >= 1) arrives before first_token_time + 100ms + (i-1) * tpot
         tpot_with_100_slack = None
         tpot_slack_violations = 0
         tpot_slack_tokens_checked = 0
+        tpot_slack_badness_ms = None
         if tpot is not None and len(all_token_times) > 1 and first_token_time is not None:
             # Check tokens starting from index 1 (second token)
             tpot_slack_tokens_checked = len(all_token_times) - 1
+            max_delay = 0.0  # Track maximum delay beyond deadline (in seconds)
             for i in range(1, len(all_token_times)):
                 # Token i should arrive by: first_token_time + 100ms + (i-1) * tpot (in seconds)
                 deadline = first_token_time + 0.1 + ((i - 1) * tpot / 1000.0)
-                if all_token_times[i] > deadline:
+                delay = all_token_times[i] - deadline
+                if delay > 0:
                     tpot_slack_violations += 1
+                    if delay > max_delay:
+                        max_delay = delay
             tpot_with_100_slack = (tpot_slack_violations == 0)
+            tpot_slack_badness_ms = max_delay * 1000.0  # Convert to milliseconds
 
         # Build log record with logical field ordering
         record = {
@@ -384,12 +401,14 @@ async def async_send_streaming_request(
             record["slo_satisfied"] = slo_satisfied
             record["slo_violations"] = slo_violations
             record["slo_tokens_checked"] = slo_tokens_checked
+            record["slo_badness_ms"] = round(slo_badness_ms, 2) if slo_badness_ms is not None else None
             stats.record_slo_result(slo_tier_label, slo_satisfied)
         # Add alternative SLO check results
         if tpot_with_100_slack is not None:
             record["tpot_with_100_slack"] = tpot_with_100_slack
             record["tpot_slack_violations"] = tpot_slack_violations
             record["tpot_slack_tokens_checked"] = tpot_slack_tokens_checked
+            record["tpot_slack_badness_ms"] = round(tpot_slack_badness_ms, 2) if tpot_slack_badness_ms is not None else None
         # Append detailed timing and text at the end
         record["intervals"] = first_20_intervals
         record["output_text"] = output_text[:100]  # Only log first 100 chars
@@ -959,6 +978,10 @@ def parse_args():
 
 
 def main():
+    # Disable tokenizers parallelism to avoid warnings when forking
+    # The multiprocessing provides parallelism at the process level
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
     # Set multiprocessing start method
     # Use 'fork' on Unix for fast process creation (0.1s vs 4s per process)
     # Fall back to 'spawn' on Windows or if fork is unavailable

@@ -544,6 +544,13 @@ async def set_tpot(obj: SetTPOTReqInput, request: Request):
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    # Apply SLO target margin if configured
+    if _global_state.tokenizer_manager.server_args.slo_target_margin > 0:
+        if obj.target_ttft_ms is not None:
+            obj.target_ttft_ms = obj.target_ttft_ms * (1 - _global_state.tokenizer_manager.server_args.slo_target_margin)
+        if obj.target_tpot_ms is not None:
+            obj.target_tpot_ms = obj.target_tpot_ms * (1 - _global_state.tokenizer_manager.server_args.slo_target_margin)
+
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:

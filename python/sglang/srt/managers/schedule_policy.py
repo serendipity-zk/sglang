@@ -91,6 +91,14 @@ class CacheAgnosticPolicy(Enum):
     RANDOM = "random"
 
 
+class PrefillScheduleMode(Enum):
+    """Prefill scheduling mode for SLO-aware scheduling."""
+
+    BUDGET = "budget"        # Default: fill up to max_prefill_tokens (original behavior)
+    PREDICTOR = "predictor"  # Use cycle_time_predictor binary search per-request
+    SIMULATION = "simulation"  # Use prefill_sim_engine execution plan
+
+
 class SchedulePolicy:
     Policy = Union[CacheAwarePolicy, CacheAgnosticPolicy]
 

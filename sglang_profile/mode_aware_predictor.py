@@ -19,6 +19,9 @@ import json
 from pathlib import Path
 from typing import List, Tuple
 import numpy as np
+import csv
+from datetime import datetime
+import os
 
 
 # ---------- Trilinear interpolation ----------
@@ -180,6 +183,7 @@ class ModeAwarePredictor:
         W0: float = 4.0,
         max_correction: float = np.inf,
         log_every: int = 100,
+        csv_log_path: str = None,
     ):
         """
         Args:
@@ -193,6 +197,7 @@ class ModeAwarePredictor:
             W0: Confidence threshold for adaptive alpha
             max_correction: Maximum absolute correction value
             log_every: Log statistics every N samples
+            csv_log_path: Path to CSV log file (if None, uses default)
         """
         # Load grid model
         self.grid_path = grid_path
@@ -288,7 +293,22 @@ class ModeAwarePredictor:
         self._sum_abs_err = 0.0
         self._window_errs = []
 
+        # CSV logger for predict and submit calls
+        if csv_log_path is None:
+            csv_log_path = f"mode_aware_predictor_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        self.csv_log_path = csv_log_path
+        self.csv_file = open(self.csv_log_path, 'w', newline='')
+        self.csv_writer = csv.writer(self.csv_file)
+        # Write CSV header
+        self.csv_writer.writerow([
+            'timestamp', 'operation', 'mode', 'batch_size_tokens', 'prefill_chunk_pairs',
+            'kv_tokens_used', 'x', 'y', 'z', 'grid_pred', 'correction', 'n_neighbors',
+            'final_prediction', 'actual_time_ms', 'abs_error'
+        ])
+        self.csv_file.flush()
+
         print(f"  Bias correction: α={alpha}, k={k}, r={radius}, h={bandwidth}, half_life={half_life}, W0={W0}")
+        print(f"  CSV logging to: {self.csv_log_path}")
 
     def _compute_y_scalar(self, prefill_chunk_pairs: List[List[int]]) -> float:
         """
@@ -348,10 +368,30 @@ class ModeAwarePredictor:
         grid_pred = float(trilinear_predict(x, y, z, X_knots, Y_knots, Z_knots, grid))
 
         # Local bias correction
-        correction, _ = bias_corrector.correction(x, y, z)
+        correction, n_neighbors = bias_corrector.correction(x, y, z)
 
         # Final prediction (ensure non-negative)
         final_pred = max(0.0, grid_pred + correction)
+
+        # Log to CSV
+        self.csv_writer.writerow([
+            datetime.now().isoformat(),
+            'predict',
+            mode if self.is_multimode else 'single',
+            batch_size_tokens,
+            str(prefill_chunk_pairs),
+            kv_tokens_used,
+            x,
+            y,
+            z,
+            grid_pred,
+            correction,
+            n_neighbors,
+            final_pred,
+            '',  # actual_time_ms (not available for predict)
+            ''   # abs_error (not available for predict)
+        ])
+        self.csv_file.flush()
 
         return final_pred
 
@@ -420,10 +460,10 @@ class ModeAwarePredictor:
                 grid_preds = trilinear_predict(xs, ys, zs, X_knots, Y_knots, Z_knots, grid)
 
                 for offset, idx in enumerate(indices):
-                    correction, _ = bias_corrector.correction(
-                        float(xs[offset]), float(ys[offset]), float(zs[offset])
-                    )
-                    preds[idx] = max(0.0, float(grid_preds[offset]) + correction)
+                    # correction, _ = bias_corrector.correction(
+                    #     float(xs[offset]), float(ys[offset]), float(zs[offset])
+                    # )
+                    preds[idx] = max(0.0, float(grid_preds[offset]) + 0)
 
         else:
             X_knots = self.X_knots
@@ -506,6 +546,9 @@ class ModeAwarePredictor:
         # Compute base grid prediction (without bias correction)
         grid_pred = float(trilinear_predict(x, y, z, X_knots, Y_knots, Z_knots, grid))
 
+        # Get current correction before update
+        correction, n_neighbors = bias_corrector.correction(x, y, z)
+
         # Residual relative to base grid (this is what we correct)
         residual = float(iteration_time_ms) - grid_pred
 
@@ -519,6 +562,26 @@ class ModeAwarePredictor:
         self._window_errs.append(abs_err)
         if len(self._window_errs) > self.log_every:
             self._window_errs.pop(0)
+
+        # Log to CSV
+        self.csv_writer.writerow([
+            datetime.now().isoformat(),
+            'submit',
+            mode if self.is_multimode else 'single',
+            batch_size_tokens,
+            str(prefill_chunk_pairs),
+            kv_tokens_used,
+            x,
+            y,
+            z,
+            grid_pred,
+            correction,
+            n_neighbors,
+            y_pred,
+            iteration_time_ms,
+            abs_err
+        ])
+        self.csv_file.flush()
 
         # Logging
         if self._n_seen % self.log_every == 0:
@@ -548,3 +611,11 @@ class ModeAwarePredictor:
     def mean_abs_err_cum(self) -> float:
         """Cumulative mean absolute error."""
         return self._sum_abs_err / self._n_seen if self._n_seen > 0 else 0.0
+
+    def __del__(self):
+        """Close CSV file on cleanup."""
+        if hasattr(self, 'csv_file') and self.csv_file:
+            try:
+                self.csv_file.close()
+            except Exception:
+                pass

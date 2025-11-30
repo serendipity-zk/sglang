@@ -184,6 +184,7 @@ class ServerArgs:
     schedule_low_priority_values_first: bool = False
     priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
+    slo_target_margin: float = 0.03  # 3% margin subtracted from target tpot/ttft
     page_size: Optional[int] = None
     hybrid_kvcache_ratio: Optional[float] = None
     swa_full_tokens_ratio: float = 0.8
@@ -239,6 +240,7 @@ class ServerArgs:
     # Cycle time predictor configuration
     predictor_type: str = "grid"
     predictor_grid_path: str = "/sgl-workspace/sglang/profile/grid3d.json"
+    prefill_schedule_mode: str = "budget"  # "budget", "predictor", "simulation"
 
     # API related
     api_key: Optional[str] = None
@@ -1361,6 +1363,12 @@ class ServerArgs:
             help="How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
         )
         parser.add_argument(
+            "--slo-target-margin",
+            type=float,
+            default=ServerArgs.slo_target_margin,
+            help="Margin to subtract from target_tpot_ms and target_ttft_ms. Default is 0.03 (3%%). Set to 0 to disable.",
+        )
+        parser.add_argument(
             "--page-size",
             type=int,
             default=ServerArgs.page_size,
@@ -1662,6 +1670,13 @@ class ServerArgs:
             type=str,
             default=ServerArgs.predictor_grid_path,
             help="Path to grid3d.json file for cycle time predictor",
+        )
+        parser.add_argument(
+            "--prefill-schedule-mode",
+            type=str,
+            default=ServerArgs.prefill_schedule_mode,
+            choices=["budget", "predictor", "simulation"],
+            help="Prefill scheduling strategy: budget (greedy fill), predictor (TPOT-aware binary search), simulation (plan-guided)",
         )
 
         # API related
