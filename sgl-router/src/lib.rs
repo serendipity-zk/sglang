@@ -108,10 +108,8 @@ struct Router {
     model_path: Option<String>,
     // Explicit tokenizer path
     tokenizer_path: Option<String>,
-    // Scheduler configuration
-    scheduler: SchedulerType,
-    scheduler_tpot_buckets: Option<Vec<f32>>,
-    worker_selection_policy: Option<String>,
+    // Scheduler configuration (JSON string)
+    scheduler_config: Option<String>,
 }
 
 impl Router {
@@ -174,31 +172,20 @@ impl Router {
         // Convert main policy
         let policy = convert_policy(&self.policy);
 
-        // Convert scheduler configuration
-        let scheduler = match &self.scheduler {
-            SchedulerType::Eager => config::SchedulerConfig::Eager,
-            SchedulerType::Gated => config::SchedulerConfig::Gated,
-            SchedulerType::SloAware => {
-                // Parse worker selection policy from JSON string if provided
-                let policy = match &self.worker_selection_policy {
-                    Some(json_str) => {
-                        Some(serde_json::from_str::<config::WorkerSelectionPolicy>(json_str)
-                            .map_err(|e| config::ConfigError::InvalidValue {
-                                field: "worker_selection_policy".to_string(),
-                                value: json_str.clone(),
-                                reason: format!("Failed to parse JSON: {}", e),
-                            })?)
-                    }
-                    None => None,
-                };
-
-                config::SchedulerConfig::SloAware {
-                    tpot_buckets: self
-                        .scheduler_tpot_buckets
-                        .clone()
-                        .unwrap_or_else(|| vec![10.0, 50.0]),
-                    worker_selection_policy: policy,
-                }
+        // Parse scheduler configuration from JSON string
+        let scheduler = match &self.scheduler_config {
+            Some(json_str) => {
+                // Parse the entire SchedulerConfig from JSON
+                serde_json::from_str::<config::SchedulerConfig>(json_str)
+                    .map_err(|e| config::ConfigError::InvalidValue {
+                        field: "scheduler_config".to_string(),
+                        value: json_str.clone(),
+                        reason: format!("Failed to parse scheduler config JSON: {}", e),
+                    })?
+            }
+            None => {
+                // Default to eager scheduler if no config provided
+                config::SchedulerConfig::Eager
             }
         };
 
@@ -346,9 +333,7 @@ impl Router {
         model_path = None,
         tokenizer_path = None,
         // Scheduler defaults
-        scheduler = SchedulerType::Eager,
-        scheduler_tpot_buckets = None,
-        worker_selection_policy = None,
+        scheduler_config = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -408,9 +393,7 @@ impl Router {
         rate_limit_tokens_per_second: Option<usize>,
         model_path: Option<String>,
         tokenizer_path: Option<String>,
-        scheduler: SchedulerType,
-        scheduler_tpot_buckets: Option<Vec<f32>>,
-        worker_selection_policy: Option<String>,
+        scheduler_config: Option<String>,
     ) -> PyResult<Self> {
         // Determine connection mode from worker URLs
         let mut all_urls = worker_urls.clone();
@@ -487,9 +470,7 @@ impl Router {
             connection_mode,
             model_path,
             tokenizer_path,
-            scheduler,
-            scheduler_tpot_buckets,
-            worker_selection_policy,
+            scheduler_config,
         })
     }
 

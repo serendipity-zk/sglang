@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{info, warn};
 
-use crate::config::types::WorkerSelectionPolicy;
+use crate::config::types::{AutoScalingConfig, WorkerSelectionPolicy};
 use crate::core::{Worker, WorkerId, WorkerStats};
 use crate::routers::http::scheduler::{PendingRequest, SchedulerConfig};
 use crate::ui::RouterUi;
@@ -33,6 +33,8 @@ pub struct SloAwareScheduler {
     last_schedule_duration_us: AtomicU64,
     /// Worker selection policy configuration
     policy: WorkerSelectionPolicy,
+    /// Auto-scaling configuration (if enabled)
+    auto_scaling: Option<AutoScalingConfig>,
 }
 
 impl SloAwareScheduler {
@@ -40,6 +42,7 @@ impl SloAwareScheduler {
         _policy_registry: Arc<crate::policies::PolicyRegistry>,
         tpot_buckets: Vec<f32>,
         policy: WorkerSelectionPolicy,
+        auto_scaling: Option<AutoScalingConfig>,
     ) -> Self {
         let tier_workers = Arc::new(DashMap::new());
         let tier_queue_sizes = Arc::new(DashMap::new());
@@ -60,6 +63,7 @@ impl SloAwareScheduler {
             tier_queue_sizes,
             last_schedule_duration_us: AtomicU64::new(0),
             policy,
+            auto_scaling,
         }
     }
 
@@ -191,10 +195,87 @@ impl SloAwareScheduler {
         self.last_schedule_duration_us.load(Ordering::Relaxed)
     }
 
+    /// Calculate TPOT value for a given tier index
+    /// - For SLO tiers (0..tpot_buckets.len()): returns the upper bound of that tier
+    /// - For idle tier (tpot_buckets.len()): returns idle_tpot_ms from config (default 1000.0)
+    fn calculate_tpot_for_tier(&self, tier_idx: usize) -> f64 {
+        let idle_tier_idx = self.tpot_buckets.len();
+
+        if tier_idx < idle_tier_idx {
+            // SLO tier - use the upper bound
+            self.tpot_buckets[tier_idx] as f64
+        } else {
+            // Idle tier - use configured idle TPOT (default 1000.0)
+            self.auto_scaling
+                .as_ref()
+                .map(|config| config.idle_tpot_ms)
+                .unwrap_or(1000.0)
+        }
+    }
+
+    /// Send TPOT update to a worker (fire-and-forget HTTP POST to /set_tpot)
+    /// Only sends if auto_scaling is enabled and send_tpot_updates is true
+    fn send_tpot_update(&self, worker_url: &str, tpot_ms: f64) {
+        // Check if auto-scaling and TPOT updates are enabled
+        let should_send = self.auto_scaling
+            .as_ref()
+            .map(|config| config.enabled && config.send_tpot_updates)
+            .unwrap_or(false);
+
+        if !should_send {
+            return;
+        }
+
+        // Fire-and-forget HTTP POST to /set_tpot endpoint
+        let url = format!("{}/set_tpot", worker_url.trim_end_matches('/'));
+        let tpot_value = tpot_ms;
+
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let payload = serde_json::json!({
+                "tpot": tpot_value
+            });
+
+            match client
+                .post(&url)
+                .json(&payload)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        tracing::debug!("Successfully sent TPOT update to {}: {} ms", url, tpot_value);
+                    } else {
+                        tracing::warn!(
+                            "Failed to send TPOT update to {}: HTTP {}",
+                            url,
+                            response.status()
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Error sending TPOT update to {}: {}", url, e);
+                }
+            }
+        });
+    }
+
     /// Dynamic worker reclassification based on load
     /// - Move workers with batch_size=0 to idle tier
     /// - Assign idle workers to tiers with pending queues
     fn schedule_worker(&self, worker_registry: &Arc<crate::core::WorkerRegistry>) {
+        // Check if auto-scaling is enabled
+        let auto_scaling_enabled = self.auto_scaling
+            .as_ref()
+            .map(|config| config.enabled)
+            .unwrap_or(false);
+
+        if !auto_scaling_enabled {
+            // Auto-scaling disabled - skip dynamic tier reassignment
+            return;
+        }
+
         let idle_tier_idx = self.tpot_buckets.len();
 
         // Get current worker stats
@@ -232,7 +313,13 @@ impl SloAwareScheduler {
             self.tier_workers
                 .entry(idle_tier_idx)
                 .or_insert_with(Vec::new)
-                .push(worker_id);
+                .push(worker_id.clone());
+
+            // Send TPOT update if auto-scaling is enabled
+            if let Some(worker) = worker_registry.get(&worker_id) {
+                let new_tpot = self.calculate_tpot_for_tier(idle_tier_idx);
+                self.send_tpot_update(worker.url(), new_tpot);
+            }
         }
 
         // Step 2: Find tiers with pending queues and assign idle workers
@@ -270,6 +357,12 @@ impl SloAwareScheduler {
                     .entry(*target_tier_idx)
                     .or_insert_with(Vec::new)
                     .push(idle_worker_id.clone());
+
+                // Send TPOT update if auto-scaling is enabled
+                if let Some(worker) = worker_registry.get(idle_worker_id) {
+                    let new_tpot = self.calculate_tpot_for_tier(*target_tier_idx);
+                    self.send_tpot_update(worker.url(), new_tpot);
+                }
             }
         }
     }

@@ -235,6 +235,36 @@ impl Default for WorkerSelectionPolicy {
     }
 }
 
+/// Auto-scaling configuration for SLO-aware scheduler
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoScalingConfig {
+    /// Enable auto-scaling (dynamic worker tier assignment based on load)
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Send TPOT updates to worker's /set_tpot endpoint when tier changes
+    #[serde(default)]
+    pub send_tpot_updates: bool,
+
+    /// TPOT value (in ms) to set when worker is idle
+    #[serde(default = "default_idle_tpot_ms")]
+    pub idle_tpot_ms: f64,
+}
+
+fn default_idle_tpot_ms() -> f64 {
+    1000.0
+}
+
+impl Default for AutoScalingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            send_tpot_updates: false,
+            idle_tpot_ms: 1000.0,
+        }
+    }
+}
+
 /// Scheduler configuration for different scheduling strategies
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -255,6 +285,9 @@ pub enum SchedulerConfig {
         /// Worker selection policy configuration (optional, defaults to FirstAvailable)
         #[serde(skip_serializing_if = "Option::is_none")]
         worker_selection_policy: Option<WorkerSelectionPolicy>,
+        /// Auto-scaling configuration (optional, defaults to disabled)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        auto_scaling: Option<AutoScalingConfig>,
     },
 }
 

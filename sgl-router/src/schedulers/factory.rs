@@ -24,13 +24,14 @@ impl SchedulerFactory {
         match config {
             SchedulerConfig::Eager => Arc::new(EagerScheduler::new()),
             SchedulerConfig::Gated => Arc::new(GatedScheduler::new()),
-            SchedulerConfig::SloAware { tpot_buckets, worker_selection_policy } => {
+            SchedulerConfig::SloAware { tpot_buckets, worker_selection_policy, auto_scaling } => {
                 let policy = worker_selection_policy.clone()
                     .unwrap_or(WorkerSelectionPolicy::FirstAvailable);
                 Arc::new(SloAwareScheduler::new(
                     policy_registry,
                     tpot_buckets.clone(),
                     policy,
+                    auto_scaling.clone(),
                 ))
             },
         }
@@ -44,10 +45,12 @@ impl SchedulerFactory {
             "slo_aware" => {
                 // Default buckets: <10ms, 10-50ms, >50ms
                 // Default policy: FirstAvailable
+                // Default auto-scaling: disabled
                 Arc::new(SloAwareScheduler::new(
                     policy_registry,
                     vec![10.0, 50.0],
                     WorkerSelectionPolicy::FirstAvailable,
+                    None,
                 ))
             }
             _ => {

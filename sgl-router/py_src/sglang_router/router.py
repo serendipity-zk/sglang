@@ -131,24 +131,24 @@ class Router:
         )
         args_dict["prefill_policy"] = policy_from_str(args_dict["prefill_policy"])
         args_dict["decode_policy"] = policy_from_str(args_dict["decode_policy"])
-        args_dict["scheduler"] = scheduler_from_str(args_dict["scheduler"])
 
-        # Load worker selection policy from JSON file if provided
-        if args_dict.get("worker_selection_policy_file"):
-            policy_path = Path(args_dict["worker_selection_policy_file"])
-            if policy_path.exists():
-                with policy_path.open("r", encoding="utf-8") as f:
-                    policy_config = json.load(f)
+        # Load scheduler config from JSON file if provided
+        if args_dict.get("scheduler_config_file"):
+            config_path = Path(args_dict["scheduler_config_file"])
+            if config_path.exists():
+                with config_path.open("r", encoding="utf-8") as f:
+                    scheduler_config = json.load(f)
                 # Pass as JSON string to Rust
-                args_dict["worker_selection_policy"] = json.dumps(policy_config)
+                args_dict["scheduler_config"] = json.dumps(scheduler_config)
             else:
-                raise ValueError(f"Worker selection policy file not found: {policy_path}")
+                raise ValueError(f"Scheduler config file not found: {config_path}")
         else:
-            args_dict["worker_selection_policy"] = None
+            # No config file - will default to eager scheduler in Rust
+            args_dict["scheduler_config"] = None
 
-        # remove mini_lb parameter and policy file path (we converted it to policy dict)
+        # remove mini_lb parameter and scheduler config file path (we converted it to config dict)
         args_dict.pop("mini_lb")
-        args_dict.pop("worker_selection_policy_file", None)
+        args_dict.pop("scheduler_config_file", None)
 
         return Router(_Router(**args_dict))
 
