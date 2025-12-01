@@ -6,6 +6,7 @@ use rand::Rng;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_pickle as pickle;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -17,7 +18,7 @@ use tokenizers::Tokenizer;
 
 // --- Configuration ---
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(long)]
@@ -46,6 +47,9 @@ struct Args {
 
     #[arg(long, default_value = "output.jsonl")]
     log_path: String,
+
+    #[arg(long)]
+    elapsed_dump_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,18 +88,16 @@ struct LogRecord {
     slo_tokens_checked: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     slo_badness_ms: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tpot_with_100_slack: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tpot_slack_violations: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tpot_slack_tokens_checked: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tpot_slack_badness_ms: Option<f64>,
     intervals: Vec<f64>,
     output_text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct TokenElapsedTimeline {
+    request_id: String,
+    elapsed_ms: Vec<f64>,
 }
 
 // --- Global Shared State ---
@@ -168,6 +170,7 @@ struct AppState {
     args: Args,
     endpoint: String,
     stats: Arc<SharedStats>,
+    elapsed_dump_tx: Option<tokio::sync::mpsc::Sender<TokenElapsedTimeline>>,
 }
 
 // --- Helper Functions ---
@@ -296,6 +299,25 @@ async fn main() -> Result<()> {
         writer.flush().ok();
     });
 
+    // Optional: high-performance elapsed timeline dump (pickle stream)
+    let elapsed_dump_tx = if let Some(path) = args.elapsed_dump_path.clone() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TokenElapsedTimeline>(100_000);
+        tokio::spawn(async move {
+            let file = File::create(&path).expect("Failed to create elapsed dump file");
+            let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
+            let opts = pickle::SerOptions::new();
+            while let Some(timeline) = rx.recv().await {
+                if let Err(e) = pickle::to_writer(&mut writer, &timeline, opts.clone()) {
+                    eprintln!("Failed to write elapsed timeline: {}", e);
+                }
+            }
+            writer.flush().ok();
+        });
+        Some(tx)
+    } else {
+        None
+    };
+
     // 3. Build Components
     println!("Loading tokenizer and building token pool...");
     let token_pool = build_token_pool(&args.text_file, &args.tokenizer, 200_000)?;
@@ -319,9 +341,10 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         client,
         token_pool,
-        args: Args::parse(), // Clone for thread safety
+        args: args.clone(), // Clone for thread safety
         endpoint,
         stats: stats.clone(),
+        elapsed_dump_tx,
     });
 
     // 4. Load and Sort Trace
@@ -461,10 +484,6 @@ async fn process_request(
         slo_violations: None,
         slo_tokens_checked: None,
         slo_badness_ms: None,
-        tpot_with_100_slack: None,
-        tpot_slack_violations: None,
-        tpot_slack_tokens_checked: None,
-        tpot_slack_badness_ms: None,
         intervals: Vec::new(),
         output_text: String::new(),
         error: None,
@@ -583,62 +602,52 @@ async fn process_request(
                 // Keep first 20 intervals for logging (matching Python)
                 record.intervals = all_intervals.iter().take(20).map(|x| (x * 100.0).round() / 100.0).collect();
 
+                // Precompute per-token elapsed times relative to request start
+                let elapsed_ms_per_token: Vec<f64> = token_times
+                    .iter()
+                    .map(|t| t.duration_since(start_ts).as_secs_f64() * 1000.0)
+                    .collect();
+
                 // SLO check: verify each token i arrives before start_time + ttft + i * tpot
                 if let (Some(ttft_limit), Some(tpot_limit)) = (row.ttft, row.tpot) {
-                    if !token_times.is_empty() {
-                        let slo_tokens_checked = token_times.len();
-                        let mut slo_violations = 0;
-                        let mut max_delay = 0.0; // Track maximum delay beyond deadline (in seconds)
+                    if !elapsed_ms_per_token.is_empty() {
+                        let slo_tokens_checked = elapsed_ms_per_token.len();
+                        let mut violation_indices = Vec::new();
+                        let mut max_delay_ms = 0.0; // Track maximum delay beyond deadline (in ms)
+                        let mut delays_ms = Vec::with_capacity(slo_tokens_checked);
 
-                        for (i, &token_time) in token_times.iter().enumerate() {
-                            // Token i should arrive by: start_time + ttft + i * tpot (in seconds)
-                            let deadline = start_ts + Duration::from_secs_f64((ttft_limit + (i as f64 * tpot_limit)) / 1000.0);
-                            let delay = token_time.duration_since(deadline).as_secs_f64();
-                            if delay > 0.0 {
-                                slo_violations += 1;
-                                if delay > max_delay {
-                                    max_delay = delay;
+                        for (i, &elapsed_ms) in elapsed_ms_per_token.iter().enumerate() {
+                            // Token i should arrive by: ttft + i * tpot (in ms since request start)
+                            let deadline_ms = ttft_limit + (i as f64 * tpot_limit);
+                            let delay_ms = elapsed_ms - deadline_ms;
+                            if delay_ms > 0.0 {
+                                violation_indices.push(i);
+                                if delay_ms > max_delay_ms {
+                                    max_delay_ms = delay_ms;
                                 }
                             }
+                            delays_ms.push(delay_ms);
                         }
 
-                        record.slo_satisfied = Some(slo_violations == 0);
-                        record.slo_violations = Some(slo_violations);
+                        record.slo_satisfied = Some(violation_indices.is_empty());
+                        record.slo_violations = Some(violation_indices.len());
                         record.slo_tokens_checked = Some(slo_tokens_checked);
-                        record.slo_badness_ms = Some((max_delay * 1000.0 * 100.0).round() / 100.0);
+                        record.slo_badness_ms = Some((max_delay_ms * 100.0).round() / 100.0);
 
                         // Record SLO result to stats
                         let tier_label = format_slo_tier_label(row.tpot);
-                        state.stats.record_slo_result(tier_label, slo_violations == 0).await;
+                        state.stats.record_slo_result(tier_label, violation_indices.is_empty()).await;
                     }
                 }
 
-                // Alternative SLO check with 100ms slack (matching Python)
-                if let Some(tpot_limit) = row.tpot {
-                    if token_times.len() > 1 {
-                        if let Some(first_token_time) = first_token_ts {
-                            // Check tokens starting from index 1 (second token)
-                            let tpot_slack_tokens_checked = token_times.len() - 1;
-                            let mut tpot_slack_violations = 0;
-                            let mut max_delay = 0.0;
-
-                            for i in 1..token_times.len() {
-                                // Token i should arrive by: first_token_time + 100ms + (i-1) * tpot (in seconds)
-                                let deadline = first_token_time + Duration::from_secs_f64(0.1 + ((i - 1) as f64 * tpot_limit / 1000.0));
-                                let delay = token_times[i].duration_since(deadline).as_secs_f64();
-                                if delay > 0.0 {
-                                    tpot_slack_violations += 1;
-                                    if delay > max_delay {
-                                        max_delay = delay;
-                                    }
-                                }
-                            }
-
-                            record.tpot_with_100_slack = Some(tpot_slack_violations == 0);
-                            record.tpot_slack_violations = Some(tpot_slack_violations);
-                            record.tpot_slack_tokens_checked = Some(tpot_slack_tokens_checked);
-                            record.tpot_slack_badness_ms = Some((max_delay * 1000.0 * 100.0).round() / 100.0);
-                        }
+                // Emit elapsed timeline for post-hoc analysis if configured
+                if let Some(dump_tx) = state.elapsed_dump_tx.as_ref() {
+                    if !elapsed_ms_per_token.is_empty() {
+                        let timeline = TokenElapsedTimeline {
+                            request_id: req_id.clone(),
+                            elapsed_ms: elapsed_ms_per_token,
+                        };
+                        let _ = dump_tx.send(timeline).await;
                     }
                 }
             }

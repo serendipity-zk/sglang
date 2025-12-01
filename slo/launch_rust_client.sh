@@ -24,12 +24,13 @@
 # Path to the compiled Rust binary (release build for performance)
 RUST_BINARY="/sgl-workspace/sglang/slo/rust_client/target/release/slo_runner"
 
-# Build if not exists
-if [ ! -f "$RUST_BINARY" ]; then
-    echo "Release binary not found. Building..."
-    cd /sgl-workspace/sglang/slo/rust_client
+# Build if missing or sources changed
+cd /sgl-workspace/sglang/slo/rust_client
+if [ ! -f "$RUST_BINARY" ] || find src Cargo.toml -newer "$RUST_BINARY" | read; then
+    echo "Building release binary..."
     cargo build --release
 fi
+cd /sgl-workspace/sglang
 
 # Run the Rust client with HuggingFace tokenizer (matches Python version)
 # The tokenizer will be automatically downloaded from HuggingFace on first run
@@ -41,4 +42,5 @@ $RUST_BINARY \
   --model meta-llama/Llama-3.1-8B-Instruct \
   --rate 23.75 \
   --max-requests 1000 \
-  --log-path /sgl-workspace/sglang/slo/logs/rust_client_output.jsonl
+  --log-path /sgl-workspace/sglang/slo/logs/rust_client_output.jsonl \
+  --elapsed-dump-path /sgl-workspace/sglang/slo/logs/rust_elapsed_timelines.pkl
