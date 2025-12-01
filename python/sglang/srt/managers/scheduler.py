@@ -1926,6 +1926,7 @@ class Scheduler(
                 arrival_time_ms=arrival_time_ms,
             )
             req.tokenizer = self.tokenizer
+            logger.info(f"Received new request: rid={req.rid}, time={arrival_time_ms}, recv_time={time.time() * 1000.0}")
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode

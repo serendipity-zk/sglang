@@ -614,6 +614,7 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         _model_id: Option<&str>,
+        request_id: &str,
     ) -> Response {
         // Select router based on headers
         // GenerateRequest doesn't have a model field
@@ -621,7 +622,7 @@ impl RouterTrait for RouterManager {
 
         if let Some(router) = router {
             // In multi-model mode, pass None since GenerateRequest doesn't have model field
-            router.route_generate(headers, body, None).await
+            router.route_generate(headers, body, None, request_id).await
         } else {
             // Return 404 when no router is available for the request
             (
@@ -638,13 +639,14 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         _model_id: Option<&str>,
+        request_id: &str,
     ) -> Response {
         // Select router based on headers and model
         let router = self.select_router_for_request(headers, Some(&body.model));
 
         if let Some(router) = router {
             // In multi-model mode, pass the model_id to the router
-            router.route_chat(headers, body, Some(&body.model)).await
+            router.route_chat(headers, body, Some(&body.model), request_id).await
         } else {
             // Return 404 when the specified model is not found
             (
@@ -661,6 +663,7 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         _model_id: Option<&str>,
+        request_id: &str,
     ) -> Response {
         // Select router based on headers and model
         let router = self.select_router_for_request(headers, Some(&body.model));
@@ -668,7 +671,7 @@ impl RouterTrait for RouterManager {
         if let Some(router) = router {
             // In multi-model mode, pass the model_id to the router
             router
-                .route_completion(headers, body, Some(&body.model))
+                .route_completion(headers, body, Some(&body.model), request_id)
                 .await
         } else {
             // Return 404 when the specified model is not found
@@ -685,6 +688,7 @@ impl RouterTrait for RouterManager {
         _headers: Option<&HeaderMap>,
         _body: &ResponsesRequest,
         _model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
@@ -745,13 +749,14 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         body: &EmbeddingRequest,
         _model_id: Option<&str>,
+        request_id: &str,
     ) -> Response {
         // Select router based on headers and model
         let router = self.select_router_for_request(headers, Some(&body.model));
 
         if let Some(router) = router {
             router
-                .route_embeddings(headers, body, Some(&body.model))
+                .route_embeddings(headers, body, Some(&body.model), request_id)
                 .await
         } else {
             // Return 404 when the specified model is not found
@@ -769,12 +774,13 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         body: &RerankRequest,
         model_id: Option<&str>,
+        request_id: &str,
     ) -> Response {
         // Try to select a router based on headers
         let router = self.select_router_for_request(headers, None);
 
         if let Some(router) = router {
-            router.route_rerank(headers, body, model_id).await
+            router.route_rerank(headers, body, model_id, request_id).await
         } else {
             (
                 StatusCode::NOT_FOUND,

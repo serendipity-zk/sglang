@@ -47,11 +47,16 @@ pub trait SchedulerBase: Send + Sync + Debug + 'static {
             let msg_id = worker.next_message_id();
             let gen = worker.generation();
 
-            // Extract request_id from body for tracking
-            let request_id = request.body_json
-                .get("request_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            // Prefer middleware-provided request_id; fall back to payload if missing/empty
+            let request_id = if !request.request_id.is_empty() {
+                Some(request.request_id.clone())
+            } else {
+                request
+                    .body_json
+                    .get("request_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            };
 
             // Add pending message NOW, before spawning async task
             worker.add_pending_message(PendingMessage::new(
@@ -181,6 +186,7 @@ async fn process_pending<S: SchedulerBase + ?Sized>(
         model_id,
         is_stream,
         text: _,
+        request_id: _,
         enqueue_started: _,
         arrival_time_ms,
         response_tx,

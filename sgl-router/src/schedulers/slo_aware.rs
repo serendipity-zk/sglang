@@ -721,9 +721,15 @@ impl Scheduler for SloAwareScheduler {
                                     Some(queue_idx) => {
                                         // Valid request - add to appropriate queue
                                         let target_tpot_ms = request.target_tpot_ms;
+                                        let request_id = request.request_id.clone();
+
                                         queues[queue_idx].push_back(request);
                                         self.set_tier_queue_size(queue_idx, queues[queue_idx].len());
-                                        info!("Request added to queue {}: target_tpot={:?}", queue_idx, target_tpot_ms);
+                                        info!("Timestamp {}, request_id={}, Request added to queue {}: target_tpot={:?}",
+                                              chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+                                              request_id,
+                                              queue_idx,
+                                              target_tpot_ms);
                                     }
                                     None => {
                                         // Request should be rejected
@@ -773,6 +779,11 @@ impl Scheduler for SloAwareScheduler {
 
                         if receiver_closed && queues.iter().all(|queue| queue.is_empty()) {
                             break;
+                        }
+
+                        // Only log if tick took meaningful time (≥10μs)
+                        if duration_us >= 10 {
+                            info!("Timestamp {}, Scheduler tick completed after {} us", chrono::Utc::now().timestamp_millis() as f64 / 1000.0, duration_us);
                         }
                     }
                 }

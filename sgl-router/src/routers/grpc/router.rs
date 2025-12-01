@@ -206,6 +206,7 @@ impl RouterTrait for GrpcRouter {
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::GenerateRequest,
         _model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -215,6 +216,7 @@ impl RouterTrait for GrpcRouter {
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::ChatCompletionRequest,
         _model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -224,6 +226,7 @@ impl RouterTrait for GrpcRouter {
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::CompletionRequest,
         _model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -233,6 +236,7 @@ impl RouterTrait for GrpcRouter {
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::ResponsesRequest,
         _model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -250,6 +254,7 @@ impl RouterTrait for GrpcRouter {
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::EmbeddingRequest,
         _model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }
@@ -259,6 +264,7 @@ impl RouterTrait for GrpcRouter {
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::RerankRequest,
         _model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED).into_response()
     }

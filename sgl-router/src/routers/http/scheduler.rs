@@ -15,6 +15,8 @@ pub struct PendingRequest {
     pub model_id: Option<String>,
     pub is_stream: bool,
     pub text: String,
+    /// Request ID from middleware (for tracking and logging)
+    pub request_id: String,
     pub enqueue_started: std::time::Instant,
     /// Arrival time recorded at router ingress (ms since Unix epoch)
     pub arrival_time_ms: f64,

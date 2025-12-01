@@ -191,6 +191,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         _headers: Option<&HeaderMap>,
         _body: &GenerateRequest,
         _model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         // Generate endpoint is SGLang-specific, not supported for OpenAI backend
         (
@@ -205,6 +206,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         _model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         if !self.circuit_breaker.can_execute() {
             return (StatusCode::SERVICE_UNAVAILABLE, "Circuit breaker open").into_response();
@@ -334,6 +336,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         _headers: Option<&HeaderMap>,
         _body: &CompletionRequest,
         _model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         // Completion endpoint not implemented for OpenAI backend
         (
@@ -348,6 +351,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::ResponsesRequest,
         _model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
@@ -405,6 +409,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::EmbeddingRequest,
         _model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
@@ -418,6 +423,7 @@ impl super::super::RouterTrait for OpenAIRouter {
         _headers: Option<&HeaderMap>,
         _body: &RerankRequest,
         _model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,

@@ -470,6 +470,7 @@ impl Router {
         typed_req: &T,
         route: &str,
         model_id: Option<&str>,
+        request_id: &str,
     ) -> Response {
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
@@ -510,6 +511,7 @@ impl Router {
             model_id: model_id_owned,
             is_stream,
             text,
+            request_id: request_id.to_string(),
             enqueue_started: Instant::now(),
             arrival_time_ms,
             response_tx,
@@ -1109,8 +1111,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         model_id: Option<&str>,
+        request_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/generate", model_id)
+        self.route_typed_request(headers, body, "/generate", model_id, request_id)
             .await
     }
 
@@ -1119,8 +1122,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        request_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
+        self.route_typed_request(headers, body, "/v1/chat/completions", model_id, request_id)
             .await
     }
 
@@ -1129,8 +1133,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         model_id: Option<&str>,
+        request_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
+        self.route_typed_request(headers, body, "/v1/completions", model_id, request_id)
             .await
     }
 
@@ -1139,8 +1144,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &ResponsesRequest,
         model_id: Option<&str>,
+        request_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses", model_id)
+        self.route_typed_request(headers, body, "/v1/responses", model_id, request_id)
             .await
     }
 
@@ -1159,11 +1165,12 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &EmbeddingRequest,
         model_id: Option<&str>,
+        request_id: &str,
     ) -> Response {
         // Record embeddings-specific metrics in addition to general request metrics
         let start = Instant::now();
         let res = self
-            .route_typed_request(headers, body, "/v1/embeddings", model_id)
+            .route_typed_request(headers, body, "/v1/embeddings", model_id, request_id)
             .await;
 
         // Embedding specific metrics
@@ -1183,12 +1190,13 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &RerankRequest,
         model_id: Option<&str>,
+        request_id: &str,
     ) -> Response {
         if let Err(e) = body.validate() {
             return (StatusCode::BAD_REQUEST, e).into_response();
         }
         let response = self
-            .route_typed_request(headers, body, "/v1/rerank", model_id)
+            .route_typed_request(headers, body, "/v1/rerank", model_id, request_id)
             .await;
         if response.status().is_success() {
             match Self::build_rerank_response(body, response).await {

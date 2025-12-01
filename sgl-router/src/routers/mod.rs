@@ -76,6 +76,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         model_id: Option<&str>,
+        request_id: &str,
     ) -> Response;
 
     /// Route a chat completion request
@@ -84,6 +85,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        request_id: &str,
     ) -> Response;
 
     /// Route a completion request
@@ -92,6 +94,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         model_id: Option<&str>,
+        request_id: &str,
     ) -> Response;
 
     /// Route a responses request
@@ -100,6 +103,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &ResponsesRequest,
         model_id: Option<&str>,
+        request_id: &str,
     ) -> Response;
 
     /// Retrieve a stored/background response by id
@@ -136,6 +140,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &EmbeddingRequest,
         model_id: Option<&str>,
+        request_id: &str,
     ) -> Response;
 
     async fn route_rerank(
@@ -143,6 +148,7 @@ pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
         headers: Option<&HeaderMap>,
         body: &RerankRequest,
         model_id: Option<&str>,
+        request_id: &str,
     ) -> Response;
 
     /// Flush cache on all workers

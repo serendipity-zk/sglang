@@ -1773,6 +1773,7 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         // Extract parameters
         let is_stream = body.stream;
@@ -1815,6 +1816,7 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         // Extract parameters
         let is_stream = body.stream;
@@ -1856,6 +1858,7 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &CompletionRequest,
         model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         // Extract parameters
         let is_stream = body.stream;
@@ -1893,6 +1896,7 @@ impl RouterTrait for PDRouter {
         _headers: Option<&HeaderMap>,
         _body: &ResponsesRequest,
         _model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
@@ -1922,6 +1926,7 @@ impl RouterTrait for PDRouter {
         _headers: Option<&HeaderMap>,
         _body: &crate::protocols::spec::EmbeddingRequest,
         _model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
@@ -1935,6 +1940,7 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &RerankRequest,
         model_id: Option<&str>,
+        _request_id: &str,
     ) -> Response {
         // Extract text for cache-aware routing
         let req_text = if self.policies_need_request_text() {

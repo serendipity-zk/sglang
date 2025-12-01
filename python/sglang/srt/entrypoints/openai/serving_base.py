@@ -49,6 +49,12 @@ class OpenAIServingBase(ABC):
                 request, raw_request
             )
 
+            # Extract x-request-id from headers if rid is not provided
+            if adapted_request.rid is None and raw_request:
+                request_id = raw_request.headers.get("x-request-id")
+                if request_id:
+                    adapted_request.rid = request_id
+
             # Note(Xinyuan): raw_request below is only used for detecting the connection of the client
             if hasattr(request, "stream") and request.stream:
                 return await self._handle_streaming_request(

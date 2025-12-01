@@ -5,7 +5,7 @@ use crate::{
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
-    middleware::{self, QueuedRequest, TokenBucket},
+    middleware::{self, QueuedRequest, RequestId, TokenBucket},
     policies::PolicyRegistry,
     protocols::{
         spec::{
@@ -25,7 +25,7 @@ use crate::{
     tool_parser::ParserRegistry,
 };
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{Extension, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -176,6 +176,7 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
 // The RouterTrait now accepts optional headers and typed body directly
 async fn generate(
     State(state): State<Arc<AppState>>,
+    Extension(request_id): Extension<RequestId>,
     headers: http::HeaderMap,
     Json(body): Json<GenerateRequest>,
 ) -> Response {
@@ -183,7 +184,7 @@ async fn generate(
     RouterUi::inc_total_generate();
     let resp = state
         .router
-        .route_generate(Some(&headers), &body, None)
+        .route_generate(Some(&headers), &body, None, &request_id.0)
         .await;
     RouterUi::inc_finished_generate();
     resp
@@ -191,61 +192,67 @@ async fn generate(
 
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
+    Extension(request_id): Extension<RequestId>,
     headers: http::HeaderMap,
     Json(body): Json<ChatCompletionRequest>,
 ) -> Response {
-    state.router.route_chat(Some(&headers), &body, None).await
+    state.router.route_chat(Some(&headers), &body, None, &request_id.0).await
 }
 
 async fn v1_completions(
     State(state): State<Arc<AppState>>,
+    Extension(request_id): Extension<RequestId>,
     headers: http::HeaderMap,
     Json(body): Json<CompletionRequest>,
 ) -> Response {
     state
         .router
-        .route_completion(Some(&headers), &body, None)
+        .route_completion(Some(&headers), &body, None, &request_id.0)
         .await
 }
 
 async fn rerank(
     State(state): State<Arc<AppState>>,
+    Extension(request_id): Extension<RequestId>,
     headers: http::HeaderMap,
     Json(body): Json<RerankRequest>,
 ) -> Response {
-    state.router.route_rerank(Some(&headers), &body, None).await
+    state.router.route_rerank(Some(&headers), &body, None, &request_id.0).await
 }
 
 async fn v1_rerank(
     State(state): State<Arc<AppState>>,
+    Extension(request_id): Extension<RequestId>,
     headers: http::HeaderMap,
     Json(body): Json<V1RerankReqInput>,
 ) -> Response {
     state
         .router
-        .route_rerank(Some(&headers), &body.into(), None)
+        .route_rerank(Some(&headers), &body.into(), None, &request_id.0)
         .await
 }
 
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
+    Extension(request_id): Extension<RequestId>,
     headers: http::HeaderMap,
     Json(body): Json<ResponsesRequest>,
 ) -> Response {
     state
         .router
-        .route_responses(Some(&headers), &body, None)
+        .route_responses(Some(&headers), &body, None, &request_id.0)
         .await
 }
 
 async fn v1_embeddings(
     State(state): State<Arc<AppState>>,
+    Extension(request_id): Extension<RequestId>,
     headers: http::HeaderMap,
     Json(body): Json<EmbeddingRequest>,
 ) -> Response {
     state
         .router
-        .route_embeddings(Some(&headers), &body, None)
+        .route_embeddings(Some(&headers), &body, None, &request_id.0)
         .await
 }
 
