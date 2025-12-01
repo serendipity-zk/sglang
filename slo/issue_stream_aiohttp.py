@@ -226,11 +226,16 @@ async def async_send_streaming_request(
     output_text = ""  # Accumulated output text
     error_msg = None
     record = None  # Initialize record to avoid UnboundLocalError in finally block
+    post_timestamp = None
 
     try:
         timeout_obj = aiohttp.ClientTimeout(total=timeout if timeout > 0 else None)
+        post_timestamp = time.time()
 
-        async with session.post(endpoint_url, json=data, timeout=timeout_obj) as resp:
+        # Send request_id in headers so router can use it for tracking
+        headers = {"x-request-id": request_id}
+
+        async with session.post(endpoint_url, json=data, headers=headers, timeout=timeout_obj) as resp:
             resp.raise_for_status()
 
             # Low-latency streaming with readany() and manual line parsing
@@ -386,6 +391,7 @@ async def async_send_streaming_request(
             "real_output_len": output_token_count,  # Actual output tokens generated
             "status": "SUCCESS",
             "submit_timestamp": submit_timestamp,
+            "post_timestamp": post_timestamp,
             "total_duration_ms": round(total_duration_ms, 2),
             "ttft_ms": round(ttft_ms, 2) if ttft_ms is not None else None,
             "avg_interval_ms": round(avg_interval, 2) if avg_interval is not None else None,
@@ -429,6 +435,7 @@ async def async_send_streaming_request(
             "error": error_msg,
             "exception_type": type(e).__name__,
             "submit_timestamp": submit_timestamp,
+            "post_timestamp": post_timestamp,
             "total_duration_ms": round(total_duration_ms, 2),
             "chunk_count": chunk_count,  # Number of streaming chunks before failure
         }
@@ -519,10 +526,10 @@ async def worker_event_loop(
                 ttft = req_data.get("ttft")
                 tpot = req_data.get("tpot")
                 enqueue_timestamp = req_data.get("enqueue_timestamp")  # Get enqueue time from main process
+                request_id = req_data.get("request_id")
 
                 # Sample prompt
                 prompt_ids = sample_prompt_from_pool(token_pool, prefill, rng)
-                request_id = f"req_{idx:06d}_{int(time.time() * 1000) % 1000000:06d}"
 
                 # Record submission
                 stats.record_submit()
@@ -550,13 +557,14 @@ async def worker_event_loop(
             try:
                 # Non-blocking get with timeout
                 try:
-                    req_data = request_queue.get(timeout=0.001)
+                    req_data = request_queue.get(timeout=0.01)
                 except Exception:
                     # Queue is empty or other error - check if there are pending tasks
-                    if tasks:
-                        # Wait for some tasks to complete
-                        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                        tasks = list(pending)
+                    # if tasks:
+                    #     # Wait for some tasks to complete
+                    #     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    #     tasks = list(pending)
+                    await asyncio.sleep(0)
                     continue
 
                 # Sentinel value to stop worker
@@ -900,8 +908,10 @@ def run_trace(
             tpot = float(tpot_val) if tpot_val not in (None, "") else None
 
             # Put request in queue (record enqueue time for accurate rate tracking)
+            request_id = f"req_{idx:06d}"
             req_data = {
                 "idx": idx,
+                "request_id": request_id,
                 "prefill": prefill,
                 "decode": decode,
                 "ttft": ttft,
@@ -978,10 +988,6 @@ def parse_args():
 
 
 def main():
-    # Disable tokenizers parallelism to avoid warnings when forking
-    # The multiprocessing provides parallelism at the process level
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
     # Set multiprocessing start method
     # Use 'fork' on Unix for fast process creation (0.1s vs 4s per process)
     # Fall back to 'spawn' on Windows or if fork is unavailable
