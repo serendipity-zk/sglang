@@ -197,7 +197,14 @@ class SchedulerOutputProcessorMixin:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
 
-        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+        if getattr(batch, "iteration_id", None) is None:
+            batch.iteration_id = getattr(self, "iteration_count", 0) + 1
+        self.stream_output(
+            batch.reqs,
+            batch.return_logprob,
+            skip_stream_req,
+            getattr(batch, "iteration_id", None),
+        )
 
     def process_batch_result_decode(
         self: Scheduler,
@@ -224,6 +231,11 @@ class SchedulerOutputProcessorMixin:
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
+
+        # If iteration_id hasn't been set yet (e.g., overlap path before counter increment),
+        # default to the upcoming iteration number.
+        if getattr(batch, "iteration_id", None) is None:
+            batch.iteration_id = getattr(self, "iteration_count", 0) + 1
 
         self.token_to_kv_pool_allocator.free_group_begin()
 
@@ -295,7 +307,7 @@ class SchedulerOutputProcessorMixin:
                 req.grammar.finished = req.finished()
 
         self.set_next_batch_sampling_info_done(batch)
-        self.stream_output(batch.reqs, batch.return_logprob)
+        self.stream_output(batch.reqs, batch.return_logprob, iteration_id=getattr(batch, "iteration_id", None))
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
@@ -507,10 +519,13 @@ class SchedulerOutputProcessorMixin:
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
+        iteration_id: Optional[int] = None,
     ):
         """Stream the output to detokenizer."""
         if self.is_generation:
-            self.stream_output_generation(reqs, return_logprob, skip_req)
+            self.stream_output_generation(
+                reqs, return_logprob, skip_req, iteration_id
+            )
         else:  # embedding or reward model
             self.stream_output_embedding(reqs)
 
@@ -519,6 +534,7 @@ class SchedulerOutputProcessorMixin:
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
+        iteration_id: Optional[int] = None,
     ):
         rids = []
         finished_reasons: List[BaseFinishReason] = []
@@ -536,6 +552,7 @@ class SchedulerOutputProcessorMixin:
         cached_tokens = []
         spec_verify_ct = []
         output_hidden_states = None
+        start_iterations: List[Optional[int]] = []
 
         if return_logprob:
             input_token_logprobs_val = []
@@ -623,6 +640,7 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(req.output_ids))
                 cached_tokens.append(req.cached_tokens)
+                start_iterations.append(getattr(req, "start_iteration", None))
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
@@ -713,6 +731,22 @@ class SchedulerOutputProcessorMixin:
                 return
 
             now = time.time()
+            if iteration_id is None:
+                iteration_id = getattr(self, "iteration_count", None)
+            if iteration_id is None:
+                logger.warning(
+                    "BatchTokenIDOut missing iteration_id; sample rids=%s (count=%d); batch_has_attr=%s",
+                    rids[:3],
+                    len(rids),
+                    hasattr(skip_req, "iteration_id"),
+                )
+            else:
+                logger.warning(
+                    "BatchTokenIDOut iteration_id=%s for %d rids (sample=%s)",
+                    iteration_id,
+                    len(rids),
+                    rids[:3],
+                )
             # delta_ms = (
             #     None
             #     if self._last_detokenizer_submit_time is None
@@ -728,37 +762,46 @@ class SchedulerOutputProcessorMixin:
             #     total_new_tokens,
             # )
             self._last_detokenizer_submit_time = now
+            if iteration_id is None:
+                logger.warning(
+                    "BatchTokenIDOut missing iteration_id; sample rids=%s (count=%d)",
+                    rids[:3],
+                    len(rids),
+                )
 
             self.send_to_detokenizer.send_pyobj(
                 BatchTokenIDOut(
-                    rids,
-                    finished_reasons,
-                    decoded_texts,
-                    decode_ids_list,
-                    read_offsets,
-                    output_ids,
-                    skip_special_tokens,
-                    spaces_between_special_tokens,
-                    no_stop_trim,
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_tokens,
-                    spec_verify_ct,
-                    input_token_logprobs_val,
-                    input_token_logprobs_idx,
-                    output_token_logprobs_val,
-                    output_token_logprobs_idx,
-                    input_top_logprobs_val,
-                    input_top_logprobs_idx,
-                    output_top_logprobs_val,
-                    output_top_logprobs_idx,
-                    input_token_ids_logprobs_val,
-                    input_token_ids_logprobs_idx,
-                    output_token_ids_logprobs_val,
-                    output_token_ids_logprobs_idx,
-                    output_hidden_states,
+                    rids=rids,
+                    finished_reasons=finished_reasons,
+                    decoded_texts=decoded_texts,
+                    decode_ids=decode_ids_list,
+                    read_offsets=read_offsets,
+                    output_ids=output_ids,
+                    skip_special_tokens=skip_special_tokens,
+                    spaces_between_special_tokens=spaces_between_special_tokens,
+                    no_stop_trim=no_stop_trim,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    cached_tokens=cached_tokens,
+                    spec_verify_ct=spec_verify_ct,
+                    input_token_logprobs_val=input_token_logprobs_val,
+                    input_token_logprobs_idx=input_token_logprobs_idx,
+                    output_token_logprobs_val=output_token_logprobs_val,
+                    output_token_logprobs_idx=output_token_logprobs_idx,
+                    input_top_logprobs_val=input_top_logprobs_val,
+                    input_top_logprobs_idx=input_top_logprobs_idx,
+                    output_top_logprobs_val=output_top_logprobs_val,
+                    output_top_logprobs_idx=output_top_logprobs_idx,
+                    input_token_ids_logprobs_val=input_token_ids_logprobs_val,
+                    input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
+                    output_token_ids_logprobs_val=output_token_ids_logprobs_val,
+                    output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
+                    output_hidden_states=output_hidden_states,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
+                    start_iterations=start_iterations,
+                    iteration_id=iteration_id,
+                    server_id=getattr(self, "worker_id", None),
                 )
             )
 

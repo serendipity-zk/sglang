@@ -463,6 +463,7 @@ class Req:
         router_generation: Optional[int] = None,
         router_message_id: Optional[int] = None,
         arrival_time_ms: Optional[float] = None,
+        start_iteration: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -667,6 +668,8 @@ class Req:
 
         # Router-observed arrival time in milliseconds since unix epoch
         self.arrival_time_ms = arrival_time_ms
+        # Scheduler iteration counter snapshot when the request was accepted
+        self.start_iteration = start_iteration
 
     @property
     def seqlen(self):

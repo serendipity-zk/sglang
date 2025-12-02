@@ -224,7 +224,7 @@ def start_proc(cmd, env=None, prefix="proc", logfile_path="worker.log", echo_con
     log_handle = stream_output(proc, prefix, logfile_path, echo_console=echo_console)
     return proc, log_handle
 
-def kill_proc_tree(proc: Popen, grace=10):
+def kill_proc_tree(proc: Popen, grace=1):
     """优雅退出：SIGINT -> 等待 -> SIGTERM -> 等待 -> SIGKILL"""
     if proc.poll() is not None:
         return
@@ -241,7 +241,7 @@ def kill_proc_tree(proc: Popen, grace=10):
         os.killpg(proc.pid, signal.SIGTERM)
     except ProcessLookupError:
         return
-    for _ in range(25):
+    for _ in range(5):
         if proc.poll() is not None:
             return
         time.sleep(0.2)

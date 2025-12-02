@@ -1420,6 +1420,15 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.server_args.weight_version,
             }
+            server_id = getattr(recv_obj, "server_id", None)
+            iteration_id = getattr(recv_obj, "iteration_id", None)
+            start_iterations = getattr(recv_obj, "start_iterations", None)
+            if server_id is not None:
+                meta_info["server_id"] = server_id
+            if iteration_id is not None:
+                meta_info["iteration_id"] = iteration_id
+            if start_iterations is not None and len(start_iterations) > i:
+                meta_info["start_iteration"] = start_iterations[i]
 
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(

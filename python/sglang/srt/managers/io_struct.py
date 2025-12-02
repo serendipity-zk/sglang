@@ -862,6 +862,10 @@ class BatchTokenIDOut:
     # val is the length of padded tokens after expansion.
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+    # Global scheduler iteration data
+    start_iterations: Optional[List[Optional[int]]] = None
+    iteration_id: Optional[int] = None
+    server_id: Optional[str] = None
 
 
 @dataclass
@@ -929,6 +933,10 @@ class BatchStrOut:
 
     placeholder_tokens_idx: List[Optional[List[int]]]
     placeholder_tokens_val: List[Optional[List[int]]]
+    # Global scheduler iteration data
+    start_iterations: Optional[List[Optional[int]]] = None
+    iteration_id: Optional[int] = None
+    server_id: Optional[str] = None
 
 
 @dataclass

@@ -299,6 +299,7 @@ class Scheduler(
         # Track idle reporting cadence
         self._last_idle_router_report_time: Optional[float] = None
         self._idle_router_report_interval = 0.02  # seconds
+        self.last_cycle_time_prediction = 0
 
         # Timestamp of the last completed process_batch_result call
         self._last_process_result_end_time: Optional[float] = None
@@ -874,7 +875,8 @@ class Scheduler(
         now_ms = time.time() * 1000.0
         running_slacks: List[Dict[str, Union[str, float]]] = []
         queue_slacks: List[Dict[str, Union[str, float]]] = []
-        decode_slacks: List[float] = []
+        min_decode_slack_val: Optional[float] = None
+        min_decode_slack_rid: Optional[str] = None
 
         for req in batch.reqs or []:
             slack = self._compute_req_slack_ms(req, now_ms=now_ms)
@@ -893,7 +895,9 @@ class Scheduler(
                     or (batch.forward_mode == ForwardMode.MIXED and decoding_reqs and req in decoding_reqs)
                 )
                 if is_decode:
-                    decode_slacks.append(slack)
+                    if min_decode_slack_val is None or slack < min_decode_slack_val:
+                        min_decode_slack_val = slack
+                        min_decode_slack_rid = req.rid
 
         for req in self.waiting_queue:
             slack = self._compute_req_slack_ms(req, now_ms=now_ms)
@@ -924,8 +928,10 @@ class Scheduler(
             metrics["running_slack_ms"] = batch_slack_stats
         if queue_slack_stats:
             metrics["queue_slack_ms"] = queue_slack_stats
-        if decode_slacks:
-            metrics["min_decode_slack_ms"] = round(min(decode_slacks), 2)
+        if min_decode_slack_val is not None:
+            metrics["min_decode_slack_ms"] = round(min_decode_slack_val, 2)
+            if min_decode_slack_rid is not None:
+                metrics["min_decode_slack_rid"] = min_decode_slack_rid
 
         if running_slacks or queue_slacks:
             combined = [
@@ -1382,6 +1388,7 @@ class Scheduler(
                 logger.info(f"before report metrics: {iteration_time_ms}")
                 # Increment iteration counter for completed iteration
                 self.iteration_count += 1
+                batch.iteration_id = self.iteration_count
                 # Report metrics
                 self._collect_and_report_iteration_metrics(batch, iteration_time_ms)
 
@@ -1497,6 +1504,7 @@ class Scheduler(
                     gpu_elapsed_ms = gpu_elapsed
                     # Increment iteration counter for completed iteration
                     self.iteration_count += 1
+                    tmp_batch.iteration_id = self.iteration_count
                     # Attach scheduler interval since last process result if available
                     since_last = getattr(tmp_batch, 'since_last_process_ms', None)
                     if since_last is not None:
@@ -1514,6 +1522,7 @@ class Scheduler(
                 elif hasattr(tmp_batch, 'iteration_start_time'):
                     # Increment iteration counter for completed iteration
                     self.iteration_count += 1
+                    tmp_batch.iteration_id = self.iteration_count
                     # Fallback to wall-clock time if GPU elapsed is unavailable
                     batch_end_time = time.perf_counter()
                     iteration_time_ms = (batch_end_time - tmp_batch.iteration_start_time) * 1000
@@ -1536,6 +1545,7 @@ class Scheduler(
                 self._report_idle_metrics_if_needed()
 
             self.last_batch = batch
+            self.last_cycle_time_prediction = self.predict_batch(batch)
 
             loop_total_ms = (
                 recv_time_ms
@@ -1613,6 +1623,7 @@ class Scheduler(
                     logger.info(f"before report metrics3: {iteration_time_ms}")
                     # Increment iteration counter for completed micro-batch
                     self.iteration_count += 1
+                    self.cur_batch.iteration_id = self.iteration_count
                     # Report metrics for this micro-batch
                     self._collect_and_report_iteration_metrics(self.cur_batch, iteration_time_ms)
 
@@ -1924,6 +1935,7 @@ class Scheduler(
                 router_generation=recv_req.router_generation,
                 router_message_id=recv_req.router_message_id,
                 arrival_time_ms=arrival_time_ms,
+                start_iteration=self.iteration_count,
             )
             req.tokenizer = self.tokenizer
             logger.info(f"Received new request: rid={req.rid}, time={arrival_time_ms}, recv_time={time.time() * 1000.0}")
@@ -1954,6 +1966,8 @@ class Scheduler(
             # Create a new request from a previous session
             session = self.sessions[recv_req.session_params.id]
             req = session.create_req(recv_req, self.tokenizer)
+            # Align session-generated requests with current scheduler iteration counter
+            req.start_iteration = self.iteration_count
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
@@ -2186,6 +2200,7 @@ class Scheduler(
             recv_req.sampling_params,
             token_type_ids=recv_req.token_type_ids,
             priority=recv_req.priority,
+            start_iteration=self.iteration_count,
         )
         req.tokenizer = self.tokenizer
 
@@ -2442,8 +2457,8 @@ class Scheduler(
             - chunked_prefill_size: Fallback when no simulation results
         """
         if self._last_prefill_sim_results is None:
-            logger.info(f"No execution flow found, falling back to default chunk size {self.chunked_prefill_size}")
-            return self.chunked_prefill_size  # Fallback to default
+            logger.info("No execution flow found, falling back to decode")
+            return self.chunked_prefill_size  # Fallback if no simulation results   
         
         # Use the base case result (extra=0)
         base_result = self._last_prefill_sim_results[0]
@@ -2452,7 +2467,7 @@ class Scheduler(
         # even when decode_feasible=False (marked as "LATE" but still executable)
         execution_flow = getattr(base_result, 'execution_flow', None) or []
         if not execution_flow:
-            logger.info(f"No execution flow found, falling back to default chunk size {self.chunked_prefill_size}")
+            logger.info("No execution flow found, falling back to decode")
             return self.chunked_prefill_size  # Fallback if no execution flow
         
         # First chunk determines this iteration's budget
@@ -2531,10 +2546,10 @@ class Scheduler(
             # running_batch = merged batch for future iterations (after line 2666 merge)
             # We need the current GPU batch time for correct overlap calculation.
             tpot_effective = self.tpot if self.tpot not in (None, 0) else 1000.0
-            pred_last = self.predict_batch(self.last_batch)
+    
+            pred_last = self.last_cycle_time_prediction
 
-            # Decode slack seeds from current decoding requests if available.
-            from sglang.srt.managers.schedule_batch import ForwardMode  # local import to avoid cycle at module load
+
             min_decode_slack = None
             min_slack_req_tpot = tpot_effective  # Track TPOT of request with minimum slack
             if self.last_batch is not None and getattr(self.last_batch, "reqs", None):
@@ -2572,7 +2587,8 @@ class Scheduler(
             # - Subtract pred_last: time consumed waiting for last_batch
             # - Add min_slack_req_tpot: TPOT budget recovered from last_batch iteration (using the TPOT of the request with minimum slack)
             # Assumes mixed-chunk mode: decode requests are serviced during last_batch
-            decode_slack_ms = min_decode_slack - pred_last + min_slack_req_tpot
+
+            decode_slack_ms = min_decode_slack - pred_last
 
             # Edge cases handled by this formula:
             # 1. pred_last = 0 (no overlap): decode_slack_ms = min_decode_slack + tpot
@@ -2693,8 +2709,10 @@ class Scheduler(
                         timeline = res.execution_flow if res.execution_flow else res.base_plan
                         if scenario_changed:
                             logger.info(
-                                "[PREFILL-SIM] base extra=0 status=%s time=%.2fms padded=%.2fms timeline=%s",
+                                "[PREFILL-SIM] base extra=0 status=%s time=%.2f + %.2f = %.2fms padded=%.2fms timeline=%s",
                                 status,
+                                res.total_time_ms,
+                                pred_last,
                                 reported_time,
                                 reported_padded,
                                 timeline,
@@ -2835,22 +2853,30 @@ class Scheduler(
 
         num_used, token_usage, available_size, evictable_size = self._get_token_info()
 
+        # Respect the batch's forward_mode when available instead of inferring from token shapes.
+        batch_mode = getattr(batch, "forward_mode", None)
+        inferred_mode = mode or _forward_mode_to_string(batch_mode)
+        is_decode_mode = False
+        if batch_mode is not None:
+            try:
+                is_decode_mode = batch_mode.is_decode()
+            except AttributeError:
+                is_decode_mode = batch_mode == ForwardMode.DECODE
+
         total_tokens = 0
         prefill_pairs: List[List[int]] = []
         for req in batch.reqs:
             extend_len = getattr(req, "extend_input_len", 0)
+            if is_decode_mode:
+                # Decode batches effectively process one token per request.
+                extend_len = 1
             total_tokens += extend_len
-            if extend_len > 1:
+            if not is_decode_mode and extend_len > 1:
                 prefix_len = len(getattr(req, "prefix_indices", []))
                 prefill_pairs.append([extend_len, prefix_len + extend_len])
 
         if total_tokens <= 0:
             return 0.0
-
-        inferred_mode = mode
-        if inferred_mode is None and getattr(self.cycle_time_predictor, "is_multimode", False):
-            # If there are no prefill pairs, treat as decode-only; otherwise mixed/prefill.
-            inferred_mode = "DECODE" if not prefill_pairs else "MIXED"
 
         predictor = self.cycle_time_predictor
         kwargs = dict(

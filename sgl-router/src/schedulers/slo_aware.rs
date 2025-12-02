@@ -245,7 +245,7 @@ impl SloAwareScheduler {
             {
                 Ok(response) => {
                     if response.status().is_success() {
-                        tracing::debug!("Successfully sent TPOT update to {}: {} ms", url, tpot_value);
+                        tracing::info!("Successfully sent TPOT update to {}: {} ms", url, tpot_value);
                     } else {
                         tracing::warn!(
                             "Failed to send TPOT update to {}: HTTP {}",

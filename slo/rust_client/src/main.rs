@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tokenizers::Tokenizer;
 
 // --- Configuration ---
@@ -50,6 +50,9 @@ struct Args {
 
     #[arg(long)]
     elapsed_dump_path: Option<String>,
+
+    #[arg(long, default_value = "output.ans")]
+    ans_log_path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,6 +80,14 @@ struct LogRecord {
     avg_interval_ms: Option<f64>,
     chunk_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
+    server_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iteration_id: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_iteration: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iteration_id_missing: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     target_ttft_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_tpot_ms: Option<f64>,
@@ -98,6 +109,15 @@ struct LogRecord {
 struct TokenElapsedTimeline {
     request_id: String,
     elapsed_ms: Vec<f64>,
+    server_id: Option<String>,
+    start_iteration: Option<usize>,
+    iteration_ids: Vec<Option<usize>>,
+}
+
+async fn log_ans(ans_tx: &Option<mpsc::Sender<String>>, msg: impl Into<String>) {
+    if let Some(tx) = ans_tx {
+        let _ = tx.send(msg.into()).await;
+    }
 }
 
 // --- Global Shared State ---
@@ -171,6 +191,7 @@ struct AppState {
     endpoint: String,
     stats: Arc<SharedStats>,
     elapsed_dump_tx: Option<tokio::sync::mpsc::Sender<TokenElapsedTimeline>>,
+    ans_tx: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
 // --- Helper Functions ---
@@ -190,6 +211,7 @@ async fn status_display_task(
     total_requests: usize,
     log_path: String,
     start_time: Instant,
+    ans_tx: Option<mpsc::Sender<String>>,
 ) {
     use std::io::{self, Write};
 
@@ -260,6 +282,10 @@ async fn status_display_task(
                 println!("{}", line);
             }
             io::stdout().flush().ok();
+        } else if let Some(tx) = ans_tx.as_ref() {
+            // Non-TTY: emit periodic summary to ans log instead of stdout
+            let summary = lines.join(" | ");
+            let _ = tx.try_send(summary);
         }
 
         // Check if done
@@ -276,14 +302,25 @@ async fn status_display_task(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Prepare ans log channel early (stdout may be hidden)
+    let args = Args::parse();
+    let (ans_tx, mut ans_rx) = mpsc::channel::<String>(10_000);
+    let ans_log_path = args.ans_log_path.clone();
+    tokio::spawn(async move {
+        let file = File::create(&ans_log_path).expect("Failed to create ans log file");
+        let mut writer = std::io::BufWriter::with_capacity(256 * 1024, file);
+        while let Some(line) = ans_rx.recv().await {
+            writeln!(writer, "{}", line).ok();
+        }
+        writer.flush().ok();
+    });
+
     // 1. Optimize OS Limits (Important for 10k connections)
     match fdlimit::raise_fd_limit() {
-        Ok(_) => println!("OS File Descriptor limit raised successfully"),
-        Err(e) => println!("Failed to raise FD limit: {}. Ensure `ulimit -n` is high.", e),
+        Ok(_) => log_ans(&Some(ans_tx.clone()), "OS File Descriptor limit raised successfully").await,
+        Err(e) => log_ans(&Some(ans_tx.clone()), format!("Failed to raise FD limit: {}. Ensure `ulimit -n` is high.", e)).await,
     }
 
-    let args = Args::parse();
-    
     // 2. Prepare Logger (Dedicated Thread)
     let (log_tx, mut log_rx) = tokio::sync::mpsc::channel::<LogRecord>(100_000);
     let log_path = args.log_path.clone();
@@ -302,13 +339,16 @@ async fn main() -> Result<()> {
     // Optional: high-performance elapsed timeline dump (pickle stream)
     let elapsed_dump_tx = if let Some(path) = args.elapsed_dump_path.clone() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TokenElapsedTimeline>(100_000);
+        let ans_tx_for_timeline = Some(ans_tx.clone());
         tokio::spawn(async move {
             let file = File::create(&path).expect("Failed to create elapsed dump file");
             let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
             let opts = pickle::SerOptions::new();
             while let Some(timeline) = rx.recv().await {
                 if let Err(e) = pickle::to_writer(&mut writer, &timeline, opts.clone()) {
-                    eprintln!("Failed to write elapsed timeline: {}", e);
+                    if let Some(tx) = ans_tx_for_timeline.as_ref() {
+                        let _ = tx.send(format!("Failed to write elapsed timeline: {}", e)).await;
+                    }
                 }
             }
             writer.flush().ok();
@@ -319,9 +359,9 @@ async fn main() -> Result<()> {
     };
 
     // 3. Build Components
-    println!("Loading tokenizer and building token pool...");
+    log_ans(&Some(ans_tx.clone()), "Loading tokenizer and building token pool...").await;
     let token_pool = build_token_pool(&args.text_file, &args.tokenizer, 200_000)?;
-    println!("Token pool size: {}", token_pool.len());
+    log_ans(&Some(ans_tx.clone()), format!("Token pool size: {}", token_pool.len())).await;
 
     let mut base = args.base_url.clone();
     if base.ends_with("/v1") {
@@ -345,10 +385,11 @@ async fn main() -> Result<()> {
         endpoint,
         stats: stats.clone(),
         elapsed_dump_tx,
+        ans_tx: Some(ans_tx.clone()),
     });
 
     // 4. Load and Sort Trace
-    println!("Loading trace...");
+    log_ans(&Some(ans_tx.clone()), "Loading trace...").await;
     let mut rdr = csv::Reader::from_path(&args.trace)?;
     let mut rows: Vec<TraceRow> = rdr.deserialize().collect::<Result<_, _>>()?;
     
@@ -362,7 +403,7 @@ async fn main() -> Result<()> {
     }
     
     let total_reqs = rows.len();
-    println!("Starting trace replay: {} requests", total_reqs);
+    log_ans(&Some(ans_tx.clone()), format!("Starting trace replay: {} requests", total_reqs)).await;
 
     // 5. The Dispatch Loop
     let start_time = Instant::now();
@@ -370,8 +411,9 @@ async fn main() -> Result<()> {
     // Spawn status display task
     let stats_clone = stats.clone();
     let log_path_clone = args.log_path.clone();
+    let ans_tx_clone = state.ans_tx.clone();
     tokio::spawn(async move {
-        status_display_task(stats_clone, total_reqs, log_path_clone, start_time).await;
+        status_display_task(stats_clone, total_reqs, log_path_clone, start_time, ans_tx_clone).await;
     });
     let epoch_start = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
     let rate = args.rate;
@@ -401,7 +443,7 @@ async fn main() -> Result<()> {
     // Wait for all requests to drain
     while join_set.join_next().await.is_some() {}
 
-    println!("\nAll requests completed. Log saved.");
+    log_ans(&Some(ans_tx.clone()), "All requests completed. Log saved.").await;
 
     Ok(())
 }
@@ -478,6 +520,10 @@ async fn process_request(
         ttft_ms: None,
         avg_interval_ms: None,
         chunk_count: 0,
+        server_id: None,
+        iteration_id: None,
+        start_iteration: None,
+        iteration_id_missing: None,
         target_ttft_ms: row.ttft,
         target_tpot_ms: row.tpot,
         slo_satisfied: None,
@@ -501,6 +547,11 @@ async fn process_request(
 
                 let mut first_token_ts: Option<Instant> = None;
                 let mut token_times: Vec<Instant> = Vec::with_capacity(row.decode);
+                let mut token_iteration_ids: Vec<Option<usize>> = Vec::with_capacity(row.decode);
+                let mut server_id: Option<String> = None;
+                let mut start_iteration: Option<usize> = None;
+                let mut last_iteration_id: Option<usize> = None;
+                let mut iteration_seen = false;
                 let mut output_text = String::new();
                 let mut prev_token_count = 0;
 
@@ -529,6 +580,23 @@ async fn process_request(
 
                                         // Extract actual token count from response (matching Python)
                                         if let Some(meta_info) = json.get("meta_info") {
+                                            if server_id.is_none() {
+                                                if let Some(id_val) = meta_info.get("server_id").and_then(|v| v.as_str()) {
+                                                    server_id = Some(id_val.to_string());
+                                                }
+                                            }
+                                            if start_iteration.is_none() {
+                                                if let Some(start_iter) = meta_info.get("start_iteration").and_then(|v| v.as_u64()) {
+                                                    start_iteration = Some(start_iter as usize);
+                                                }
+                                            }
+                                            let iteration_id = meta_info.get("iteration_id").and_then(|v| v.as_u64()).map(|v| v as usize);
+                                            if iteration_id.is_some() {
+                                                iteration_seen = true;
+                                                last_iteration_id = iteration_id;
+                                            }
+                                            let token_iteration_tag = iteration_id.or(last_iteration_id);
+
                                             if let Some(completion_tokens) = meta_info.get("completion_tokens") {
                                                 if let Some(current_token_count) = completion_tokens.as_u64() {
                                                     let current_token_count = current_token_count as usize;
@@ -540,6 +608,7 @@ async fn process_request(
                                                         // Add token times for each new token
                                                         for _ in 0..num_new_tokens {
                                                             token_times.push(chunk_arrival_time);
+                                                            token_iteration_ids.push(token_iteration_tag);
                                                             if first_token_ts.is_none() {
                                                                 first_token_ts = Some(chunk_arrival_time);
                                                             }
@@ -640,12 +709,34 @@ async fn process_request(
                     }
                 }
 
+                record.server_id = server_id.clone();
+                record.iteration_id = last_iteration_id;
+                record.start_iteration = start_iteration;
+
+                if !iteration_seen {
+                    record.iteration_id_missing = Some(true);
+                    log_ans(
+                        &state.ans_tx,
+                        format!(
+                            "[warn] request {} missing iteration_id (server_id={}, start_iteration={:?}, tokens={})",
+                            req_id,
+                            server_id.clone().unwrap_or_else(|| "<unknown>".to_string()),
+                            start_iteration,
+                            token_times.len()
+                        ),
+                    )
+                    .await;
+                }
+
                 // Emit elapsed timeline for post-hoc analysis if configured
                 if let Some(dump_tx) = state.elapsed_dump_tx.as_ref() {
                     if !elapsed_ms_per_token.is_empty() {
                         let timeline = TokenElapsedTimeline {
                             request_id: req_id.clone(),
                             elapsed_ms: elapsed_ms_per_token,
+                            server_id: server_id.clone(),
+                            start_iteration,
+                            iteration_ids: token_iteration_ids,
                         };
                         let _ = dump_tx.send(timeline).await;
                     }

@@ -197,6 +197,13 @@ def _handle_output_by_index(output, i):
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            start_iterations=(
+                [output.start_iterations[i]]
+                if output.start_iterations and len(output.start_iterations) > i
+                else None
+            ),
+            iteration_id=output.iteration_id,
+            server_id=output.server_id,
         )
     elif isinstance(output, BatchEmbeddingOut):
         new_output = BatchEmbeddingOut(
@@ -313,6 +320,13 @@ def _handle_output_by_index(output, i):
             ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            start_iterations=(
+                [output.start_iterations[i]]
+                if output.start_iterations and len(output.start_iterations) > i
+                else None
+            ),
+            iteration_id=output.iteration_id,
+            server_id=output.server_id,
         )
     elif isinstance(output, BatchMultimodalOut):
         new_output = BatchMultimodalOut(

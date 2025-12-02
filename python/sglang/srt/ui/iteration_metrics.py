@@ -99,6 +99,7 @@ class _IterationMetricsState:
             # Log to standard logger (will be redirected to log file)
             if "log" in destinations:
                 min_decode_slack = metrics.get("min_decode_slack_ms")
+                min_decode_slack_rid = metrics.get("min_decode_slack_rid")
                 kv_usage_pct = metrics.get("kv_usage_pct")
                 tpot_ms = metrics.get("tpot_ms")
                 min_decode_slack_str = (
@@ -141,7 +142,10 @@ class _IterationMetricsState:
                 kv_section = (
                     f"KV:{metrics.get('kv_tokens_used', 0)} ({kv_usage_str})"
                 ).ljust(22)
-                slack_section = f"Slack:{min_decode_slack_str}".ljust(18)
+                slack_suffix = (
+                    f" ({min_decode_slack_rid})" if min_decode_slack_rid else ""
+                )
+                slack_section = f"Slack:{min_decode_slack_str}{slack_suffix}".ljust(30)
                 tpot_section = f"tpot:{tpot_str}".ljust(10)
                 prefill_section = f"prefill:{metrics.get('prefill_chunk_pairs', [])}"
                 log_line = (

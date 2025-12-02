@@ -149,6 +149,7 @@ class Session:
             router_generation=req.router_generation,
             router_message_id=req.router_message_id,
             arrival_time_ms=getattr(req, "arrival_time_ms", None),
+            start_iteration=getattr(req, "start_iteration", None),
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs
