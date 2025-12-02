@@ -288,6 +288,10 @@ pub enum SchedulerConfig {
         /// Auto-scaling configuration (optional, defaults to disabled)
         #[serde(skip_serializing_if = "Option::is_none")]
         auto_scaling: Option<AutoScalingConfig>,
+        /// Initial tier allocation (optional, e.g., [1, 1, 2] means 1 worker to tier 0, 1 to tier 1, 2 to tier 2)
+        /// If not specified, workers will be distributed evenly across tiers using round-robin
+        #[serde(skip_serializing_if = "Option::is_none")]
+        initial_tier_allocation: Option<Vec<usize>>,
     },
 }
 

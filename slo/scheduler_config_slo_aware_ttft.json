@@ -1,6 +1,7 @@
 {
   "type": "slo_aware",
   "tpot_buckets": [15.0, 25.0, 40.0],
+  "initial_tier_allocation": [1, 1, 2],
   "worker_selection_policy": {
     "type": "TTFTAware",
     "margin_ms": 50.0

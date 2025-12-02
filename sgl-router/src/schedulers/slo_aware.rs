@@ -35,6 +35,10 @@ pub struct SloAwareScheduler {
     policy: WorkerSelectionPolicy,
     /// Auto-scaling configuration (if enabled)
     auto_scaling: Option<AutoScalingConfig>,
+    /// Initial tier allocation configuration
+    initial_tier_allocation: Option<Vec<usize>>,
+    /// Track last known health state of workers (worker_url -> is_healthy)
+    worker_health_state: Arc<DashMap<String, bool>>,
 }
 
 impl SloAwareScheduler {
@@ -43,6 +47,7 @@ impl SloAwareScheduler {
         tpot_buckets: Vec<f32>,
         policy: WorkerSelectionPolicy,
         auto_scaling: Option<AutoScalingConfig>,
+        initial_tier_allocation: Option<Vec<usize>>,
     ) -> Self {
         let tier_workers = Arc::new(DashMap::new());
         let tier_queue_sizes = Arc::new(DashMap::new());
@@ -64,6 +69,8 @@ impl SloAwareScheduler {
             last_schedule_duration_us: AtomicU64::new(0),
             policy,
             auto_scaling,
+            initial_tier_allocation,
+            worker_health_state: Arc::new(DashMap::new()),
         }
     }
 
@@ -90,7 +97,8 @@ impl SloAwareScheduler {
         None
     }
 
-    /// Initialize workers into SLO tiers using round-robin assignment
+    /// Initialize workers into SLO tiers
+    /// Uses initial_tier_allocation from config if provided, otherwise distributes evenly via round-robin
     /// Idle tier (tpot_buckets.len()) is left empty for future autoscaling
     fn initialize_workers(&self, worker_registry: &Arc<crate::core::WorkerRegistry>) {
         let all_workers = worker_registry.get_all_with_ids();
@@ -101,20 +109,53 @@ impl SloAwareScheduler {
             return;
         }
 
-        info!(
-            "Initializing {} workers into {} SLO tiers using round-robin assignment",
-            all_workers.len(),
-            num_slo_tiers
-        );
+        // Use configured tier allocation if provided, otherwise use round-robin
+        match &self.initial_tier_allocation {
+            Some(tier_allocation) => {
+                info!(
+                    "Initializing {} workers into {} SLO tiers using configured allocation {:?}",
+                    all_workers.len(),
+                    num_slo_tiers,
+                    tier_allocation
+                );
 
-        // Round-robin assign workers to SLO tiers (not idle tier)
-        for (worker_idx, (worker_id, _worker)) in all_workers.iter().enumerate() {
-            let tier_idx = worker_idx % num_slo_tiers;
+                // Assign workers to tiers based on configured allocation
+                // If not enough workers, fill from beginning and leave rest empty
+                let mut worker_iter = all_workers.iter();
 
-            self.tier_workers
-                .entry(tier_idx)
-                .or_insert_with(Vec::new)
-                .push(worker_id.clone());
+                for (tier_idx, &count) in tier_allocation.iter().enumerate() {
+                    if tier_idx >= num_slo_tiers {
+                        break; // Don't exceed available tiers
+                    }
+                    for _ in 0..count {
+                        if let Some((worker_id, _worker)) = worker_iter.next() {
+                            self.tier_workers
+                                .entry(tier_idx)
+                                .or_insert_with(Vec::new)
+                                .push(worker_id.clone());
+                        } else {
+                            // No more workers available
+                            break;
+                        }
+                    }
+                }
+            }
+            None => {
+                info!(
+                    "Initializing {} workers into {} SLO tiers using round-robin distribution",
+                    all_workers.len(),
+                    num_slo_tiers
+                );
+
+                // Round-robin assignment across SLO tiers
+                for (idx, (worker_id, _worker)) in all_workers.iter().enumerate() {
+                    let tier_idx = idx % num_slo_tiers;
+                    self.tier_workers
+                        .entry(tier_idx)
+                        .or_insert_with(Vec::new)
+                        .push(worker_id.clone());
+                }
+            }
         }
 
         // Log tier assignments (each tier is an upper bound)
@@ -367,6 +408,105 @@ impl SloAwareScheduler {
         }
     }
 
+    /// Monitor worker health state changes and react accordingly
+    /// - When worker becomes healthy: set TPOT based on tier assignment
+    /// - When worker becomes unhealthy: log and update UI
+    fn monitor_worker_health(&self, worker_registry: &Arc<crate::core::WorkerRegistry>) {
+        let all_workers = worker_registry.get_all_with_ids();
+
+        for (worker_id, worker) in all_workers {
+            let worker_url = worker.url();
+            let current_health = worker.is_healthy();
+
+            // Check if we have previous health state
+            let previous_health = self.worker_health_state.get(worker_url).map(|entry| *entry);
+
+            match (previous_health, current_health) {
+                // Worker just became healthy (unhealthy -> healthy or first time seeing it healthy)
+                (Some(false), true) | (None, true) => {
+                    info!("Worker {} is now healthy", worker_url);
+
+                    // Find which tier this worker belongs to
+                    let mut worker_tier: Option<usize> = None;
+                    for tier_idx in 0..=self.tpot_buckets.len() {
+                        if let Some(tier_workers) = self.tier_workers.get(&tier_idx) {
+                            if tier_workers.contains(&worker_id) {
+                                worker_tier = Some(tier_idx);
+                                break;
+                            }
+                        }
+                    }
+
+                    // If worker is assigned to a tier and TPOT updates are enabled, send TPOT
+                    if let Some(tier_idx) = worker_tier {
+                        let should_send_tpot = self.auto_scaling
+                            .as_ref()
+                            .map(|config| config.send_tpot_updates)
+                            .unwrap_or(false);
+
+                        if should_send_tpot {
+                            let tpot_ms = self.calculate_tpot_for_tier(tier_idx);
+                            info!(
+                                "Setting TPOT for newly healthy worker {} (tier {}): {} ms",
+                                worker_url, tier_idx, tpot_ms
+                            );
+                            self.send_tpot_update(worker_url, tpot_ms);
+                        }
+
+                        // Log tier assignment for UI visibility
+                        let boundary_desc = if tier_idx < self.tpot_buckets.len() {
+                            let boundary = self.tpot_buckets[tier_idx];
+                            if tier_idx == 0 {
+                                format!("≤{} ms", boundary)
+                            } else {
+                                let prev_boundary = self.tpot_buckets[tier_idx - 1];
+                                format!(">{} ms, ≤{} ms", prev_boundary, boundary)
+                            }
+                        } else {
+                            "idle/autoscaling".to_string()
+                        };
+                        info!(
+                            "Worker {} assigned to tier {} ({})",
+                            worker_url, tier_idx, boundary_desc
+                        );
+                    }
+
+                    // Update health state
+                    self.worker_health_state.insert(worker_url.to_string(), true);
+                }
+                // Worker just became unhealthy (healthy -> unhealthy)
+                (Some(true), false) => {
+                    warn!("Worker {} is now UNHEALTHY - will be excluded from scheduling", worker_url);
+
+                    // Find which tier this worker belongs to for UI/logging
+                    for tier_idx in 0..=self.tpot_buckets.len() {
+                        if let Some(tier_workers) = self.tier_workers.get(&tier_idx) {
+                            if tier_workers.contains(&worker_id) {
+                                warn!(
+                                    "Unhealthy worker {} in tier {} will not receive new requests",
+                                    worker_url, tier_idx
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    // Update health state
+                    self.worker_health_state.insert(worker_url.to_string(), false);
+                }
+                // Worker still healthy or still unhealthy - no change needed
+                (Some(true), true) | (Some(false), false) => {
+                    // No health state change, do nothing
+                }
+                // First time seeing worker and it's unhealthy
+                (None, false) => {
+                    // Initialize health state as unhealthy
+                    self.worker_health_state.insert(worker_url.to_string(), false);
+                }
+            }
+        }
+    }
+
     fn select_worker_first_available(&self, workers: &[Arc<dyn Worker>]) -> Option<Arc<dyn Worker>> {
         if workers.is_empty() {
             return None;
@@ -587,6 +727,18 @@ impl SloAwareScheduler {
                 continue;
             }
 
+            // Check if TTFT target has been violated - reject immediately
+            if self.is_ttft_violated(front) {
+                let violated = queue.pop_front().unwrap();
+                warn!(
+                    "Rejecting request {}: TTFT target {:?} ms violated",
+                    violated.request_id,
+                    violated.target_ttft_ms
+                );
+                self.handle_timeout(violated);
+                continue;
+            }
+
             // Get available workers for the request (filtered by model)
             let available =
                 available_workers_for_request(&config.worker_registry, front.model_id.as_deref());
@@ -638,13 +790,11 @@ impl SloAwareScheduler {
 
                     // Convert Option<f32> to f64 with default
                     let target_ttft_ms = front.target_ttft_ms.unwrap_or(1000.0) as f64;
-                    let ttft_violated = self.is_ttft_violated(front);
 
-                    self.select_worker_ttft_aware_with_fallback(
+                    self.select_worker_ttft_aware(
                         &tier_filtered,
                         request_tokens,
                         target_ttft_ms,
-                        ttft_violated,
                         *margin_ms,
                     )
                 }
@@ -774,8 +924,11 @@ impl Scheduler for SloAwareScheduler {
                             self.set_tier_queue_size(queue_idx, queue.len());
                         }
 
-                        // Placeholder for dynamic worker reclassification (currently empty)
+                        // Dynamic worker reclassification based on load
                         self.schedule_worker(&config.worker_registry);
+
+                        // Monitor worker health state changes and update TPOT/UI accordingly
+                        self.monitor_worker_health(&config.worker_registry);
 
                         if receiver_closed && queues.iter().all(|queue| queue.is_empty()) {
                             break;
