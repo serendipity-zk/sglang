@@ -42,6 +42,12 @@ def parse_args() -> argparse.Namespace:
         default=10**9,
         help="Override predictor logging interval to avoid console spam.",
     )
+    parser.add_argument(
+        "--csv-log-path",
+        type=str,
+        default=None,
+        help="Path to CSV log file for predictor (default: auto-generated)",
+    )
     return parser.parse_args()
 
 
@@ -140,7 +146,11 @@ def benchmark_mode(
 
 def main() -> None:
     args = parse_args()
-    predictor = ModeAwarePredictor(args.grid_path, log_every=args.log_every)
+    predictor = ModeAwarePredictor(
+        grid_path=args.grid_path,
+        log_every=args.log_every,
+        csv_log_path=args.csv_log_path
+    )
     rng = np.random.default_rng(args.seed)
 
     if args.total <= args.warmup:

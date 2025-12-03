@@ -35,13 +35,13 @@ cd /sgl-workspace/sglang
 # Run the Rust client with HuggingFace tokenizer (matches Python version)
 # The tokenizer will be automatically downloaded from HuggingFace on first run
 $RUST_BINARY \
-  --trace /sgl-workspace/sglang/slo/trace/1024_1024_152540.csv \
+  --trace /sgl-workspace/sglang/SLO-CSim/trace/arxiv/sharegpt.csv \
   --text-file /sgl-workspace/sglang/slo/text/enwik8 \
   --tokenizer meta-llama/Llama-3.1-8B-Instruct \
   --base-url http://0.0.0.0:40010/v1 \
   --model meta-llama/Llama-3.1-8B-Instruct \
-  --rate 23.75 \
-  --max-requests 2000 \
+  --rate 100 \
+  --max-requests 5000 \
   --log-path /sgl-workspace/sglang/slo/logs/rust_client_output.jsonl \
   --elapsed-dump-path /sgl-workspace/sglang/slo/logs/rust_elapsed_timelines.pkl \
   --ans-log-path /sgl-workspace/sglang/slo/logs/rust_client.ans

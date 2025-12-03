@@ -8,7 +8,6 @@ import socket
 import sys
 import time
 import errno
-from datetime import datetime
 from subprocess import Popen, PIPE
 from threading import Thread
 
@@ -41,7 +40,7 @@ def is_port_available(host: str, port: int) -> bool:
         s.listen(1)
         return True
     except OSError:
-        return False
+        return True
     finally:
         try:
             s.close()
@@ -186,7 +185,7 @@ def stream_output(proc: Popen, prefix: str, logfile_path: str, echo_console: boo
     持续读取子进程 stdout/stderr，并将日志写入独立日志文件（追加）。
     若 echo_console=True，则同时打印到当前终端（带前缀）。
     """
-    logf = open(logfile_path, "ab", buffering=0)
+    logf = open(logfile_path, "wb", buffering=0)
 
     def pump(stream, tag):
         for line in iter(stream.readline, b""):
@@ -265,6 +264,8 @@ def main():
                         help="逗号分隔 GPU 列表（与端口一一对应）")
     parser.add_argument("--log-dir", default="logs",
                         help="日志目录（每个 worker 一个文件）")
+    parser.add_argument("--predictor-log-dir", default=None,
+                        help="Predictor CSV 日志目录（每个 worker 一个文件）。默认与 --log-dir 相同")
     parser.add_argument("--extra-worker-args", default="",
                         help="附加给 sglang worker 的参数串，例如: \"--max-concurrent-requests 16\"")
     parser.add_argument("--no-wait", action="store_true",
@@ -327,7 +328,10 @@ def main():
             sys.exit(1)
 
     ensure_dir(args.log_dir)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    # Set predictor log directory (default to same as log_dir)
+    predictor_log_dir = args.predictor_log_dir if args.predictor_log_dir else args.log_dir
+    ensure_dir(predictor_log_dir)
 
     procs = []
     logs = []
@@ -344,11 +348,20 @@ def main():
             if args.extra_worker_args:
                 cmd.extend(args.extra_worker_args.split())
 
+            # Add unique predictor log path for this worker (no timestamp - overwrites)
+            predictor_log_path = os.path.join(
+                predictor_log_dir, f"predictor_w{idx}_gpu{gpu}_p{port}.csv"
+            )
+            cmd.extend(["--predictor-log-path", predictor_log_path])
+
+            # Worker log path (no timestamp - overwrites)
             log_path = os.path.join(
-                args.log_dir, f"worker_{idx}_gpu{gpu}_p{port}_{stamp}.ans"
+                args.log_dir, f"worker_{idx}_gpu{gpu}_p{port}.ans"
             )
             prefix = f"w{idx}@gpu{gpu}:{port}"
-            print(f"Starting worker {idx} on GPU {gpu} port {port} ... log -> {log_path}")
+            print(f"Starting worker {idx} on GPU {gpu} port {port}")
+            print(f"  Worker log:    {log_path}")
+            print(f"  Predictor log: {predictor_log_path}")
             proc, logf = start_proc(cmd, env=env, prefix=prefix, logfile_path=log_path)
             procs.append(proc)
             logs.append(logf)
@@ -364,7 +377,7 @@ def main():
         # Optionally open a tmux UI window stacking four panes
         if args.tmux_ui:
             try:
-                session = f"sgl-ui-{stamp}"
+                session = f"sgl-ui-{ports[0]}"
                 script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "server_ui.py"))
                 # First pane
                 first_cmd = (

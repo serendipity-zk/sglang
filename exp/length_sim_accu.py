@@ -191,6 +191,7 @@ def benchmark_trace(
     warmup: int = 30000,
     sample_interval: int = 4000,
     grid_path: str = None,
+    csv_log_path: str = None,
     tpot: float = 20.0,
 ) -> List[dict]:
     def _collect_snapshots(df: pd.DataFrame) -> List[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
@@ -218,7 +219,10 @@ def benchmark_trace(
     predictor = None
     if grid_path:
         print(f"[Benchmark] Loading predictor from {grid_path}")
-        predictor = ModeAwarePredictor(grid_path=grid_path)
+        predictor = ModeAwarePredictor(
+            grid_path=grid_path,
+            csv_log_path=csv_log_path
+        )
 
     for bin_count in bin_counts:
         # Create Monte Carlo estimator with new API
@@ -539,6 +543,12 @@ def main():
         help="Path to grid3d.json for ModeAwarePredictor.",
     )
     parser.add_argument(
+        "--csv-log-path",
+        type=str,
+        default=None,
+        help="Path to CSV log file for predictor (default: auto-generated)",
+    )
+    parser.add_argument(
         "--tpot",
         type=float,
         default=20.0,
@@ -574,6 +584,7 @@ def main():
                 warmup=args.warmup,
                 sample_interval=args.sample_interval,
                 grid_path=args.grid_path,
+                csv_log_path=args.csv_log_path,
                 tpot=args.tpot,
             )
         )

@@ -39,6 +39,8 @@ pub struct SloAwareScheduler {
     initial_tier_allocation: Option<Vec<usize>>,
     /// Track last known health state of workers (worker_url -> is_healthy)
     worker_health_state: Arc<DashMap<String, bool>>,
+    /// Enable periodic TPOT updates (500ms interval)
+    send_tpot_updates: bool,
 }
 
 impl SloAwareScheduler {
@@ -48,6 +50,7 @@ impl SloAwareScheduler {
         policy: WorkerSelectionPolicy,
         auto_scaling: Option<AutoScalingConfig>,
         initial_tier_allocation: Option<Vec<usize>>,
+        send_tpot_updates: bool,
     ) -> Self {
         let tier_workers = Arc::new(DashMap::new());
         let tier_queue_sizes = Arc::new(DashMap::new());
@@ -71,6 +74,7 @@ impl SloAwareScheduler {
             auto_scaling,
             initial_tier_allocation,
             worker_health_state: Arc::new(DashMap::new()),
+            send_tpot_updates,
         }
     }
 
@@ -255,15 +259,9 @@ impl SloAwareScheduler {
     }
 
     /// Send TPOT update to a worker (fire-and-forget HTTP POST to /set_tpot)
-    /// Only sends if auto_scaling is enabled and send_tpot_updates is true
+    /// Only sends if send_tpot_updates is true
     fn send_tpot_update(&self, worker_url: &str, tpot_ms: f64) {
-        // Check if auto-scaling and TPOT updates are enabled
-        let should_send = self.auto_scaling
-            .as_ref()
-            .map(|config| config.enabled && config.send_tpot_updates)
-            .unwrap_or(false);
-
-        if !should_send {
+        if !self.send_tpot_updates {
             return;
         }
 
@@ -286,7 +284,7 @@ impl SloAwareScheduler {
             {
                 Ok(response) => {
                     if response.status().is_success() {
-                        tracing::info!("Successfully sent TPOT update to {}: {} ms", url, tpot_value);
+                        tracing::debug!("Successfully sent TPOT update to {}: {} ms", url, tpot_value);
                     } else {
                         tracing::warn!(
                             "Failed to send TPOT update to {}: HTTP {}",
@@ -439,12 +437,7 @@ impl SloAwareScheduler {
 
                     // If worker is assigned to a tier and TPOT updates are enabled, send TPOT
                     if let Some(tier_idx) = worker_tier {
-                        let should_send_tpot = self.auto_scaling
-                            .as_ref()
-                            .map(|config| config.send_tpot_updates)
-                            .unwrap_or(false);
-
-                        if should_send_tpot {
+                        if self.send_tpot_updates {
                             let tpot_ms = self.calculate_tpot_for_tier(tier_idx);
                             info!(
                                 "Setting TPOT for newly healthy worker {} (tier {}): {} ms",
@@ -502,6 +495,30 @@ impl SloAwareScheduler {
                 (None, false) => {
                     // Initialize health state as unhealthy
                     self.worker_health_state.insert(worker_url.to_string(), false);
+                }
+            }
+        }
+    }
+
+    /// Send periodic TPOT updates to all workers (every 500ms)
+    /// This ensures workers always have the correct TPOT value even if they miss
+    /// tier change notifications or restart
+    fn send_periodic_tpot_updates(&self, worker_registry: &Arc<crate::core::WorkerRegistry>) {
+        if !self.send_tpot_updates {
+            return;
+        }
+
+        // Iterate through all tiers including idle (0..=tpot_buckets.len())
+        for tier_idx in 0..=self.tpot_buckets.len() {
+            if let Some(worker_ids) = self.tier_workers.get(&tier_idx) {
+                let tpot_ms = self.calculate_tpot_for_tier(tier_idx);
+
+                for worker_id in worker_ids.iter() {
+                    if let Some(worker) = worker_registry.get(worker_id) {
+                        if worker.is_healthy() {
+                            self.send_tpot_update(worker.url(), tpot_ms);
+                        }
+                    }
                 }
             }
         }
@@ -860,6 +877,11 @@ impl Scheduler for SloAwareScheduler {
 
             let mut ticker = interval(Duration::from_millis(SCHEDULER_TICK_INTERVAL_MS));
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            // Separate ticker for periodic TPOT updates (500ms interval)
+            let mut tpot_ticker = interval(Duration::from_millis(500));
+            tpot_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
             let mut receiver_closed = false;
 
             loop {
@@ -938,6 +960,10 @@ impl Scheduler for SloAwareScheduler {
                         if duration_us >= 10 {
                             info!("Timestamp {}, Scheduler tick completed after {} us", chrono::Utc::now().timestamp_millis() as f64 / 1000.0, duration_us);
                         }
+                    }
+                    _ = tpot_ticker.tick() => {
+                        // Periodic TPOT updates every 500ms
+                        self.send_periodic_tpot_updates(&config.worker_registry);
                     }
                 }
             }

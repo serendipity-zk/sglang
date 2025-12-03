@@ -2,13 +2,13 @@
   "type": "slo_aware",
   "tpot_buckets": [15.0, 25.0, 40.0],
   "initial_tier_allocation": [1, 1, 2],
+  "send_tpot_updates": true,
   "worker_selection_policy": {
     "type": "TTFTAware",
     "margin_ms": 50.0
   },
   "auto_scaling": {
-    "enabled": true,
-    "send_tpot_updates": true,
+    "enabled": false,
     "idle_tpot_ms": 1000.0
   }
 }

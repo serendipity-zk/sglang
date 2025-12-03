@@ -42,7 +42,6 @@ class SimulatorConfig:
     kv_cache: int
     tpot_ms: float
     slack_decode_ms: float
-    grid_path: str
 
 
 @dataclass
@@ -162,13 +161,13 @@ class SimulationScenario:
         if len(total_prefill_lens) != len(already_prefilled_lens):
             raise ValueError("Lengths and already_prefilled_lens must match")
         
-        # 1. Align to granularity and Sort by slack (Tightest first)
+        # 1. Calculate remaining tokens and sort by slack (Tightest first)
         zipped = []
         for l, s, p in zip(total_prefill_lens, raw_slacks, already_prefilled_lens):
             clamped_prefilled = max(0, min(int(p), int(l)))
             remaining_tokens = max(int(l) - clamped_prefilled, 0)
-            aligned_remaining = (remaining_tokens + GRANULARITY - 1) // GRANULARITY * GRANULARITY if remaining_tokens > 0 else 0
-            zipped.append((aligned_remaining, float(s), clamped_prefilled))
+            # No alignment needed - use raw remaining tokens
+            zipped.append((remaining_tokens, float(s), clamped_prefilled))
         if sort_by_slack:
             zipped.sort(key=lambda x: x[1])
         
@@ -185,14 +184,16 @@ class SimulationScenario:
         if self.total_len == 0:
             return [0]
 
+        # Work in units of GRANULARITY, but track remainder separately
         units = self.total_len // GRANULARITY
+        remainder = self.total_len % GRANULARITY
         max_chunks = max(1, min(max_chunks, units))
         n_chunks = random.randint(1, max_chunks)
 
         if n_chunks == 1:
             return [self.total_len]
 
-        # Sample n_chunks-1 split points
+        # Sample n_chunks-1 split points in the aligned portion
         split_points = sorted(random.sample(range(1, units), n_chunks - 1))
         split_points = [0] + split_points + [units]
 
@@ -201,6 +202,10 @@ class SimulationScenario:
         for i in range(1, len(split_points)):
             delta_units = split_points[i] - split_points[i - 1]
             plan.append(delta_units * GRANULARITY)
+
+        # Append remainder as final chunk if it exists
+        if remainder > 0:
+            plan.append(remainder)
 
         return plan
 
@@ -217,7 +222,7 @@ class SimulationScenario:
 
         # 1. Power-of-2 equal-division plans (existing)
         t_pow2_start = time.perf_counter()
-        chunk_size = GRANULARITY
+        chunk_size = 1
         while chunk_size < self.total_len:
             p = [chunk_size] * (self.total_len // chunk_size)
             rem = self.total_len % chunk_size
@@ -226,21 +231,23 @@ class SimulationScenario:
             raw_plans.append(p)
             chunk_size *= 2
         raw_plans.append([self.total_len])
+        # only get first 4 power-of-2 plans to limit total plans
+        raw_plans = raw_plans[:-4]
         t_pow2_end = time.perf_counter()
 
-        # 2. Group-by-request plan
-        t_group_start = time.perf_counter()
-        raw_plans.append(self.req_lens)
-        t_group_end = time.perf_counter()
+        # # 2. Group-by-request plan
+        # t_group_start = time.perf_counter()
+        # raw_plans.append(self.req_lens)
+        # t_group_end = time.perf_counter()
 
-        # 3. Random split plans
-        t_random_start = time.perf_counter()
-        num_random_samples = 5
-        units = self.total_len // GRANULARITY
-        for _ in range(num_random_samples):
-            random_plan = self._sample_random_plan(max_chunks=units)
-            raw_plans.append(random_plan)
-        t_random_end = time.perf_counter()
+        # # 3. Random split plans
+        # t_random_start = time.perf_counter()
+        # num_random_samples = 5
+        # units = self.total_len // GRANULARITY
+        # for _ in range(num_random_samples):
+        #     random_plan = self._sample_random_plan(max_chunks=units)
+        #     raw_plans.append(random_plan)
+        # t_random_end = time.perf_counter()
 
         # Deduplication
         t_dedup_start = time.perf_counter()
@@ -257,8 +264,8 @@ class SimulationScenario:
 
         t_end = time.perf_counter()
         pow2_time = (t_pow2_end - t_pow2_start) * 1000
-        group_time = (t_group_end - t_group_start) * 1000
-        random_time = (t_random_end - t_random_start) * 1000
+        # group_time = (t_group_end - t_group_start) * 1000
+        # random_time = (t_random_end - t_random_start) * 1000
         dedup_time = (t_create_start - t_dedup_start) * 1000
         create_time = (t_end - t_create_start) * 1000
         # Debug: print number of plans generated (uncomment if needed)
@@ -270,11 +277,16 @@ class GlobalBatchPredictor:
     Wraps the ML Predictor.
     Responsibility: Aggregate requests from ALL plans in ALL scenarios, predict once, distribute results.
     """
-    def __init__(self, config: SimulatorConfig):
+    def __init__(self, config: SimulatorConfig, predictor: ModeAwarePredictor):
+        """
+        Args:
+            config: Simulator configuration
+            predictor: External ModeAwarePredictor instance
+        """
         self.config = config
-        self.predictor = ModeAwarePredictor(config.grid_path)
+        self.predictor = predictor
         self.is_multimode = getattr(self.predictor, "is_multimode", False)
-        
+
         # Base decode latency is constant for a given batch/kv setup
         self.base_decode_ms = float(
             self.predictor.predict(config.decode_batch, [], config.kv_cache, mode="DECODE")
@@ -365,8 +377,49 @@ class TimelineSimulator:
                     current_slacks[idx] -= delta_ms
                     min_prefill_slack = min(min_prefill_slack, current_slacks[idx])
 
+        # Edge case: No prefill requests
+        if not plan.req_lens:
+            # Distinguish between:
+            # 1. No-prefill but has decode (decode_batch > 1): use real decode time
+            # 2. No-prefill-no-decode (decode_batch == 1 is fallback): use 1ms overhead
+            if config.decode_batch > 1:
+                # Case 1: Real decode work exists
+                time_ms = base_decode_ms
+            else:
+                # Case 2: Completely idle (decode_batch=1 is just fallback minimum)
+                time_ms = 1.0
+
+            execution_flow = [0]
+            execution_times = [time_ms]
+            total_time = time_ms
+            iterations = 1
+            decode_slack += config.tpot_ms - time_ms
+            min_decode_slack = min(min_decode_slack, decode_slack)
+
+            if min_decode_slack < 0 or decode_slack < 0:
+                decode_feasible = False
+
+            success = decode_feasible  # No prefill to fail
+
+            return BatchPlanResult(
+                base_plan=plan.chunks,
+                success=success,
+                decode_feasible=decode_feasible,
+                prefill_met=0,
+                total_time_ms=total_time,
+                padded_total_time_ms=total_time,
+                iterations=iterations,
+                min_decode_slack_ms=min_decode_slack,
+                min_prefill_slack_ms=min_prefill_slack,
+                reason="ok" if success else "decode infeasible",
+                final_prefill_slacks_ms=[],
+                execution_flow=execution_flow,
+                execution_times=execution_times
+            )
+
         # Step through the plan
         for chunk_size, (chunk_segs, cycle_time) in zip(plan.chunks, zip(plan.schedule_segments, plan.cycle_times_ms)):
+            cycle_time = cycle_time * 2
             # 1. Decode Constraint Check
             est_decode_slack = decode_slack - cycle_time + config.tpot_ms
 
@@ -434,8 +487,14 @@ class TimelineSimulator:
 # ==============================================================================
 
 class PrefillSimulatorEngine:
-    def __init__(self, grid_path: str):
-        self.grid_path = grid_path
+    def __init__(self, predictor: ModeAwarePredictor):
+        """
+        Initialize the prefill simulator engine.
+
+        Args:
+            predictor: External ModeAwarePredictor instance
+        """
+        self.predictor_instance = predictor
         self.config: Optional[SimulatorConfig] = None
         self.predictor: Optional[GlobalBatchPredictor] = None
 
@@ -451,23 +510,30 @@ class PrefillSimulatorEngine:
             kv_cache=kv_cache,
             tpot_ms=tpot_ms,
             slack_decode_ms=slack_decode_ms,
-            grid_path=self.grid_path,
         )
 
-        # Only create predictor once, or if grid_path changes
-        if self.predictor is None or (self.config is not None and self.config.grid_path != new_config.grid_path):
-            self.predictor = GlobalBatchPredictor(new_config)
-        # If decode_batch or kv_cache changed, update base_decode_ms
-        elif self.config is None or self.config.decode_batch != new_config.decode_batch or self.config.kv_cache != new_config.kv_cache:
-            self.predictor.config = new_config
-            self.predictor.base_decode_ms = float(
-                self.predictor.predictor.predict(new_config.decode_batch, [], new_config.kv_cache, mode="DECODE")
-            )
+        # Recreate GlobalBatchPredictor if config changed (especially decode_batch or kv_cache)
+        if (self.predictor is None or
+            self.config is None or
+            self.config.decode_batch != new_config.decode_batch or
+            self.config.kv_cache != new_config.kv_cache):
+            self.predictor = GlobalBatchPredictor(new_config, predictor=self.predictor_instance)
         else:
-            # Just update the config (tpot_ms, slack_decode_ms changed)
+            # Just update config (tpot_ms, slack_decode_ms changed)
             self.predictor.config = new_config
 
         self.config = new_config
+
+        # Warning: Negative decode slack indicates TPOT constraint violation
+        if slack_decode_ms < 0:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "[PREFILL-SIM] Decode slack negative! "
+                "slack_decode_ms=%.2f tpot_ms=%.2f decode_batch=%d kv_cache=%d "
+                "(TPOT constraint violated - system overloaded)",
+                slack_decode_ms, tpot_ms, decode_batch, kv_cache
+            )
 
     def _ensure_ready(self) -> None:
         if self.config is None or self.predictor is None:
@@ -608,14 +674,13 @@ class PrefillSimulatorEngine:
             decode_feasible.sort(key=lambda r: (-r.prefill_met, r.padded_total_time_ms))
             return decode_feasible[0]
 
-        return BatchPlanResult(
-            base_plan=[], success=False, decode_feasible=False,
-            prefill_met=0, total_time_ms=0.0, padded_total_time_ms=0.0, iterations=0,
-            min_decode_slack_ms=-1, min_prefill_slack_ms=-1, reason="infeasible",
-            final_prefill_slacks_ms=[],
-            execution_flow=[],
-            execution_times=[]
-        )
+        # No plans satisfy decode SLO - return plan with least negative slack
+        # (minimizes further damage to TPOT constraint)
+        max_iters = max(r.iterations for r in results)
+        for r in results: pad(r, max_iters)
+        # Sort by min_decode_slack descending (least negative = best)
+        results.sort(key=lambda r: -r.min_decode_slack_ms)
+        return results[0]
 
 
 # ==============================================================================
@@ -641,6 +706,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--decode-slack", type=float, default=0.0)
     parser.add_argument("--grid-path", default="sglang_profile/grid3d.json")
     parser.add_argument("--test-extra-len", type=int, nargs="+", default=None)
+    parser.add_argument("--csv-log-path", type=str, default=None,
+                        help="Path to CSV log file for predictor (default: auto-generated)")
     return parser.parse_args()
 
 def main():
@@ -666,9 +733,14 @@ def main():
     if len(args.prefill_lens) == 0:
         print("Note: Running with empty prefill list (base case has no requests)")
 
-    engine = PrefillSimulatorEngine(
+    # Create predictor
+    predictor = ModeAwarePredictor(
         grid_path=args.grid_path,
+        csv_log_path=args.csv_log_path
     )
+
+    # Create engine with predictor
+    engine = PrefillSimulatorEngine(predictor=predictor)
     engine.update_decode(
         decode_batch=args.decode_batch,
         kv_cache=args.kv_cache,

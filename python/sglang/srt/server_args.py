@@ -240,6 +240,7 @@ class ServerArgs:
     # Cycle time predictor configuration
     predictor_type: str = "grid"
     predictor_grid_path: str = "/sgl-workspace/sglang/profile/grid3d.json"
+    predictor_log_path: Optional[str] = None
     prefill_schedule_mode: str = "budget"  # "budget", "predictor", "simulation"
 
     # API related
@@ -1662,14 +1663,20 @@ class ServerArgs:
             "--predictor-type",
             type=str,
             default=ServerArgs.predictor_type,
-            choices=["grid", "mode_aware"],
-            help="Type of cycle time predictor: 'grid' (old, single model) or 'mode_aware' (multi-mode: DECODE/EXTEND/MIXED)",
+            choices=["grid", "mode_aware", "rust"],
+            help="Type of cycle time predictor: 'grid' (single model), 'mode_aware' (multi-mode Python), or 'rust' (multi-mode Rust KNN)",
         )
         parser.add_argument(
             "--predictor-grid-path",
             type=str,
             default=ServerArgs.predictor_grid_path,
             help="Path to grid3d.json file for cycle time predictor",
+        )
+        parser.add_argument(
+            "--predictor-log-path",
+            type=str,
+            default=ServerArgs.predictor_log_path,
+            help="Path to CSV log file for predictor (default: auto-generated timestamp-based name)",
         )
         parser.add_argument(
             "--prefill-schedule-mode",

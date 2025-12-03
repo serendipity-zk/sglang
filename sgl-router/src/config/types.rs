@@ -242,10 +242,6 @@ pub struct AutoScalingConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Send TPOT updates to worker's /set_tpot endpoint when tier changes
-    #[serde(default)]
-    pub send_tpot_updates: bool,
-
     /// TPOT value (in ms) to set when worker is idle
     #[serde(default = "default_idle_tpot_ms")]
     pub idle_tpot_ms: f64,
@@ -259,7 +255,6 @@ impl Default for AutoScalingConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            send_tpot_updates: false,
             idle_tpot_ms: 1000.0,
         }
     }
@@ -292,6 +287,10 @@ pub enum SchedulerConfig {
         /// If not specified, workers will be distributed evenly across tiers using round-robin
         #[serde(skip_serializing_if = "Option::is_none")]
         initial_tier_allocation: Option<Vec<usize>>,
+        /// Send periodic TPOT updates to workers (independent of autoscaling)
+        /// When true, sends TPOT updates every 500ms to all workers based on tier assignment
+        #[serde(default)]
+        send_tpot_updates: bool,
     },
 }
 

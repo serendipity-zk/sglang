@@ -28,13 +28,14 @@ from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple, Union
 import copy
 
+from jwt import decode
 import psutil
 import setproctitle
 import torch
 import zmq
 from torch.distributed import barrier
 
-PREFILL_SIM_EXTRAS = [0, 128, 256, 384, 512, 768, 1024, 2048, 4096]
+PREFILL_SIM_EXTRAS = [128, 256, 384, 512, 768, 1024, 2048, 4096]
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
@@ -165,6 +166,7 @@ from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 # Import cycle time predictors for SLO-aware scheduling
 sys.path.insert(0, "/sgl-workspace/sglang")
+sys.path.insert(0, "/sgl-workspace/sglang/rust_predictor")
 from sglang_profile.grid_predictor import GridBasedCycleTimePredictor
 from sglang_profile.mode_aware_predictor import ModeAwarePredictor
 from exp.prefill_multi_sim import PrefillSimulatorEngine
@@ -619,10 +621,34 @@ class Scheduler(
         # Cycle time predictor for SLO-aware scheduling (optional)
         self.cycle_time_predictor = None
         if self.server_args.enable_iteration_metrics:
-            if self.server_args.predictor_type == "mode_aware":
+            if self.server_args.predictor_type == "rust":
+                try:
+                    from rust_predictor.rust_mode_aware_wrapper import RustModeAwarePredictor
+                    logger.info(
+                        f"Initializing RustModeAwarePredictor with grid: {self.server_args.predictor_grid_path}"
+                    )
+                    if self.server_args.predictor_log_path:
+                        logger.info(
+                            f"Predictor CSV logging to: {self.server_args.predictor_log_path}"
+                        )
+                    self.cycle_time_predictor = RustModeAwarePredictor(
+                        grid_path=self.server_args.predictor_grid_path,
+                        csv_log_path=self.server_args.predictor_log_path,
+                    )
+                except ImportError as e:
+                    logger.warning(
+                        f"Failed to import RustModeAwarePredictor: {e}. "
+                        "Install knn_workload_predictor wheel built by maturin. "
+                        "Prediction disabled."
+                    )
+            elif self.server_args.predictor_type == "mode_aware":
                 logger.info(
                     f"Initializing ModeAwarePredictor with grid: {self.server_args.predictor_grid_path}"
                 )
+                if self.server_args.predictor_log_path:
+                    logger.info(
+                        f"Predictor CSV logging to: {self.server_args.predictor_log_path}"
+                    )
                 self.cycle_time_predictor = ModeAwarePredictor(
                     grid_path=self.server_args.predictor_grid_path,
                     log_every=100,
@@ -632,6 +658,7 @@ class Scheduler(
                     bandwidth=0.20,
                     half_life=50.0,
                     W0=4.0,
+                    csv_log_path=self.server_args.predictor_log_path,
                 )
             else:  # "grid" (old single-mode predictor)
                 logger.info(
@@ -662,8 +689,8 @@ class Scheduler(
         )
         self.prefill_sim_engine: Optional[PrefillSimulatorEngine] = None
         self._last_prefill_sim_results: Optional[List] = None
-        self._last_prefill_sim_time_ms: Optional[float] = None
-        self._last_prefill_sim_metrics: Optional[Dict[int, float]] = None
+        self._prefill_sim_runtime_ms: Optional[float] = None  # Algorithm execution time
+        self._predicted_ttft_for_new_admits: Optional[Dict[int, float]] = None  # Maps extra_len -> predicted TTFT (ms) for router
         # Track last scenario to avoid duplicate logging
         self._last_prefill_sim_decode_batch: Optional[int] = None
         self._last_prefill_sim_kv_cache: Optional[int] = None
@@ -861,10 +888,10 @@ class Scheduler(
             "kv_forecast_peak_gt": self._last_kv_forecast_gt[0] if self._last_kv_forecast_gt else None,
             "kv_forecast_slack_ms_gt": self._last_kv_forecast_gt[1] if self._last_kv_forecast_gt else None,
             "kv_forecast_time_ms": round(self._last_kv_forecast_time_ms, 3) if self._last_kv_forecast_time_ms is not None else None,
-            "prefill_sim_time_ms": round(self._last_prefill_sim_time_ms, 3) if self._last_prefill_sim_time_ms is not None else None,
+            "prefill_sim_time_ms": round(self._prefill_sim_runtime_ms, 3) if self._prefill_sim_runtime_ms is not None else None,
             # Prefill chunk pairs: list of [current_chunk, cumulative_prefill]
             "prefill_chunk_pairs": prefill_chunk_pairs,
-            "prefill_sim_results": self._last_prefill_sim_metrics,
+            "prefill_sim_results": self._predicted_ttft_for_new_admits,  # Predicted TTFT for different admission sizes
             # Keep some old names for compatibility
             "batch_size_tokens": total_tokens,
             "num_requests": num_batch_reqs,
@@ -1018,8 +1045,8 @@ class Scheduler(
             # Get mode for mode-aware predictor
             mode_str = _forward_mode_to_string(batch.forward_mode)
 
-            # Call submit with mode parameter (for mode-aware predictor) or without (for old predictor)
-            if isinstance(self.cycle_time_predictor, ModeAwarePredictor):
+            # Call submit with mode parameter (for multi-mode predictor) or without (for old predictor)
+            if getattr(self.cycle_time_predictor, "is_multimode", False):
                 self.cycle_time_predictor.submit(
                     batch_size_tokens=total_tokens,
                     prefill_chunk_pairs=prefill_chunk_pairs,
@@ -1563,8 +1590,8 @@ class Scheduler(
                 else 0.0
             )
             prefill_sim_time_ms = (
-                self._last_prefill_sim_time_ms
-                if self._last_prefill_sim_time_ms is not None
+                self._prefill_sim_runtime_ms
+                if self._prefill_sim_runtime_ms is not None
                 else 0.0
             )
             if self.last_batch is not None or batch is not None:
@@ -2509,26 +2536,26 @@ class Scheduler(
         last_batch = the batch currently executing (or just finished) on GPU
                      (can be DECODE, EXTEND, or MIXED mode)
 
-        After merge at line 2626, running_batch = merged batch for future iterations.
+        running_batch = merged batch for future iterations (after prefill merge)
         We must predict last_batch (current GPU batch) to get correct overlap time.
         Predicting merged running_batch would include future requests, overcounting overlap.
 
         Results Stored:
         --------------
-        - self._last_prefill_sim_results: List[BatchPlanResult]
-        - self._last_prefill_sim_metrics: Dict[int, float] (extra_len -> time_ms)
+        - self._last_prefill_sim_results: List[BatchPlanResult] (base case results)
+        - self._predicted_ttft_for_new_admits: Dict[int, float] (extra_len -> predicted TTFT in ms for router)
         """
         t_sim_start = time.perf_counter()
-        self._last_prefill_sim_time_ms = 0.0
+        self._prefill_sim_runtime_ms = 0.0
         try:
             grid_path = getattr(self.server_args, "predictor_grid_path", None)
             if grid_path is None:
-                self._last_prefill_sim_time_ms = (time.perf_counter() - t_sim_start) * 1000.0
+                self._prefill_sim_runtime_ms = (time.perf_counter() - t_sim_start) * 1000.0
                 return
 
             # Lazily create engine and update dynamic config each iteration.
             if self.prefill_sim_engine is None:
-                self.prefill_sim_engine = PrefillSimulatorEngine(grid_path=grid_path)
+                self.prefill_sim_engine = PrefillSimulatorEngine(predictor=self.cycle_time_predictor)
 
             num_used, _, _, _ = self._get_token_info()
 
@@ -2543,7 +2570,7 @@ class Scheduler(
             # Overlap adjustment: predict last_batch execution time.
             # IMPORTANT: Use last_batch (the batch currently on GPU), NOT running_batch.
             # last_batch = current GPU batch (can be DECODE, EXTEND, or MIXED mode)
-            # running_batch = merged batch for future iterations (after line 2666 merge)
+            # running_batch = merged batch for future iterations (after prefill merge)
             # We need the current GPU batch time for correct overlap calculation.
             tpot_effective = self.tpot if self.tpot not in (None, 0) else 1000.0
     
@@ -2572,23 +2599,26 @@ class Scheduler(
                     slack_val = getattr(req, "last_slack_ms", None)
                     if slack_val is None:
                         slack_val = self._compute_req_slack_ms(req, now_ms=time.time() * 1000.0)
-                    if slack_val is None:
+                    if slack_val is None or slack_val < 0: # if a request already violates slack, skip it
+                        continue
+                    fixed_slack = slack_val - pred_last + tpot_effective
+                    if fixed_slack < 0: # if a request already violates slack, skip it
                         continue
                     # Update min slack and track the TPOT of that request
-                    if min_decode_slack is None or slack_val < min_decode_slack:
-                        min_decode_slack = slack_val
+                    if min_decode_slack is None or fixed_slack < min_decode_slack:
+                        min_decode_slack = fixed_slack
                         # Use per-request TPOT if available, otherwise fall back to global
                         req_tpot = req.target_tpot_ms
                         min_slack_req_tpot = float(req_tpot) if req_tpot not in (None, 0) else tpot_effective
 
-            min_decode_slack = 0.0 if min_decode_slack is None else float(min_decode_slack)
+            min_decode_slack = 9999999 if min_decode_slack is None else float(min_decode_slack) # if not request, then slack is inf
 
             # Decode slack formula: min_slack - overlap_time + TPOT_budget
             # - Subtract pred_last: time consumed waiting for last_batch
             # - Add min_slack_req_tpot: TPOT budget recovered from last_batch iteration (using the TPOT of the request with minimum slack)
             # Assumes mixed-chunk mode: decode requests are serviced during last_batch
 
-            decode_slack_ms = min_decode_slack - pred_last
+            decode_slack_ms = min_decode_slack 
 
             # Edge cases handled by this formula:
             # 1. pred_last = 0 (no overlap): decode_slack_ms = min_decode_slack + tpot
@@ -2684,54 +2714,152 @@ class Scheduler(
                 self._last_prefill_sim_decode_batch = decode_batch
                 self._last_prefill_sim_kv_cache = num_used
                 self._last_prefill_sim_prefill_lens = total_prefill_lens.copy()
+            
+            # take a look how should we handle this iteration
+            t0 = time.time()
             self._last_prefill_sim_results = self.prefill_sim_engine.evaluate_extras(
                 total_prefill_lens,
                 prefill_slacks,
-                PREFILL_SIM_EXTRAS,
+                [0],
                 already_prefilled_lens=already_prefilled_lens,
             )
-            self._last_prefill_sim_time_ms = (time.perf_counter() - t_sim_start) * 1000.0
+            t1 = time.time()
+            
+
+            # Part 1: Handle base case (extra_len = 0)
+            res = None  # Initialize to avoid scope issues
             try:
-                # Build compact metrics-friendly summary: map extra_len -> time_ms (or inf on fail)
-                metrics_summary = {}
-                # Log summary of simulation results; keep concise to avoid log spam.
-                summaries = []
-                for idx, res in enumerate(self._last_prefill_sim_results or []):
-                    extra_len = PREFILL_SIM_EXTRAS[idx] if idx < len(PREFILL_SIM_EXTRAS) else None
+                if self._last_prefill_sim_results and len(self._last_prefill_sim_results) > 0:
+                    res = self._last_prefill_sim_results[0]  # Base case only
                     status = "PASS" if res.success else ("LATE" if res.decode_feasible else "FAIL")
                     # Since another batch is running, include pred_last in reported times for visibility.
                     # reported_time = time from NOW until new_batch completes
                     #               = pred_last (last_batch completes) + res.total_time_ms (new_batch executes)
                     reported_time = res.total_time_ms + pred_last
                     reported_padded = res.padded_total_time_ms + pred_last
-                    if idx == 0:
-                        # Base case
-                        timeline = res.execution_flow if res.execution_flow else res.base_plan
-                        if scenario_changed:
-                            logger.info(
-                                "[PREFILL-SIM] base extra=0 status=%s time=%.2f + %.2f = %.2fms padded=%.2fms timeline=%s",
-                                status,
-                                res.total_time_ms,
-                                pred_last,
-                                reported_time,
-                                reported_padded,
-                                timeline,
-                            )
-                        metrics_summary[0] = None if status == "FAIL" else reported_time
-                    else:
+                    execution_flow = res.execution_flow if res.execution_flow else res.base_plan
+                    if scenario_changed:
+                        logger.info(
+                            "[PREFILL-SIM] base extra=0 status=%s time=%.2f + %.2f = %.2fms padded=%.2fms execution_flow=%s, expected run time=%s",
+                            status,
+                            res.total_time_ms,
+                            pred_last,
+                            reported_time,
+                            reported_padded,
+                            execution_flow,
+                            res.execution_times,
+                        )
+            except Exception:
+                logger.exception("Failed to log base case prefill simulation results")
+
+            # Part 2: Simulate next iteration after first chunk
+            # Skip if base case failed or returned no results
+            if res is None or not hasattr(res, 'execution_flow') or not res.execution_flow:
+                logger.warning("[PREFILL-SIM] Skipping next iteration simulation - no base case results")
+                self._predicted_ttft_for_new_admits = {}
+                self._prefill_sim_runtime_ms = (time.perf_counter() - t_sim_start) * 1000.0
+                return
+        
+            if(t1 - t0) > 0.001 or len(total_prefill_lens) > 10:
+                logger.warning("[PREFILL-SIM] Taking too long to do simulation: %.4f s", (t1 - t0))
+                self._predicted_ttft_for_new_admits = {128: 9999999, 8192: 99999999}
+                self._prefill_sim_runtime_ms = (time.perf_counter() - t_sim_start) * 1000.0
+                return
+
+
+            # Extract chunk0 execution details
+            tokens_left_to_process = res.execution_flow[0]  # Can be 0 for decode-only iteration
+            time_consumed = res.execution_times[0] if res.execution_times and len(res.execution_times) > 0 else 0.0
+
+            # Remove scheduled-to-be-finished prefills and update remaining state
+            remaining_total_lens = []
+            remaining_already_prefilled = []
+            remaining_slacks = []
+
+            for idx in range(len(total_prefill_lens)):
+                total_len = total_prefill_lens[idx]
+                already_prefilled = already_prefilled_lens[idx]
+                slack = prefill_slacks[idx]
+
+                remaining_len = total_len - already_prefilled  # Tokens still to process for this request
+
+                if tokens_left_to_process >= remaining_len:
+                    # This request will be fully processed, remove it
+                    tokens_left_to_process -= remaining_len
+                elif tokens_left_to_process > 0:
+                    # This is the borderline request - partially processed
+                    new_already_prefilled = already_prefilled + tokens_left_to_process
+                    new_slack = max(slack - time_consumed, 0.0)  # Update slack
+
+                    remaining_total_lens.append(total_len)
+                    remaining_already_prefilled.append(new_already_prefilled)
+                    remaining_slacks.append(new_slack)
+
+                    tokens_left_to_process = 0
+                else:
+                    # This request hasn't been touched yet, update slack only
+                    new_slack = max(slack - time_consumed, 0.0)
+
+                    remaining_total_lens.append(total_len)
+                    remaining_already_prefilled.append(already_prefilled)
+                    remaining_slacks.append(new_slack)
+
+            # Update the lists for the next evaluation
+            total_prefill_lens = remaining_total_lens
+            already_prefilled_lens = remaining_already_prefilled
+            prefill_slacks = remaining_slacks
+            
+            predicted_decode_slack = decode_slack_ms - time_consumed + tpot_effective 
+            if predicted_decode_slack < 0:
+                predicted_decode_slack = 0.0
+            
+            self.prefill_sim_engine.update_decode(
+                decode_batch=decode_batch,
+                kv_cache=num_used,
+                tpot_ms=tpot_effective,
+                slack_decode_ms=predicted_decode_slack,
+            )
+            
+            if scenario_changed:
+                logger.info(f"[PREFILL-SIM] after first chunk, total_prefill_lens={total_prefill_lens}, already_prefilled_lens={already_prefilled_lens}, prefill_slacks={prefill_slacks}, predicted_decode_slack={predicted_decode_slack:.2f}ms")
+            
+            # Now lets predict for next iteration, if we can admit more prefill
+            self._pred_prefill_results = self.prefill_sim_engine.evaluate_extras(
+                total_prefill_lens,
+                prefill_slacks,
+                PREFILL_SIM_EXTRAS,
+                already_prefilled_lens=already_prefilled_lens,
+            )
+
+            # Process prediction results for router reporting
+            try:
+                self._predicted_ttft_for_new_admits = {}  # Maps extra_len -> predicted TTFT (ms)
+                if self._pred_prefill_results:
+                    summaries = []
+
+                    for idx, res in enumerate(self._pred_prefill_results):
+                        extra_len = PREFILL_SIM_EXTRAS[idx]
+                        status = "PASS" if res.success else ("LATE" if res.decode_feasible else "FAIL")
+                        # Time for new admits = wait for GPU + wait for chunk0 + their batch execution
+                        # 1) pred_last: ongoing batch on GPU
+                        # 2) time_consumed: chunk0 execution time
+                        # 3) res.total_time_ms: new batch with extras
+                        reported_time = pred_last + time_consumed + res.total_time_ms
                         if status == "FAIL":
                             summaries.append(f"({extra_len}, FAIL)")
-                            metrics_summary[extra_len] = None
+                            self._predicted_ttft_for_new_admits[extra_len] = 9999999
                         else:
                             summaries.append(f"({extra_len}, {round(reported_time)}ms)")
-                            metrics_summary[extra_len] = reported_time
-                if summaries and scenario_changed:
-                    logger.info("[PREFILL-SIM] extras: %s", ", ".join(summaries))
-                self._last_prefill_sim_metrics = metrics_summary
+                            self._predicted_ttft_for_new_admits[extra_len] = reported_time
+                    if summaries and scenario_changed:
+                        logger.info("[PREFILL-SIM] extras: %s", ", ".join(summaries))
             except Exception:
-                logger.exception("Failed to log prefill simulation results")
+                logger.exception("Failed to log extra prefill simulation results")
+
+            # Record total runtime for the entire simulation process
+            self._prefill_sim_runtime_ms = (time.perf_counter() - t_sim_start) * 1000.0
         except Exception:
-            self._last_prefill_sim_time_ms = (time.perf_counter() - t_sim_start) * 1000.0
+            self._prefill_sim_runtime_ms = (time.perf_counter() - t_sim_start) * 1000.0
             logger.exception("Failed to run prefill simulator")
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
@@ -2941,6 +3069,8 @@ class Scheduler(
         # Decode tokens for mixed chunk mode
         decode_tokens = running_bs if self.is_mixed_chunk else 0
 
+        if self.chunked_req is not None:
+            self.chunked_req.init_next_round_input()
         # Determine prefill parameters based on schedule mode
         if self.prefill_schedule_mode == PrefillScheduleMode.SIMULATION:
             # SIMULATION mode: use prefill_sim_engine execution plan

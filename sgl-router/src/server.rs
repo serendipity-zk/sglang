@@ -31,7 +31,6 @@ use axum::{
     routing::{delete, get, post},
     serve, Json, Router,
 };
-use chrono::Utc;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -705,8 +704,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
         let base_dir = config.log_dir.clone().unwrap_or_else(|| ".".to_string());
-        let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
-        let log_file_name = format!("router-log-{}.txt", timestamp);
+        // Use fixed filename (no timestamp) - logs will overwrite
+        let log_file_name = "router.log";
         let log_file_path = PathBuf::from(&base_dir).join(&log_file_name);
 
         Some(logging::init_logging(LoggingConfig {

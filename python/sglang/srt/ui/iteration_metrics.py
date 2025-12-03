@@ -127,7 +127,7 @@ class _IterationMetricsState:
                     else "gt:n/a"
                 ).ljust(18)
                 tpot_str = (
-                    f"tpot:{tpot_ms:.0f}ms" if isinstance(tpot_ms, (int, float)) else "n/a"
+                    f"{tpot_ms:.0f}ms" if isinstance(tpot_ms, (int, float)) else "n/a"
                 )
                 iter_section = f"Iter:{iteration_num}".ljust(12)
                 token_section = (
@@ -159,7 +159,7 @@ class _IterationMetricsState:
                     f"{kvf_gt_section}| "
                     f"{prefill_section}"
                 )
-                logger.info(f"STAT_METRICS: {log_line}")
+                logger.info(f"\x1b[93mSTAT_METRICS: {log_line}\x1b[0m")
 
             # Debug log with different prefix
             if "debug" in destinations:
