@@ -1817,7 +1817,8 @@ pub struct GenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_tpot_ms: Option<f32>,
 
-    /// Router-observed arrival time in milliseconds since unix epoch
+    /// Client-captured arrival time in milliseconds since unix epoch
+    /// (Used for SLO tracking; if not provided, router will capture it)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arrival_time_ms: Option<f64>,
 }
@@ -1870,6 +1871,10 @@ impl GenerationRequest for GenerateRequest {
 
     fn get_target_tpot_ms(&self) -> Option<f32> {
         self.target_tpot_ms
+    }
+
+    fn get_arrival_time_ms(&self) -> Option<f64> {
+        self.arrival_time_ms
     }
 }
 
@@ -2156,6 +2161,11 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Get target TPOT (time per output token) SLO in milliseconds
     fn get_target_tpot_ms(&self) -> Option<f32> {
+        None
+    }
+
+    /// Get client-provided arrival timestamp (ms since Unix epoch)
+    fn get_arrival_time_ms(&self) -> Option<f64> {
         None
     }
 }

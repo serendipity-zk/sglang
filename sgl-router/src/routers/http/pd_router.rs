@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -1324,6 +1324,15 @@ impl PDRouter {
         // Use provided headers or create new ones, then ensure content-type is set for streaming
         let mut headers = headers.unwrap_or_default();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        // Add anti-buffering headers to prevent nginx/proxy buffering and reduce latency
+        headers.insert(
+            HeaderName::from_static("cache-control"),
+            HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-accel-buffering"),
+            HeaderValue::from_static("no"),
+        );
         *response.headers_mut() = headers;
 
         response

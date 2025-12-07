@@ -189,6 +189,8 @@ def write_run_scaffold(args, plot_path: str, full_log_dir: str, start_ts: dateti
             "start_rate": args.start_rate,
             "max_probes": args.max_probes,
             "precision": args.precision,
+            "slo_use_detokenize_time": args.slo_use_detokenize_time,
+            "elapsed_dump_path": args.elapsed_dump_path,
         },
     }
     config_path = os.path.join(args.output_dir, "config.json")
@@ -253,6 +255,10 @@ def parse_args():
     p.add_argument("--plot-path",
                    help="Optional custom path for the generated SLOG curve image "
                         "(defaults to <output-dir>/slog_curve.png)")
+    p.add_argument("--slo-use-detokenize-time", action="store_true",
+                   help="Use detokenize time for SLO calculation instead of default")
+    p.add_argument("--elapsed-dump-path",
+                   help="Path to dump elapsed timelines pickle file (optional)")
     return p.parse_args()
 
 
@@ -384,6 +390,14 @@ def run_single_rate_rust(args, rate: float, logs_dir: str, rust_binary: str) -> 
 
     if args.max_requests > 0:
         cmd.extend(["--max-requests", str(args.max_requests)])
+
+    if args.slo_use_detokenize_time:
+        cmd.append("--slo-use-detokenize-time")
+
+    if args.elapsed_dump_path:
+        # Use a per-run elapsed dump path
+        elapsed_path = os.path.join(logs_dir, f"rate_{safe_rate}_{timestamp}_elapsed.pkl")
+        cmd.extend(["--elapsed-dump-path", elapsed_path])
 
     # Run Rust binary
     result = subprocess.run(cmd, capture_output=True, text=True)

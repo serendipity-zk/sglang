@@ -175,16 +175,17 @@ class ModeAwarePredictor:
         self,
         grid_path: str,
         buffer_size: int = 10000,
-        k: int = 64,
-        radius: float = 0.30,
+        k: int = 32,
+        radius: float = 0.32,
         bandwidth: float = 0.20,
-        half_life: float = 50.0,
-        alpha: float = 0.6,
-        W0: float = 4.0,
+        half_life: float = 30.0,
+        alpha: float = 1,
+        W0: float = 1.2,
         max_correction: float = np.inf,
         log_every: int = 100,
         csv_log_path: str = None,
     ):
+        
         """
         Args:
             grid_path: Path to grid3d.json file (single or multi-mode format)
@@ -334,6 +335,7 @@ class ModeAwarePredictor:
         Returns:
             Predicted iteration time in milliseconds
         """
+
         # Map to grid coordinates
         x = float(batch_size_tokens)
         y = self._compute_y_scalar(prefill_chunk_pairs)
@@ -364,14 +366,15 @@ class ModeAwarePredictor:
             grid = self.grid
             bias_corrector = self.bias_corrector
 
-        # Grid base prediction
+        # Grid base prediction (clip to 0 before bias)
         grid_pred = float(trilinear_predict(x, y, z, X_knots, Y_knots, Z_knots, grid))
+        base_pred = max(0.0, grid_pred)
 
         # Local bias correction
         correction, n_neighbors = bias_corrector.correction(x, y, z)
 
-        # Final prediction (ensure non-negative)
-        final_pred = max(0.0, grid_pred + correction)
+        # Final prediction (ensure non-negative after correction)
+        final_pred = max(0.0, base_pred + correction)
 
         # Log to CSV
         self.csv_writer.writerow([
@@ -482,7 +485,8 @@ class ModeAwarePredictor:
                 correction, _ = bias_corrector.correction(
                     float(xs[idx]), float(ys[idx]), float(zs[idx])
                 )
-                preds[idx] = max(0.0, float(grid_preds[idx]) + correction)
+                base_pred = max(0.0, float(grid_preds[idx]))
+                preds[idx] = max(0.0, base_pred + correction)
 
         return preds
 
@@ -543,14 +547,18 @@ class ModeAwarePredictor:
             grid = self.grid
             bias_corrector = self.bias_corrector
 
-        # Compute base grid prediction (without bias correction)
+        # Compute base grid prediction (clip to 0 before bias correction)
         grid_pred = float(trilinear_predict(x, y, z, X_knots, Y_knots, Z_knots, grid))
+        base_pred = max(0.0, grid_pred)
 
         # Get current correction before update
         correction, n_neighbors = bias_corrector.correction(x, y, z)
 
-        # Residual relative to base grid (this is what we correct)
-        residual = float(iteration_time_ms) - grid_pred
+        # Predict BEFORE update (using corrected prediction)
+        y_pred = max(0.0, base_pred + correction)
+
+        # Residual relative to clipped base grid (this is what we correct)
+        residual = float(iteration_time_ms) - base_pred
 
         # Update bias corrector for this mode
         bias_corrector.update(x, y, z, residual)

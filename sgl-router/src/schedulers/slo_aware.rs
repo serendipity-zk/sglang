@@ -5,6 +5,7 @@ use std::sync::RwLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
+use rand::seq::SliceRandom;
 use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{info, warn};
@@ -546,6 +547,7 @@ impl SloAwareScheduler {
         &self,
         sim_metrics: &HashMap<i64, f64>,
         target_tokens: i64,
+        pending_tokens: i64,
     ) -> Option<f64> {
         // Convert to sorted vector
         let mut points: Vec<(i64, f64)> = sim_metrics.iter().map(|(&k, &v)| (k, v)).collect();
@@ -576,7 +578,24 @@ impl SloAwareScheduler {
             return Some(points[0].1);
         }
         if target_tokens > points.last().unwrap().0 {
-            return Some(points.last().unwrap().1);
+            // If there are pending tokens, don't extrapolate - block admission
+            if pending_tokens > 0 {
+                return None;
+            }
+            // No pending tokens - extrapolate using linear fit of last two points
+            if points.len() >= 2 {
+                let (k1, t1) = points[points.len() - 2];
+                let (k2, t2) = points[points.len() - 1];
+                let slope = (t2 - t1) / (k2 - k1) as f64;
+                let extrapolated = t2 + slope * (target_tokens - k2) as f64;
+                info!(
+                    "[INTERPOLATE] extrapolating: target_tokens={} > max={}, slope={:.4}, result={:.1}ms",
+                    target_tokens, k2, slope, extrapolated
+                );
+                return Some(extrapolated);
+            }
+            // Only one point - can't extrapolate
+            return None;
         }
 
         None
@@ -608,10 +627,20 @@ impl SloAwareScheduler {
     ) -> Option<f64> {
         // Get worker stats
         let stats = self.worker_stats.read().ok()?;
-        let worker_stats = stats.get(worker.url())?;
+        let worker_stats = stats.get(worker.url());
+        if worker_stats.is_none() {
+            info!("[TTFT_EST] worker={} no worker_stats", worker.url());
+            return None;
+        }
+        let worker_stats = worker_stats.unwrap();
 
         // Get prefill sim metrics
-        let sim_metrics = worker_stats.prefill_sim_metrics.as_ref()?;
+        let sim_metrics = worker_stats.prefill_sim_metrics.as_ref();
+        if sim_metrics.is_none() {
+            info!("[TTFT_EST] worker={} no prefill_sim_metrics", worker.url());
+            return None;
+        }
+        let sim_metrics = sim_metrics.unwrap();
 
         // Calculate pending tokens
         let pending_tokens = self.calculate_pending_tokens(worker, worker_stats);
@@ -620,7 +649,20 @@ impl SloAwareScheduler {
         let total_tokens = pending_tokens + new_request_tokens;
 
         // Interpolate to get estimated time
-        let estimated_ms = self.interpolate_prefill_time(sim_metrics, total_tokens)?;
+        let estimated_ms = self.interpolate_prefill_time(sim_metrics, total_tokens, pending_tokens);
+        if estimated_ms.is_none() {
+            info!(
+                "[TTFT_EST] worker={} interpolate failed total_tokens={} pending={}",
+                worker.url(), total_tokens, pending_tokens
+            );
+            return None;
+        }
+        let estimated_ms = estimated_ms.unwrap();
+
+        info!(
+            "[TTFT_EST] worker={} pending={} new={} total={} est={:.1}ms margin={:.1}ms",
+            worker.url(), pending_tokens, new_request_tokens, total_tokens, estimated_ms, margin_ms
+        );
 
         // Add safety margin
         Some(estimated_ms + margin_ms)
@@ -641,38 +683,49 @@ impl SloAwareScheduler {
     }
 
     /// TTFT-aware worker selection (without fallback)
-    /// Returns worker that can meet TTFT target, or None to retry later
+    /// Returns worker that can meet remaining TTFT slack, or None to retry later
     fn select_worker_ttft_aware(
         &self,
         workers: &[Arc<dyn Worker>],
         request_tokens: i64,
-        target_ttft_ms: f64,
+        remaining_slack_ms: f64,
         margin_ms: f64,
     ) -> Option<Arc<dyn Worker>> {
         if workers.is_empty() {
+            info!("[TTFT_SEL] no workers available");
             return None;
         }
 
-        // Phase 1: Find first worker that can meet TTFT target
+        // Phase 1: Find first worker that can meet remaining TTFT slack
         // This maintains a load gradient similar to first-available policy
         for worker in workers {
             if let Some(estimated_ttft) = self.estimate_ttft(worker.as_ref(), request_tokens, margin_ms) {
-                if estimated_ttft <= target_ttft_ms {
+                if estimated_ttft <= remaining_slack_ms {
+                    info!(
+                        "[TTFT_SEL] worker={} ACCEPT est={:.1}ms <= slack={:.1}ms",
+                        worker.url(), estimated_ttft, remaining_slack_ms
+                    );
                     return Some(Arc::clone(worker));
+                } else {
+                    info!(
+                        "[TTFT_SEL] worker={} REJECT est={:.1}ms > slack={:.1}ms",
+                        worker.url(), estimated_ttft, remaining_slack_ms
+                    );
                 }
             }
         }
 
-        // Phase 2: No worker can meet target -> return None (retry next tick)
+        // Phase 2: No worker can meet remaining slack -> return None (retry next tick)
         None
     }
 
     /// TTFT-aware worker selection with fallback strategy
+    #[allow(dead_code)]
     fn select_worker_ttft_aware_with_fallback(
         &self,
         workers: &[Arc<dyn Worker>],
         request_tokens: i64,
-        target_ttft_ms: f64,
+        remaining_slack_ms: f64,
         ttft_violated: bool,
         margin_ms: f64,
     ) -> Option<Arc<dyn Worker>> {
@@ -706,8 +759,8 @@ impl SloAwareScheduler {
             return None;
         }
 
-        // Normal case: try to meet target
-        if let Some(worker) = self.select_worker_ttft_aware(workers, request_tokens, target_ttft_ms, margin_ms) {
+        // Normal case: try to meet remaining slack
+        if let Some(worker) = self.select_worker_ttft_aware(workers, request_tokens, remaining_slack_ms, margin_ms) {
             return Some(worker);
         }
 
@@ -732,52 +785,65 @@ impl SloAwareScheduler {
         queue: &mut VecDeque<PendingRequest>,
         queue_idx: usize,
     ) {
-        loop {
-            let front = match queue.front() {
-                Some(request) => request,
-                None => break,
-            };
-
-            if has_request_timed_out(config, front) {
-                let timed_out = queue.pop_front().unwrap();
+        // First pass: remove timed out and TTFT-violated requests from anywhere in queue
+        let mut i = 0;
+        while i < queue.len() {
+            let request = &queue[i];
+            if has_request_timed_out(config, request) {
+                let timed_out = queue.remove(i).unwrap();
                 self.handle_timeout(timed_out);
-                continue;
-            }
-
-            // Check if TTFT target has been violated - reject immediately
-            if self.is_ttft_violated(front) {
-                let violated = queue.pop_front().unwrap();
+                // Don't increment i, next element shifts into current position
+            } else if self.is_ttft_violated(request) {
+                let violated = queue.remove(i).unwrap();
                 warn!(
                     "Rejecting request {}: TTFT target {:?} ms violated",
                     violated.request_id,
                     violated.target_ttft_ms
                 );
                 self.handle_timeout(violated);
+                // Don't increment i
+            } else {
+                i += 1;
+            }
+        }
+
+        // Get tier workers for this queue
+        let tier_worker_ids = match self.tier_workers.get(&queue_idx) {
+            Some(ids) => ids.clone(),
+            None => {
+                warn!("No tier workers found for queue index {}", queue_idx);
+                return;
+            }
+        };
+
+        // Second pass: try to schedule requests, skipping those that don't fit
+        // If queue is very long, only check a random sample to limit runtime
+        const MAX_QUEUE_SCAN: usize = 100;
+        let indices_to_check: Vec<usize> = if queue.len() > MAX_QUEUE_SCAN {
+            let mut indices: Vec<usize> = (0..queue.len()).collect();
+            indices.shuffle(&mut rand::rng());
+            let mut sampled: Vec<usize> = indices.into_iter().take(MAX_QUEUE_SCAN).collect();
+            sampled.sort(); // Preserve arrival order
+            sampled
+        } else {
+            (0..queue.len()).collect()
+        };
+
+        // First pass: read-only, decide which indices to schedule and to which worker
+        let mut schedule_decisions: Vec<(usize, Arc<dyn Worker>)> = Vec::new();
+
+        for &i in &indices_to_check {
+            let request = &queue[i];
+
+            let available =
+                available_workers_for_request(&config.worker_registry, request.model_id.as_deref());
+            if available.is_empty() {
                 continue;
             }
 
-            // Get available workers for the request (filtered by model)
-            let available =
-                available_workers_for_request(&config.worker_registry, front.model_id.as_deref());
-
-            if available.is_empty() {
-                break;
-            }
-
-            // Strict tier-based filtering: only use workers from the matching tier
-            let tier_worker_ids = match self.tier_workers.get(&queue_idx) {
-                Some(ids) => ids.clone(),
-                None => {
-                    warn!("No tier workers found for queue index {}", queue_idx);
-                    break;
-                }
-            };
-
-            // Filter available workers to only include those in the current tier
             let tier_filtered: Vec<Arc<dyn Worker>> = available
                 .into_iter()
                 .filter(|worker| {
-                    // Get worker ID from registry by URL
                     if let Some(worker_id) = config.worker_registry.get_worker_id_by_url(worker.url()) {
                         tier_worker_ids.contains(&worker_id)
                     } else {
@@ -787,51 +853,70 @@ impl SloAwareScheduler {
                 .collect();
 
             if tier_filtered.is_empty() {
-                // No workers available in this tier - leave request in queue (strict matching)
-                info!(
-                    "Queue {}: No tier-assigned workers available, keeping request in queue",
-                    queue_idx
-                );
-                break;
+                continue;
             }
 
-            // Select worker based on configured policy
             let worker = match &self.policy {
                 WorkerSelectionPolicy::FirstAvailable => {
                     self.select_worker_first_available(&tier_filtered)
                 }
                 WorkerSelectionPolicy::TTFTAware { margin_ms } => {
-                    // Get request info for TTFT estimation
-                    // Rough token estimate: text length / 4 (common heuristic for English text)
-                    let request_tokens = (front.text.len() / 4) as i64;
+                    let request_tokens = (request.text.len() / 4) as i64;
+                    let target_ttft_ms = request.target_ttft_ms.unwrap_or(1000.0) as f64;
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as f64;
+                    let elapsed_ms = now_ms - request.arrival_time_ms;
+                    let remaining_slack_ms = target_ttft_ms - elapsed_ms;
 
-                    // Convert Option<f32> to f64 with default
-                    let target_ttft_ms = front.target_ttft_ms.unwrap_or(1000.0) as f64;
+                    info!(
+                        "[WORKER_SEL] req={} target_ttft={:.1}ms elapsed={:.1}ms remaining_slack={:.1}ms tokens={} tier_workers={}",
+                        request.request_id, target_ttft_ms, elapsed_ms, remaining_slack_ms, request_tokens, tier_filtered.len()
+                    );
 
-                    self.select_worker_ttft_aware(
+                    let result = self.select_worker_ttft_aware(
                         &tier_filtered,
                         request_tokens,
-                        target_ttft_ms,
+                        remaining_slack_ms,
                         *margin_ms,
-                    )
+                    );
+
+                    if result.is_none() {
+                        info!(
+                            "[WORKER_SEL] req={} NO worker selected (remaining_slack={:.1}ms)",
+                            request.request_id, remaining_slack_ms
+                        );
+                    } else {
+                        info!(
+                            "[WORKER_SEL] req={} selected worker={}",
+                            request.request_id, result.as_ref().unwrap().url()
+                        );
+                    }
+
+                    result
                 }
             };
 
-            let Some(worker) = worker else {
-                // No suitable worker found - defer scheduling (admission control or retry)
-                info!(
-                    "Queue {}: No suitable worker found (policy: {:?}), keeping request in queue",
-                    queue_idx,
-                    self.policy
-                );
-                break;
-            };
+            if let Some(w) = worker {
+                schedule_decisions.push((i, w));
+            }
+        }
 
-            let request = queue.pop_front().unwrap();
-            RouterUi::dec_queue();
-            let dispatcher = Arc::clone(self);
-            let cfg = Arc::clone(config);
-            dispatcher.dispatch_to_worker(cfg, request, worker).await;
+        // Build index -> worker map for O(1) lookup
+        let schedule_map: HashMap<usize, Arc<dyn Worker>> = schedule_decisions.into_iter().collect();
+
+        // Build new queue with remaining requests, dispatch scheduled ones
+        let old_queue = std::mem::take(queue);
+        for (i, request) in old_queue.into_iter().enumerate() {
+            if let Some(worker) = schedule_map.get(&i) {
+                RouterUi::dec_queue();
+                let dispatcher = Arc::clone(self);
+                let cfg = Arc::clone(config);
+                dispatcher.dispatch_to_worker(cfg, request, Arc::clone(worker)).await;
+            } else {
+                queue.push_back(request);
+            }
         }
     }
 }

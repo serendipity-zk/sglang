@@ -35,7 +35,7 @@ import torch
 import zmq
 from torch.distributed import barrier
 
-PREFILL_SIM_EXTRAS = [128, 256, 384, 512, 768, 1024, 2048, 4096]
+PREFILL_SIM_EXTRAS = [128, 256, 384, 512, 768, 1024, 2048, 4096, 8192]
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
@@ -1132,6 +1132,10 @@ class Scheduler(
 
         slack_ms = expected_ms - (now_ms - arrival_ms)
 
+        # Mark request as permanently violated once slack goes negative
+        if slack_ms < 0 and not getattr(req, 'slo_violated', False):
+            req.slo_violated = True
+
         # Cache on the request for reuse in scheduling decisions.
         req.last_slack_ms = slack_ms
         req.last_slack_computed_at_ms = now_ms
@@ -1914,9 +1918,14 @@ class Scheduler(
     ):
         self.maybe_update_dp_balance_data(recv_req)
 
-        arrival_time_ms = getattr(recv_req, "arrival_time_ms", None)
-        if arrival_time_ms is None:
-            arrival_time_ms = time.time() * 1000.0
+        recv_arrival = getattr(recv_req, "arrival_time_ms", None)
+        current_time = time.time() * 1000.0
+        if recv_arrival is None:
+            arrival_time_ms = current_time
+            logger.info(f"[ARRIVAL_DEBUG] rid={recv_req.rid}, recv_arrival=None, using current_time={current_time:.3f}")
+        else:
+            arrival_time_ms = recv_arrival
+            logger.info(f"[ARRIVAL_DEBUG] rid={recv_req.rid}, recv_arrival={recv_arrival:.3f}, current_time={current_time:.3f}, gap={(current_time - recv_arrival):.3f}ms")
 
         # Create a new request
         if (
@@ -2555,7 +2564,7 @@ class Scheduler(
 
             # Lazily create engine and update dynamic config each iteration.
             if self.prefill_sim_engine is None:
-                self.prefill_sim_engine = PrefillSimulatorEngine(predictor=self.cycle_time_predictor)
+                self.prefill_sim_engine = PrefillSimulatorEngine(predictor=self.cycle_time_predictor, safety_margin_ms=100.0)
 
             num_used, _, _, _ = self._get_token_info()
 
@@ -2599,7 +2608,7 @@ class Scheduler(
                     slack_val = getattr(req, "last_slack_ms", None)
                     if slack_val is None:
                         slack_val = self._compute_req_slack_ms(req, now_ms=time.time() * 1000.0)
-                    if slack_val is None or slack_val < 0: # if a request already violates slack, skip it
+                    if slack_val is None or slack_val < 0 or getattr(req, 'slo_violated', False): # if a request already violates slack, skip it
                         continue
                     fixed_slack = slack_val - pred_last + tpot_effective
                     if fixed_slack < 0: # if a request already violates slack, skip it
@@ -2663,6 +2672,7 @@ class Scheduler(
             already_prefilled_lens: List[int] = []
             prefill_slacks: List[float] = []
 
+            skipped_zero_len = 0
             for req in candidates:
                 # For chunked request, extend_input_len may be stale from previous chunk.
                 # Always reinitialize to get accurate remaining tokens.
@@ -2672,21 +2682,32 @@ class Scheduler(
                     try:
                         req.init_next_round_input(self.tree_cache)
                         extend_len = max(int(getattr(req, "extend_input_len", 0)), 0)
-                    except Exception:
+                    except Exception as e:
+                        logger.warning("[PREFILL-SIM] init_next_round_input failed for req %s: %s", req.rid, e)
                         extend_len = 0
 
                 prefetched = max(len(getattr(req, "prefix_indices", [])), 0)
                 total_len = prefetched + extend_len
 
-                slack_raw = getattr(req, "last_slack_ms", None)
-                if slack_raw is None:
-                    slack_raw = self._compute_req_slack_ms(req, now_ms=now_ms)
-                slack_raw = 0.0 if slack_raw is None else float(slack_raw)
-                # Prefill slack: subtract overlap time; do not add TPOT here.
-                # Waiting requests are not serviced during overlap, so they just lose time.
-                slack_adj = max(slack_raw - pred_last, 0.0)
+                # For SLO-violated requests, assign infinite slack so they don't constrain scheduling
+                # but still get included in the prefill plan
+                if getattr(req, 'slo_violated', False):
+                    slack_adj = 9999999.0
+                else:
+                    slack_raw = getattr(req, "last_slack_ms", None)
+                    if slack_raw is None:
+                        slack_raw = self._compute_req_slack_ms(req, now_ms=now_ms)
+                    slack_raw = 0.0 if slack_raw is None else float(slack_raw)
+                    # Prefill slack: subtract overlap time; do not add TPOT here.
+                    # Waiting requests are not serviced during overlap, so they just lose time.
+                    slack_adj = max(slack_raw - pred_last, 0.0)
 
                 if total_len <= 0:
+                    skipped_zero_len += 1
+                    logger.warning("[PREFILL-SIM] Skipping req %s: total_len=%d (prefetched=%d, extend_len=%d, origin_input_ids=%d, output_ids=%d)",
+                                   req.rid, total_len, prefetched, extend_len,
+                                   len(getattr(req, 'origin_input_ids', [])),
+                                   len(getattr(req, 'output_ids', [])))
                     continue
 
                 total_prefill_lens.append(total_len)
@@ -2701,14 +2722,17 @@ class Scheduler(
             )
 
             if scenario_changed:
+                skip_info = f" (skipped_zero_len={skipped_zero_len})" if skipped_zero_len > 0 else ""
                 logger.info(
-                    "[PREFILL-SIM] evaluate_extras: candidates=%d total_lens=%s prefill_slacks=%s already_prefilled=%s extras=%s%s",
+                    "[PREFILL-SIM] evaluate_extras: raw_candidates=%d valid=%d total_lens=%s prefill_slacks=%s already_prefilled=%s extras=%s%s%s",
+                    len(candidates),
                     len(total_prefill_lens),
                     total_prefill_lens if total_prefill_lens else "[]",
                     [f"{s:.1f}" for s in prefill_slacks] if prefill_slacks else "[]",
                     already_prefilled_lens if already_prefilled_lens else "[]",
                     PREFILL_SIM_EXTRAS,
                     " (empty base)" if not total_prefill_lens else "",
+                    skip_info,
                 )
                 # Update last scenario
                 self._last_prefill_sim_decode_batch = decode_batch
@@ -2851,8 +2875,25 @@ class Scheduler(
                         else:
                             summaries.append(f"({extra_len}, {round(reported_time)}ms)")
                             self._predicted_ttft_for_new_admits[extra_len] = reported_time
+
+                        # Log detailed plan and timeline for each extra
+                        if scenario_changed:
+                            execution_flow = res.execution_flow if res.execution_flow else res.base_plan
+                            execution_times = res.execution_times if res.execution_times else []
+                            # Build timeline string: chunk(time_ms)
+                            timeline_parts = []
+                            for chunk, t_ms in zip(execution_flow, execution_times):
+                                timeline_parts.append(f"{chunk}({t_ms:.1f}ms)")
+                            timeline_str = "[" + ", ".join(timeline_parts) + "]" if timeline_parts else "[]"
+                            logger.info(
+                                "[PREFILL-SIM] extra=%d status=%s reported_time=%.2fms (pred_last=%.2f + chunk0=%.2f + sim=%.2f) "
+                                "min_decode_slack=%.2fms min_prefill_slack=%.2fms iterations=%d flow=%s timeline=%s",
+                                extra_len, status, reported_time, pred_last, time_consumed, res.total_time_ms,
+                                res.min_decode_slack_ms, res.min_prefill_slack_ms, res.iterations,
+                                execution_flow, timeline_str
+                            )
                     if summaries and scenario_changed:
-                        logger.info("[PREFILL-SIM] extras: %s", ", ".join(summaries))
+                        logger.info("[PREFILL-SIM] extras summary: %s", ", ".join(summaries))
             except Exception:
                 logger.exception("Failed to log extra prefill simulation results")
 
@@ -3017,6 +3058,45 @@ class Scheduler(
 
         return predictor.predict(**kwargs)
 
+    def _abandon_chunked_prefill(self, requeue: bool = True) -> None:
+        """Safely abandon the current chunked prefill request.
+
+        Called when we need to stop a chunked prefill mid-way (e.g., SLO constraints).
+        At this point, cache_unfinished_req has already been called in get_next_batch_to_run:
+        - KV tokens are in radix cache (with lock_ref on last_node)
+        - req_pool_idx has already been freed
+
+        We need to:
+        1. Release the radix cache lock
+        2. Reset request state
+        3. Optionally re-queue to retry from scratch
+        4. Clear self.chunked_req
+        """
+        if self.chunked_req is None:
+            return
+
+        req = self.chunked_req
+        logger.info(
+            f"Abandoning chunked prefill for req {req.rid}, "
+            f"is_chunked={req.is_chunked}, prefix_len={len(req.prefix_indices)}"
+        )
+
+        # Release the radix cache lock (acquired in cache_unfinished_req)
+        if req.last_node is not None:
+            if self.is_hybrid:
+                self.tree_cache.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+            else:
+                self.tree_cache.dec_lock_ref(req.last_node)
+
+        # Reset request state for retry
+        req.reset_for_retract()
+
+        # Re-queue to retry from scratch (will re-match prefix from radix cache)
+        if requeue:
+            self._extend_requests_to_queue([req])
+
+        self.chunked_req = None
+
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_queue:
@@ -3077,6 +3157,7 @@ class Scheduler(
             sim_budget = self._get_simulation_chunk_budget()
             if sim_budget == 0:
                 logger.debug("SIMULATION mode: decode-only iteration per simulation plan")
+                self._abandon_chunked_prefill()  # Safe cleanup before return
                 return None
             # sim_budget is pure prefill tokens; add decode_tokens back because
             # PrefillAdder will subtract them (it expects total token budget)
@@ -3087,6 +3168,7 @@ class Scheduler(
         elif self.prefill_schedule_mode == PrefillScheduleMode.PREDICTOR:
             pred = self.predict_batch(self.running_batch)
             if self.target_iteration_time_ms is not None and pred > self.target_iteration_time_ms:
+                self._abandon_chunked_prefill()  # Safe cleanup before return
                 return None
             
             # PREDICTOR mode: binary search with cycle_time_predictor

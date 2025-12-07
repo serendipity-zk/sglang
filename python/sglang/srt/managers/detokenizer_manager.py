@@ -189,6 +189,15 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             spaces_between_special_tokens=recv_obj.spaces_between_special_tokens[0],
         )
 
+        # Capture detokenize timestamp (ms since Unix epoch)
+        import time
+        detok_start_ms = time.time() * 1000.0
+
+        # Create individual timestamps for each request for better tracking
+        detokenize_timestamps = []
+        for _ in range(bs):
+            detokenize_timestamps.append(time.time() * 1000.0)
+
         # Incremental decoding
         output_strs = []
         for i in range(bs):
@@ -224,6 +233,15 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             s.sent_offset = len(output_str)
             output_strs.append(incremental_output)
 
+        # Log detokenization timing for tracing
+        # detok_elapsed_ms = (time.time() * 1000.0) - detok_start_ms
+        # if detok_elapsed_ms > 1.0:  # Log if > 1ms
+        #     for i, rid in enumerate(recv_obj.rids):
+        #         logger.info(
+        #             f"[DETOK_TIMING] {rid}: detok_at={detokenize_timestamps[i]:.2f}ms, "
+        #             f"elapsed={detok_elapsed_ms:.2f}ms"
+        #         )
+
         return BatchStrOut(
             rids=recv_obj.rids,
             finished_reasons=recv_obj.finished_reasons,
@@ -251,6 +269,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             start_iterations=recv_obj.start_iterations,
             iteration_id=recv_obj.iteration_id,
             server_id=recv_obj.server_id,
+            detokenize_timestamps=detokenize_timestamps,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):

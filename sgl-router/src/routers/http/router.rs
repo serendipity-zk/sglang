@@ -494,11 +494,21 @@ impl Router {
         let headers_owned = headers.cloned();
         let (response_tx, response_rx) = oneshot::channel();
 
-        let arrival_time_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64()
-            * 1000.0;
+        // Extract arrival timestamp from client request, fall back to router capture
+        let arrival_time_ms = if let Some(client_arrival) = typed_req.get_arrival_time_ms() {
+            client_arrival as f64
+        } else {
+            // Backward compatibility: capture at router if client didn't provide
+            warn!(
+                "Client did not provide arrival_time_ms for request {}, capturing at router",
+                request_id
+            );
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64()
+                * 1000.0
+        };
 
         // Extract SLO fields from the request
         let target_ttft_ms = typed_req.get_target_ttft_ms();

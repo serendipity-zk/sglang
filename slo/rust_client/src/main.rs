@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::timeout;
 use tokenizers::Tokenizer;
 
 // --- Configuration ---
@@ -53,6 +54,10 @@ struct Args {
 
     #[arg(long, default_value = "output.ans")]
     ans_log_path: String,
+
+    /// Use server detokenize timestamps instead of client receive timestamps for SLO judgment
+    #[arg(long, default_value_t = false)]
+    slo_use_detokenize_time: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +114,7 @@ struct LogRecord {
 struct TokenElapsedTimeline {
     request_id: String,
     elapsed_ms: Vec<f64>,
+    detokenize_timestamps: Vec<Option<f64>>,
     server_id: Option<String>,
     start_iteration: Option<usize>,
     iteration_ids: Vec<Option<usize>>,
@@ -461,13 +467,14 @@ async fn process_request(
     state.stats.record_submit();
 
     // Record submit timestamp at the very start (wall clock time)
+    // This will be our single source of truth for all time measurements
     let submit_timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs_f64();
 
-    // Use perf_counter for accurate duration measurements
-    let start_ts = Instant::now();
+    // Use SystemTime for all measurements to ensure consistency
+    let start_ts = SystemTime::now();
 
     let mut rng = rand::rngs::StdRng::from_entropy();
 
@@ -475,6 +482,10 @@ async fn process_request(
     let pool_len = state.token_pool.len();
     let start_idx = rng.gen_range(0..pool_len.saturating_sub(row.prefill));
     let prompt_ids = &state.token_pool[start_idx..start_idx + row.prefill];
+
+    // Use submit_timestamp as arrival_time_ms for consistency
+    // This ensures client and server use the same time base
+    let arrival_time_ms = submit_timestamp * 1000.0;
 
     // 2. Build Payload
     let mut payload = serde_json::json!({
@@ -484,7 +495,8 @@ async fn process_request(
             "temperature": state.args.temperature,
             "ignore_eos": true
         },
-        "stream": true
+        "stream": true,
+        "arrival_time_ms": arrival_time_ms
     });
 
     // Add SLO targets if present (matching Python behavior)
@@ -540,14 +552,23 @@ async fn process_request(
             if !response.status().is_success() {
                 record.status = "FAILED".to_string();
                 record.error = Some(format!("HTTP {}", response.status()));
+                // Count failed requests as SLO violations if SLO targets were set
+                if row.tpot.is_some() {
+                    let tier_label = format_slo_tier_label(row.tpot);
+                    record.slo_satisfied = Some(false);
+                    record.slo_violations = Some(1);
+                    record.slo_tokens_checked = Some(0);
+                    state.stats.record_slo_result(tier_label, false).await;
+                }
             } else {
                 // 4. Stream Processing (The Critical Path)
                 let mut stream = response.bytes_stream();
                 let mut buffer = BytesMut::with_capacity(8192);
 
-                let mut first_token_ts: Option<Instant> = None;
-                let mut token_times: Vec<Instant> = Vec::with_capacity(row.decode);
+                let mut first_token_ts: Option<SystemTime> = None;
+                let mut token_times: Vec<SystemTime> = Vec::with_capacity(row.decode);
                 let mut token_iteration_ids: Vec<Option<usize>> = Vec::with_capacity(row.decode);
+                let mut token_detokenize_timestamps: Vec<Option<f64>> = Vec::with_capacity(row.decode);
                 let mut server_id: Option<String> = None;
                 let mut start_iteration: Option<usize> = None;
                 let mut last_iteration_id: Option<usize> = None;
@@ -555,83 +576,105 @@ async fn process_request(
                 let mut output_text = String::new();
                 let mut prev_token_count = 0;
 
-                // Read stream chunks
-                while let Some(chunk_res) = stream.next().await {
-                    let chunk_arrival_time = Instant::now(); // Capture time IMMEDIATELY on packet arrival
+                // Read stream chunks with idle timeout (10 seconds)
+                const IDLE_TIMEOUT_SECS: u64 = 10;
+                let idle_timeout = Duration::from_secs(IDLE_TIMEOUT_SECS);
 
-                    match chunk_res {
-                        Ok(chunk) => {
-                            buffer.extend_from_slice(&chunk);
+                loop {
+                    match timeout(idle_timeout, stream.next()).await {
+                        Ok(Some(chunk_res)) => {
+                            let chunk_arrival_time = SystemTime::now(); // Capture time IMMEDIATELY on packet arrival
 
-                            // Parse SSE lines manually
-                            while let Some(idx) = buffer.iter().position(|&b| b == b'\n') {
-                                let line_bytes = buffer.split_to(idx + 1);
-                                let line = String::from_utf8_lossy(&line_bytes);
+                            match chunk_res {
+                                Ok(chunk) => {
+                                    buffer.extend_from_slice(&chunk);
 
-                                if line.starts_with("data: ") {
-                                    let data_str = line.trim_start_matches("data: ").trim();
-                                    if data_str == "[DONE]" {
-                                        break;
-                                    }
+                                    // Parse SSE lines manually
+                                    while let Some(idx) = buffer.iter().position(|&b| b == b'\n') {
+                                        let line_bytes = buffer.split_to(idx + 1);
+                                        let line = String::from_utf8_lossy(&line_bytes);
 
-                                    // Try parse JSON
-                                    if let Ok(json) = serde_json::from_str::<Value>(data_str) {
-                                        chunk_count += 1;
-
-                                        // Extract actual token count from response (matching Python)
-                                        if let Some(meta_info) = json.get("meta_info") {
-                                            if server_id.is_none() {
-                                                if let Some(id_val) = meta_info.get("server_id").and_then(|v| v.as_str()) {
-                                                    server_id = Some(id_val.to_string());
-                                                }
+                                        if line.starts_with("data: ") {
+                                            let data_str = line.trim_start_matches("data: ").trim();
+                                            if data_str == "[DONE]" {
+                                                break;
                                             }
-                                            if start_iteration.is_none() {
-                                                if let Some(start_iter) = meta_info.get("start_iteration").and_then(|v| v.as_u64()) {
-                                                    start_iteration = Some(start_iter as usize);
-                                                }
-                                            }
-                                            let iteration_id = meta_info.get("iteration_id").and_then(|v| v.as_u64()).map(|v| v as usize);
-                                            if iteration_id.is_some() {
-                                                iteration_seen = true;
-                                                last_iteration_id = iteration_id;
-                                            }
-                                            let token_iteration_tag = iteration_id.or(last_iteration_id);
 
-                                            if let Some(completion_tokens) = meta_info.get("completion_tokens") {
-                                                if let Some(current_token_count) = completion_tokens.as_u64() {
-                                                    let current_token_count = current_token_count as usize;
+                                            // Try parse JSON
+                                            if let Ok(json) = serde_json::from_str::<Value>(data_str) {
+                                                chunk_count += 1;
 
-                                                    // Record time when we get NEW tokens
-                                                    if current_token_count > prev_token_count {
-                                                        let num_new_tokens = current_token_count - prev_token_count;
+                                                // Extract actual token count from response (matching Python)
+                                                if let Some(meta_info) = json.get("meta_info") {
+                                                    if server_id.is_none() {
+                                                        if let Some(id_val) = meta_info.get("server_id").and_then(|v| v.as_str()) {
+                                                            server_id = Some(id_val.to_string());
+                                                        }
+                                                    }
+                                                    if start_iteration.is_none() {
+                                                        if let Some(start_iter) = meta_info.get("start_iteration").and_then(|v| v.as_u64()) {
+                                                            start_iteration = Some(start_iter as usize);
+                                                        }
+                                                    }
+                                                    let iteration_id = meta_info.get("iteration_id").and_then(|v| v.as_u64()).map(|v| v as usize);
+                                                    if iteration_id.is_some() {
+                                                        iteration_seen = true;
+                                                        last_iteration_id = iteration_id;
+                                                    }
+                                                    let token_iteration_tag = iteration_id.or(last_iteration_id);
 
-                                                        // Add token times for each new token
-                                                        for _ in 0..num_new_tokens {
-                                                            token_times.push(chunk_arrival_time);
-                                                            token_iteration_ids.push(token_iteration_tag);
-                                                            if first_token_ts.is_none() {
-                                                                first_token_ts = Some(chunk_arrival_time);
+                                                    // Extract detokenize timestamp
+                                                    let detokenize_timestamp = meta_info.get("detokenize_timestamp").and_then(|v| v.as_f64());
+
+                                                    if let Some(completion_tokens) = meta_info.get("completion_tokens") {
+                                                        if let Some(current_token_count) = completion_tokens.as_u64() {
+                                                            let current_token_count = current_token_count as usize;
+
+                                                            // Record time when we get NEW tokens
+                                                            if current_token_count > prev_token_count {
+                                                                let num_new_tokens = current_token_count - prev_token_count;
+
+                                                                // Add token times for each new token
+                                                                for _ in 0..num_new_tokens {
+                                                                    token_times.push(chunk_arrival_time);
+                                                                    token_iteration_ids.push(token_iteration_tag);
+                                                                    token_detokenize_timestamps.push(detokenize_timestamp);
+                                                                    if first_token_ts.is_none() {
+                                                                        first_token_ts = Some(chunk_arrival_time);
+                                                                    }
+                                                                }
+
+                                                                prev_token_count = current_token_count;
                                                             }
                                                         }
+                                                    }
+                                                }
 
-                                                        prev_token_count = current_token_count;
+                                                // Get output text from server (cumulative)
+                                                if let Some(text) = json.get("text") {
+                                                    if let Some(text_str) = text.as_str() {
+                                                        output_text = text_str.to_string();
                                                     }
                                                 }
                                             }
                                         }
-
-                                        // Get output text from server (cumulative)
-                                        if let Some(text) = json.get("text") {
-                                            if let Some(text_str) = text.as_str() {
-                                                output_text = text_str.to_string();
-                                            }
-                                        }
                                     }
+                                }
+                                Err(e) => {
+                                    record.status = "FAILED".to_string();
+                                    record.error = Some(e.to_string());
+                                    break;
                                 }
                             }
                         }
-                        Err(e) => {
-                            record.error = Some(e.to_string());
+                        Ok(None) => {
+                            // Stream ended normally
+                            break;
+                        }
+                        Err(_) => {
+                            // Timeout - no data received for 10 seconds
+                            record.status = "FAILED".to_string();
+                            record.error = Some("Token idle timeout after 10s".to_string());
                             break;
                         }
                     }
@@ -641,21 +684,24 @@ async fn process_request(
                 record.output_text = output_text.chars().take(100).collect();
 
                 // 5. Calculate Stats
-                let end_ts = Instant::now();
-                record.total_duration_ms = (end_ts.duration_since(start_ts).as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
-                record.status = "SUCCESS".to_string();
+                let end_ts = SystemTime::now();
+                record.total_duration_ms = (end_ts.duration_since(start_ts).unwrap_or_default().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
+                // Only mark SUCCESS if no error occurred (timeout or stream error)
+                if record.error.is_none() {
+                    record.status = "SUCCESS".to_string();
+                }
                 record.real_output_len = token_times.len();
                 record.chunk_count = chunk_count;
 
                 if let Some(ft) = first_token_ts {
-                    record.ttft_ms = Some((ft.duration_since(start_ts).as_secs_f64() * 1000.0 * 100.0).round() / 100.0);
+                    record.ttft_ms = Some((ft.duration_since(start_ts).unwrap_or_default().as_secs_f64() * 1000.0 * 100.0).round() / 100.0);
                 }
 
                 // Calculate inter-token intervals over ALL tokens (matching Python)
                 let mut all_intervals: Vec<f64> = Vec::new();
                 if token_times.len() >= 2 {
                     for i in 1..token_times.len() {
-                        let interval_ms = token_times[i].duration_since(token_times[i-1]).as_secs_f64() * 1000.0;
+                        let interval_ms = token_times[i].duration_since(token_times[i-1]).unwrap_or_default().as_secs_f64() * 1000.0;
                         all_intervals.push(interval_ms);
                     }
                 }
@@ -672,10 +718,31 @@ async fn process_request(
                 record.intervals = all_intervals.iter().take(20).map(|x| (x * 100.0).round() / 100.0).collect();
 
                 // Precompute per-token elapsed times relative to request start
-                let elapsed_ms_per_token: Vec<f64> = token_times
-                    .iter()
-                    .map(|t| t.duration_since(start_ts).as_secs_f64() * 1000.0)
-                    .collect();
+                // Use detokenize timestamps if flag is set, otherwise use receive timestamps
+                let submit_ms = submit_timestamp * 1000.0;
+                let elapsed_ms_per_token: Vec<f64> = if state.args.slo_use_detokenize_time {
+                    // Use server detokenize timestamps for SLO calculation
+                    // Fall back to receive time if detokenize timestamp is missing
+                    token_detokenize_timestamps
+                        .iter()
+                        .zip(token_times.iter())
+                        .map(|(opt_detok_ts, recv_time)| {
+                            if let Some(detok_ts) = opt_detok_ts {
+                                // detok_ts is in ms since epoch, submit_ms is also in ms since epoch
+                                detok_ts - submit_ms
+                            } else {
+                                // Fallback to receive time
+                                recv_time.duration_since(start_ts).unwrap_or_default().as_secs_f64() * 1000.0
+                            }
+                        })
+                        .collect()
+                } else {
+                    // Use client receive timestamps (existing behavior)
+                    token_times
+                        .iter()
+                        .map(|t| t.duration_since(start_ts).unwrap_or_default().as_secs_f64() * 1000.0)
+                        .collect()
+                };
 
                 // SLO check: verify each token i arrives before start_time + ttft + i * tpot
                 if let (Some(ttft_limit), Some(tpot_limit)) = (row.ttft, row.tpot) {
@@ -734,6 +801,7 @@ async fn process_request(
                         let timeline = TokenElapsedTimeline {
                             request_id: req_id.clone(),
                             elapsed_ms: elapsed_ms_per_token,
+                            detokenize_timestamps: token_detokenize_timestamps,
                             server_id: server_id.clone(),
                             start_iteration,
                             iteration_ids: token_iteration_ids,
@@ -744,10 +812,18 @@ async fn process_request(
             }
         }
         Err(e) => {
-            let end_ts = Instant::now();
+            let end_ts = SystemTime::now();
             record.status = "FAILED".to_string();
             record.error = Some(e.to_string());
-            record.total_duration_ms = (end_ts.duration_since(start_ts).as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
+            record.total_duration_ms = (end_ts.duration_since(start_ts).unwrap_or_default().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
+            // Count failed requests as SLO violations if SLO targets were set
+            if row.tpot.is_some() {
+                let tier_label = format_slo_tier_label(row.tpot);
+                record.slo_satisfied = Some(false);
+                record.slo_violations = Some(1);
+                record.slo_tokens_checked = Some(0);
+                state.stats.record_slo_result(tier_label, false).await;
+            }
         }
     }
 

@@ -563,6 +563,7 @@ class GenerateReqInput:
             target_tpot_ms=self.target_tpot_ms if self.target_tpot_ms is not None else None,
             router_generation=self.router_generation,
             router_message_id=self.router_message_id,
+            arrival_time_ms=self.arrival_time_ms,
         )
 
 
@@ -937,6 +938,7 @@ class BatchStrOut:
     start_iterations: Optional[List[Optional[int]]] = None
     iteration_id: Optional[int] = None
     server_id: Optional[str] = None
+    detokenize_timestamps: Optional[List[float]] = None
 
 
 @dataclass

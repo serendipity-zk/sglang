@@ -42,6 +42,7 @@ class SimulatorConfig:
     kv_cache: int
     tpot_ms: float
     slack_decode_ms: float
+    safety_margin_ms: float = 0.0  # Minimum decode slack to maintain before prefill
 
 
 @dataclass
@@ -232,7 +233,7 @@ class SimulationScenario:
             chunk_size *= 2
         raw_plans.append([self.total_len])
         # only get first 4 power-of-2 plans to limit total plans
-        raw_plans = raw_plans[:-4]
+        raw_plans = raw_plans[-4:]
         t_pow2_end = time.perf_counter()
 
         # # 2. Group-by-request plan
@@ -423,13 +424,15 @@ class TimelineSimulator:
             # 1. Decode Constraint Check
             est_decode_slack = decode_slack - cycle_time + config.tpot_ms
 
-            if est_decode_slack < 0:
-                # Must inject wait cycles
+            if est_decode_slack < config.safety_margin_ms:
+                # Must inject wait cycles to maintain safety margin
                 if decode_recovery_rate <= 1e-9:
                     decode_feasible = False
                     num_waits = 0
                 else:
-                    num_waits = math.ceil(-est_decode_slack / decode_recovery_rate)
+                    # Recover enough slack to reach the safety margin
+                    deficit = config.safety_margin_ms - est_decode_slack
+                    num_waits = math.ceil(deficit / decode_recovery_rate)
 
                 # Add wait cycles to execution flow
                 execution_flow.extend([0] * num_waits)
@@ -487,14 +490,18 @@ class TimelineSimulator:
 # ==============================================================================
 
 class PrefillSimulatorEngine:
-    def __init__(self, predictor: ModeAwarePredictor):
+    def __init__(self, predictor: ModeAwarePredictor, safety_margin_ms: float = 0.0):
         """
         Initialize the prefill simulator engine.
 
         Args:
             predictor: External ModeAwarePredictor instance
+            safety_margin_ms: Minimum decode slack (ms) to maintain before starting prefill.
+                              If decode slack would drop below this margin after prefill,
+                              decode-only iterations are injected first to recover slack.
         """
         self.predictor_instance = predictor
+        self.safety_margin_ms = safety_margin_ms
         self.config: Optional[SimulatorConfig] = None
         self.predictor: Optional[GlobalBatchPredictor] = None
 
@@ -510,6 +517,7 @@ class PrefillSimulatorEngine:
             kv_cache=kv_cache,
             tpot_ms=tpot_ms,
             slack_decode_ms=slack_decode_ms,
+            safety_margin_ms=self.safety_margin_ms,
         )
 
         # Recreate GlobalBatchPredictor if config changed (especially decode_batch or kv_cache)
@@ -704,6 +712,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kv-cache", type=int, default=50_000)
     parser.add_argument("--tpot", type=float, default=30.0)
     parser.add_argument("--decode-slack", type=float, default=0.0)
+    parser.add_argument("--safety-margin", type=float, default=0.0,
+                        help="Minimum decode slack (ms) to maintain before starting prefill")
     parser.add_argument("--grid-path", default="sglang_profile/grid3d.json")
     parser.add_argument("--test-extra-len", type=int, nargs="+", default=None)
     parser.add_argument("--csv-log-path", type=str, default=None,
@@ -740,7 +750,7 @@ def main():
     )
 
     # Create engine with predictor
-    engine = PrefillSimulatorEngine(predictor=predictor)
+    engine = PrefillSimulatorEngine(predictor=predictor, safety_margin_ms=args.safety_margin)
     engine.update_decode(
         decode_batch=args.decode_batch,
         kv_cache=args.kv_cache,

@@ -670,6 +670,8 @@ class Req:
         self.arrival_time_ms = arrival_time_ms
         # Scheduler iteration counter snapshot when the request was accepted
         self.start_iteration = start_iteration
+        # SLO violation flag - set True when slack goes negative, never reset
+        self.slo_violated: bool = False
 
     @property
     def seqlen(self):

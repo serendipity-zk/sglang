@@ -40,7 +40,7 @@ def is_port_available(host: str, port: int) -> bool:
         s.listen(1)
         return True
     except OSError:
-        return True
+        return False
     finally:
         try:
             s.close()

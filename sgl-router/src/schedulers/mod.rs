@@ -263,7 +263,11 @@ fn prepare_request_payload<'a>(
                 map.insert("router_generation".to_string(), json!(gen));
                 map.insert("router_message_id".to_string(), json!(msg_id));
             }
-            map.insert("arrival_time_ms".to_string(), json!(arrival_time_ms));
+            // Only inject arrival_time_ms if not already present in payload
+            // (New clients provide it; old payloads need router injection)
+            if !map.contains_key("arrival_time_ms") {
+                map.insert("arrival_time_ms".to_string(), json!(arrival_time_ms));
+            }
         }
 
         RequestPayload::Owned(owned)
@@ -454,6 +458,15 @@ async fn send_http_request_impl(
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("text/event-stream"),
         );
+        // Add anti-buffering headers to prevent nginx/proxy buffering and reduce latency
+        response_headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+        );
+        response_headers.insert(
+            axum::http::header::HeaderName::from_static("x-accel-buffering"),
+            axum::http::HeaderValue::from_static("no"),
+        );
 
         let stream = res.bytes_stream();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -505,6 +518,15 @@ async fn send_http_request_impl(
         response_headers.insert(
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+        // Add anti-buffering headers to prevent nginx/proxy buffering and reduce latency
+        response_headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+        );
+        response_headers.insert(
+            axum::http::header::HeaderName::from_static("x-accel-buffering"),
+            axum::http::HeaderValue::from_static("no"),
         );
 
         let stream = res.bytes_stream();

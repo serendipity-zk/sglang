@@ -1430,6 +1430,17 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             if start_iterations is not None and len(start_iterations) > i:
                 meta_info["start_iteration"] = start_iterations[i]
 
+            # Add detokenize timestamp
+            detokenize_timestamps = getattr(recv_obj, "detokenize_timestamps", None)
+            if detokenize_timestamps is not None and len(detokenize_timestamps) > i:
+                meta_info["detokenize_timestamp"] = detokenize_timestamps[i]
+
+            # Add response send timestamp for tracing
+            import time
+            response_send_ms = time.time() * 1000.0
+            meta_info["response_send_timestamp"] = response_send_ms
+
+
             if getattr(state.obj, "return_logprob", False):
                 self.convert_logprob_style(
                     meta_info,
