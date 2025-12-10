@@ -8,20 +8,32 @@ from typing import Optional, Set, Tuple
 import logging
 logger = logging.getLogger(__name__)
 
+# Maximum number of seen message IDs to track for deduplication
+MAX_SEEN_IDS = 10000
+
+
 class RouterMessageAckTracker:
-    """Tracks highest contiguous router message IDs per generation for stats reporting."""
+    """Tracks highest contiguous router message IDs per generation for stats reporting.
+
+    Also provides deduplication support for resent messages.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._current_generation: Optional[int] = None
         self._last_contiguous_id: int = -1
         self._pending_ids: Set[int] = set()
+        self._seen_ids: Set[int] = set()  # Track all seen message IDs for deduplication
 
-    def record(self, generation: Optional[int], message_id: Optional[int]) -> None:
-        """Record that a request with (generation, message_id) was received."""
-        logger.warning(f"Recording message: generation={generation}, message_id={message_id}")
+    def record(self, generation: Optional[int], message_id: Optional[int]) -> bool:
+        """Record that a request with (generation, message_id) was received.
+
+        Returns:
+            True if this is a new message that should be processed.
+            False if this is a duplicate message that should be dropped.
+        """
         if generation is None or message_id is None:
-            return
+            return True  # Not tracked, allow through
 
         with self._lock:
             if self._current_generation is None or generation > self._current_generation:
@@ -29,15 +41,26 @@ class RouterMessageAckTracker:
                 self._current_generation = generation
                 self._last_contiguous_id = -1
                 self._pending_ids.clear()
+                self._seen_ids.clear()
             elif generation < self._current_generation:
                 # Ignore stale generations.
-                logger.warning(f"Ignoring stale generation: generation={generation}, current_generation={self._current_generation}")
-                return
+                logger.info(f"Dropping stale generation message: generation={generation}, current_generation={self._current_generation}")
+                return False
 
-            if message_id <= self._last_contiguous_id:
-                logger.warning(f"Ignoring duplicate message: message_id={message_id}, last_contiguous_id={self._last_contiguous_id}")
-                return
+            # Check for duplicate - either already processed (contiguous) or already seen
+            if message_id <= self._last_contiguous_id or message_id in self._seen_ids:
+                logger.info(f"Dropping duplicate message: generation={generation}, message_id={message_id}")
+                return False
 
+            # Track this message ID for future deduplication
+            self._seen_ids.add(message_id)
+
+            # Memory management: clean up old seen IDs when limit exceeded
+            if len(self._seen_ids) > MAX_SEEN_IDS:
+                # Keep only IDs greater than last_contiguous_id (still relevant)
+                self._seen_ids = {id for id in self._seen_ids if id > self._last_contiguous_id}
+
+            # Track for contiguous acknowledgment
             self._pending_ids.add(message_id)
 
             next_expected = self._last_contiguous_id + 1
@@ -45,6 +68,8 @@ class RouterMessageAckTracker:
                 self._pending_ids.remove(next_expected)
                 self._last_contiguous_id = next_expected
                 next_expected += 1
+
+            return True
 
     def get_state(self) -> Tuple[Optional[int], Optional[int]]:
         """Return (generation, last_contiguous_id) for stats reporting."""

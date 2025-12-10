@@ -302,6 +302,7 @@ mod tests {
             gen,
             "/generate".to_string(),
             Some("test-req".to_string()),
+            serde_json::json!({"test": true}),
         ));
 
         // Verify worker1 now has pending work
@@ -319,6 +320,7 @@ mod tests {
             gen,
             "/generate".to_string(),
             Some("test-req-2".to_string()),
+            serde_json::json!({"test": true}),
         ));
 
         // Now both workers are busy, should defer

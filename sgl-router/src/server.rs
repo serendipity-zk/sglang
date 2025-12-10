@@ -864,6 +864,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.health_check.check_interval_secs
     );
 
+    // Start resend checker for unacknowledged messages
+    let _resend_checker = app_context.worker_registry.start_resend_checker();
+    info!("Started resend checker for unacknowledged messages (50ms interval)");
+
     // Set up concurrency limiter with queue if configured
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(
         app_context.rate_limiter.clone(),

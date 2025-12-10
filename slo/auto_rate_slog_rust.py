@@ -187,6 +187,8 @@ def write_run_scaffold(args, plot_path: str, full_log_dir: str, start_ts: dateti
             "max_requests": args.max_requests,
             "target_attainment": args.target_attainment,
             "start_rate": args.start_rate,
+            "single_rate": args.single_rate,
+            "rate_list": args.rate_list,
             "max_probes": args.max_probes,
             "precision": args.precision,
             "slo_use_detokenize_time": args.slo_use_detokenize_time,
@@ -237,6 +239,12 @@ def parse_args():
                    help="Desired SLO attainment (0-1) to bracket the knee")
     p.add_argument("--start-rate", type=float, default=1.0,
                    help="Initial rate guess (arrival scaling factor)")
+    p.add_argument("--single-rate", type=float, default=None,
+                   help="Run at a fixed rate (skips adaptive search). "
+                        "If not specified, uses adaptive rate search.")
+    p.add_argument("--rate-list", type=str, default=None,
+                   help="Comma-separated list of rates to test sequentially "
+                        "(e.g., '100,150,200,250'). Skips adaptive search.")
     p.add_argument("--max-probes", type=int, default=12,
                    help="Maximum number of test runs during adaptive search (including tail samples)")
     p.add_argument("--precision", type=float, default=0.10,
@@ -372,7 +380,7 @@ def run_single_rate_rust(args, rate: float, logs_dir: str, rust_binary: str) -> 
     log_path = os.path.join(logs_dir, f"rate_{safe_rate}_{timestamp}.jsonl")
     ans_log_path = os.path.join(logs_dir, f"rate_{safe_rate}_{timestamp}.ans")
 
-    print(f"\n[auto-slog-rust] Running rate={rate:.4f}, log={log_path}")
+    print(f"\n[auto-slog-rust] Running rate={rate:.4f}, log={log_path}", flush=True)
 
     # Build command for Rust binary
     cmd = [
@@ -403,9 +411,9 @@ def run_single_rate_rust(args, rate: float, logs_dir: str, rust_binary: str) -> 
     result = subprocess.run(cmd, capture_output=True, text=True)
     
     if result.returncode != 0:
-        print(f"[auto-slog-rust] Rust client exited with code {result.returncode}")
+        print(f"[auto-slog-rust] Rust client exited with code {result.returncode}", flush=True)
         if result.stderr:
-            print(f"[auto-slog-rust] stderr: {result.stderr[:500]}")
+            print(f"[auto-slog-rust] stderr: {result.stderr[:500]}", flush=True)
 
     # Count completed/failed from log file
     submitted = 0
@@ -448,7 +456,8 @@ def run_single_rate_rust(args, rate: float, logs_dir: str, rust_binary: str) -> 
         f"[auto-slog-rust] Submitted={submitted}, Completed={completed}, Failed={failed}, "
         f"SLO attainment={attainment if attainment is not None else 'N/A'}, "
         f"SLO+100ms={slack_attainment if slack_attainment is not None else 'N/A'}, "
-        f"Tiers={fmt_tiers(tier_stats)}, Tiers+100ms={fmt_tiers(slack_tier_stats)}"
+        f"Tiers={fmt_tiers(tier_stats)}, Tiers+100ms={fmt_tiers(slack_tier_stats)}",
+        flush=True,
     )
 
     return {
@@ -640,14 +649,38 @@ def main():
     write_run_scaffold(args, plot_path, full_log_dir, start_ts)
 
     start = time.time()
-    search_result = adaptive_rate_search(args, full_log_dir, history_path, existing_history, rust_binary)
+
+    if args.rate_list is not None:
+        # Rate list mode - iterate through provided rates
+        rates = [float(r.strip()) for r in args.rate_list.split(",") if r.strip()]
+        print(f"[auto-slog-rust] Rate list mode: testing {len(rates)} rates: {rates}")
+        history = []
+        for idx, rate in enumerate(rates, start=1):
+            result = run_single_rate_rust(args, rate, full_log_dir, rust_binary)
+            result["order"] = idx
+            history.append(result)
+            persist_run_history(history_path, history)
+        # Use the rate with highest attainment >= target as knee, or max tested rate
+        passing = [h for h in history if h["attainment"] is not None and h["attainment"] >= args.target_attainment]
+        knee_rate = max(h["rate"] for h in passing) if passing else rates[-1]
+    elif args.single_rate is not None:
+        # Single rate mode - run once and exit
+        print(f"[auto-slog-rust] Single rate mode: running at rate={args.single_rate}")
+        result = run_single_rate_rust(args, args.single_rate, full_log_dir, rust_binary)
+        result["order"] = 1
+        history = [result]
+        persist_run_history(history_path, history)
+        knee_rate = args.single_rate
+    else:
+        # Adaptive search mode (existing behavior)
+        search_result = adaptive_rate_search(args, full_log_dir, history_path, existing_history, rust_binary)
+        history = search_result["history"]
+        knee_rate = search_result["knee_rate"]
+
     elapsed = time.time() - start
 
-    history = search_result["history"]
-    knee_rate = search_result["knee_rate"]
-
     # Print summary table
-    print("\n=== Adaptive rate sweep summary (Rust client) ===")
+    print("\n=== Adaptive rate sweep summary (Rust client) ===", flush=True)
     for entry in sorted(history, key=lambda h: h["order"]):
         att = entry["attainment"]
         slack_att = entry["slack_attainment"]
@@ -659,7 +692,8 @@ def main():
             f"[{entry['order']:02d}] rate={entry['rate']:.4f} "
             f"SLO={att_str} "
             f"SLO+100ms={slack_str} "
-            f"log={entry['log_path']}"
+            f"log={entry['log_path']}",
+            flush=True,
         )
         if tier_stats or slack_tier_stats:
             def fmt(ts):
@@ -671,17 +705,17 @@ def main():
                     parts.append(f"{tier}:{ok}/{total} ({pct:.3f})")
                 return "; ".join(parts) if parts else "N/A"
 
-            print(f"     tiers: {fmt(tier_stats)}")
-            print(f"     tiers+100ms: {fmt(slack_tier_stats)}")
+            print(f"     tiers: {fmt(tier_stats)}", flush=True)
+            print(f"     tiers+100ms: {fmt(slack_tier_stats)}", flush=True)
 
     # Render curve
     render_curve(history, args.target_attainment, plot_path)
     csv_path = write_rate_csv(history, args.output_dir)
-    print(f"\nEstimated knee rate: {knee_rate:.4f}")
-    print(f"SLOG curve saved to: {plot_path}")
+    print(f"\nEstimated knee rate: {knee_rate:.4f}", flush=True)
+    print(f"SLOG curve saved to: {plot_path}", flush=True)
     if csv_path:
-        print(f"Per-rate tier summary CSV: {csv_path}")
-    print(f"Total elapsed: {elapsed/60:.1f} minutes")
+        print(f"Per-rate tier summary CSV: {csv_path}", flush=True)
+    print(f"Total elapsed: {elapsed/60:.1f} minutes", flush=True)
 
 
 if __name__ == "__main__":

@@ -185,6 +185,7 @@ class ServerArgs:
     priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
     slo_target_margin: float = 0.03  # 3% margin subtracted from target tpot/ttft
+    default_tpot_ms: Optional[float] = None  # Default TPOT (ms) for SLO-aware scheduling
     page_size: Optional[int] = None
     hybrid_kvcache_ratio: Optional[float] = None
     swa_full_tokens_ratio: float = 0.8
@@ -241,7 +242,7 @@ class ServerArgs:
     predictor_type: str = "grid"
     predictor_grid_path: str = "/sgl-workspace/sglang/profile/grid3d.json"
     predictor_log_path: Optional[str] = None
-    prefill_schedule_mode: str = "budget"  # "budget", "predictor", "simulation"
+    prefill_schedule_mode: str = "budget"  # "budget", "predictor", "simulation", "slack"
 
     # API related
     api_key: Optional[str] = None
@@ -1370,6 +1371,12 @@ class ServerArgs:
             help="Margin to subtract from target_tpot_ms and target_ttft_ms. Default is 0.03 (3%%). Set to 0 to disable.",
         )
         parser.add_argument(
+            "--default-tpot-ms",
+            type=float,
+            default=ServerArgs.default_tpot_ms,
+            help="Default TPOT target (ms) for SLO-aware scheduling. Used when requests don't specify target_tpot_ms.",
+        )
+        parser.add_argument(
             "--page-size",
             type=int,
             default=ServerArgs.page_size,
@@ -1682,8 +1689,8 @@ class ServerArgs:
             "--prefill-schedule-mode",
             type=str,
             default=ServerArgs.prefill_schedule_mode,
-            choices=["budget", "predictor", "simulation"],
-            help="Prefill scheduling strategy: budget (greedy fill), predictor (TPOT-aware binary search), simulation (plan-guided)",
+            choices=["budget", "predictor", "simulation", "slack"],
+            help="Prefill scheduling strategy: budget (greedy fill), predictor (TPOT-aware binary search), simulation (plan-guided), slack (min_decode_slack target)",
         )
 
         # API related

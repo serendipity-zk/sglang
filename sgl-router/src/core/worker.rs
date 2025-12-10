@@ -6,13 +6,13 @@ use crate::metrics::RouterMetrics;
 use async_trait::async_trait;
 use futures;
 use parking_lot::RwLock;
-use serde_json;
+use serde_json::{self, json};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{info, warn};
 
 // Shared HTTP client for worker operations (health checks, server info, etc.)
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -21,6 +21,11 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .expect("Failed to create worker HTTP client")
 });
+
+/// Timeout in milliseconds before resending an unacknowledged message
+pub const RESEND_TIMEOUT_MS: u64 = 100;
+/// Maximum number of times to resend a message before giving up
+pub const MAX_RESEND_ATTEMPTS: u32 = 3;
 
 /// Represents a request dispatched to a worker that hasn't been acknowledged yet.
 #[derive(Debug, Clone)]
@@ -35,6 +40,12 @@ pub struct PendingMessage {
     pub route: String,
     /// Timestamp when the router dispatched the message
     pub timestamp: Instant,
+    /// Number of times this message has been resent
+    pub resend_count: u32,
+    /// Timestamp of the last send (initial send or resend)
+    pub last_send_time: Instant,
+    /// Request body stored for potential resend (contains router_generation and router_message_id)
+    pub body_json: serde_json::Value,
 }
 
 impl PendingMessage {
@@ -44,15 +55,72 @@ impl PendingMessage {
         generation: i64,
         route: impl Into<String>,
         request_id: Option<String>,
+        body_json: serde_json::Value,
     ) -> Self {
+        let now = Instant::now();
         Self {
             message_id,
             generation,
             request_id,
             route: route.into(),
-            timestamp: Instant::now(),
+            timestamp: now,
+            resend_count: 0,
+            last_send_time: now,
+            body_json,
         }
     }
+
+    /// Check if this message should be resent (timed out but not exceeded max attempts)
+    pub fn should_resend(&self) -> bool {
+        self.resend_count < MAX_RESEND_ATTEMPTS
+            && self.last_send_time.elapsed().as_millis() >= RESEND_TIMEOUT_MS as u128
+    }
+}
+
+/// Resend a pending message to a worker.
+/// This is a fire-and-forget operation - we don't wait for the response since
+/// the original request handler is already waiting.
+pub async fn resend_message(worker_url: &str, message: &PendingMessage) {
+    // Prepare the body with router metadata (same as prepare_request_payload)
+    let mut body = message.body_json.clone();
+    if let Some(map) = body.as_object_mut() {
+        map.insert("router_generation".to_string(), json!(message.generation));
+        map.insert("router_message_id".to_string(), json!(message.message_id));
+    }
+
+    let url = format!("{}{}", worker_url, message.route);
+    info!(
+        "[RESEND] worker={} message_id={} attempt={} route={}",
+        worker_url,
+        message.message_id,
+        message.resend_count + 1,
+        message.route
+    );
+
+    // Fire and forget - spawn to avoid blocking the resend checker
+    let url_clone = url.clone();
+    tokio::spawn(async move {
+        match WORKER_CLIENT
+            .post(&url_clone)
+            .json(&body)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    warn!(
+                        "[RESEND] Failed to resend to {}: status={}",
+                        url_clone,
+                        resp.status()
+                    );
+                }
+            }
+            Err(e) => {
+                warn!("[RESEND] Failed to resend to {}: {}", url_clone, e);
+            }
+        }
+    });
 }
 
 /// Core worker abstraction that represents a backend service
@@ -127,6 +195,12 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Cleanup stale pending messages and record metrics
     /// This method handles its own metrics recording
     fn cleanup_pending_messages(&self, ttl: Duration);
+
+    /// Get messages that need to be resent (timed out but not exceeded max attempts)
+    fn get_messages_to_resend(&self) -> Vec<PendingMessage>;
+
+    /// Mark a message as resent (increment resend count and update last_send_time)
+    fn mark_resent(&self, message_id: i64);
 
     /// Get the number of processed requests
     fn processed_requests(&self) -> usize;
@@ -624,6 +698,23 @@ impl Worker for BasicWorker {
         }
     }
 
+    fn get_messages_to_resend(&self) -> Vec<PendingMessage> {
+        let pending = self.pending_messages.read();
+        pending
+            .iter()
+            .filter(|msg| msg.should_resend())
+            .cloned()
+            .collect()
+    }
+
+    fn mark_resent(&self, message_id: i64) {
+        let mut pending = self.pending_messages.write();
+        if let Some(msg) = pending.iter_mut().find(|m| m.message_id == message_id) {
+            msg.resend_count += 1;
+            msg.last_send_time = Instant::now();
+        }
+    }
+
     fn processed_requests(&self) -> usize {
         self.processed_counter.load(Ordering::Relaxed)
     }
@@ -746,6 +837,14 @@ impl Worker for DPAwareWorker {
 
     fn cleanup_pending_messages(&self, ttl: Duration) {
         self.base_worker.cleanup_pending_messages(ttl)
+    }
+
+    fn get_messages_to_resend(&self) -> Vec<PendingMessage> {
+        self.base_worker.get_messages_to_resend()
+    }
+
+    fn mark_resent(&self, message_id: i64) {
+        self.base_worker.mark_resent(message_id)
     }
 
     fn processed_requests(&self) -> usize {
@@ -1930,7 +2029,13 @@ mod tests {
     }
 
     fn make_pending(id: i64) -> PendingMessage {
-        PendingMessage::new(id, 777, "/generate", Some(format!("req-{id}")))
+        PendingMessage::new(
+            id,
+            777,
+            "/generate",
+            Some(format!("req-{id}")),
+            serde_json::json!({"test": true}),
+        )
     }
 
     #[test]

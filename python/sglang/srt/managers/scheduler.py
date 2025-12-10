@@ -607,8 +607,8 @@ class Scheduler(
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
 
-        # Global TPOT (cycle time) regulator; set via /set_tpot
-        self.tpot: Optional[float] = None
+        # Global TPOT (cycle time) regulator; set via /set_tpot or --default-tpot-ms
+        self.tpot: Optional[float] = self.server_args.default_tpot_ms
 
         # Iteration counter - tracks completed GPU iterations
         self.iteration_count = 0
@@ -680,6 +680,8 @@ class Scheduler(
             server_args.prefill_schedule_mode
         )
         logger.info(f"Prefill schedule mode: {self.prefill_schedule_mode.value}")
+        if self.tpot is not None:
+            logger.info(f"Default TPOT target: {self.tpot}ms")
 
         # Track output length observations + forecast future KV peak/slack
         self.output_estimator = (
@@ -1916,6 +1918,16 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        # Check for duplicate messages early (before creating Req object)
+        if not self.router_ack_tracker.record(
+            recv_req.router_generation, recv_req.router_message_id
+        ):
+            logger.info(
+                f"Dropping duplicate request: rid={recv_req.rid}, "
+                f"generation={recv_req.router_generation}, message_id={recv_req.router_message_id}"
+            )
+            return
+
         self.maybe_update_dp_balance_data(recv_req)
 
         recv_arrival = getattr(recv_req, "arrival_time_ms", None)
@@ -2009,9 +2021,7 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        self.router_ack_tracker.record(
-            recv_req.router_generation, recv_req.router_message_id
-        )
+        # Note: router_ack_tracker.record() is called at the start of handle_generate_request()
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
@@ -2512,6 +2522,64 @@ class Scheduler(
         logger.info(f"[SIM SCHEDULE] execution_flow={execution_flow}, using first_chunk={first_chunk}")
         return first_chunk
 
+    def _compute_min_valid_decode_slack(self) -> Optional[float]:
+        """Compute minimum valid decode slack from active decode requests.
+
+        Filters out:
+        - Requests with slo_violated flag set
+        - Requests with slack < 0
+        - Requests with fixed_slack < 0 (after overlap adjustment)
+
+        Returns None if no valid decode requests found.
+        """
+        tpot_effective = self.tpot if self.tpot not in (None, 0) else 1000.0
+        pred_last = self.last_cycle_time_prediction
+
+        min_decode_slack = None
+
+        if self.last_batch is not None and getattr(self.last_batch, "reqs", None):
+            decoding_reqs = (
+                set(self.last_batch.decoding_reqs)
+                if getattr(self.last_batch, "decoding_reqs", None)
+                else None
+            )
+            for req in self.last_batch.reqs:
+                is_decode = (
+                    self.last_batch.forward_mode == ForwardMode.DECODE
+                    or (
+                        self.last_batch.forward_mode == ForwardMode.MIXED
+                        and decoding_reqs
+                        and req in decoding_reqs
+                    )
+                )
+                if not is_decode:
+                    continue
+
+                # Filter: skip already violated requests
+                if getattr(req, 'slo_violated', False):
+                    continue
+
+                slack_val = getattr(req, "last_slack_ms", None)
+                if slack_val is None:
+                    slack_val = self._compute_req_slack_ms(req, now_ms=time.time() * 1000.0)
+
+                # Filter: skip requests with no slack or negative slack
+                if slack_val is None or slack_val < 0:
+                    continue
+
+                # Compute fixed slack: slack - pred_last + tpot
+                effective_req_tpot = req.target_tpot_ms if req.target_tpot_ms is not None else tpot_effective
+                fixed_slack = slack_val - pred_last + effective_req_tpot
+
+                # Filter: skip if fixed slack is negative
+                if fixed_slack < 0:
+                    continue
+
+                if min_decode_slack is None or fixed_slack < min_decode_slack:
+                    min_decode_slack = fixed_slack
+
+        return min_decode_slack
+
     def _maybe_run_prefill_simulation(self) -> None:
         """Run prefill simulator for chunked + queued requests to guide batch formation.
 
@@ -2877,21 +2945,21 @@ class Scheduler(
                             self._predicted_ttft_for_new_admits[extra_len] = reported_time
 
                         # Log detailed plan and timeline for each extra
-                        if scenario_changed:
-                            execution_flow = res.execution_flow if res.execution_flow else res.base_plan
-                            execution_times = res.execution_times if res.execution_times else []
-                            # Build timeline string: chunk(time_ms)
-                            timeline_parts = []
-                            for chunk, t_ms in zip(execution_flow, execution_times):
-                                timeline_parts.append(f"{chunk}({t_ms:.1f}ms)")
-                            timeline_str = "[" + ", ".join(timeline_parts) + "]" if timeline_parts else "[]"
-                            logger.info(
-                                "[PREFILL-SIM] extra=%d status=%s reported_time=%.2fms (pred_last=%.2f + chunk0=%.2f + sim=%.2f) "
-                                "min_decode_slack=%.2fms min_prefill_slack=%.2fms iterations=%d flow=%s timeline=%s",
-                                extra_len, status, reported_time, pred_last, time_consumed, res.total_time_ms,
-                                res.min_decode_slack_ms, res.min_prefill_slack_ms, res.iterations,
-                                execution_flow, timeline_str
-                            )
+                        # if scenario_changed:
+                        #     execution_flow = res.execution_flow if res.execution_flow else res.base_plan
+                        #     execution_times = res.execution_times if res.execution_times else []
+                            # # Build timeline string: chunk(time_ms)
+                            # timeline_parts = []
+                            # for chunk, t_ms in zip(execution_flow, execution_times):
+                            #     timeline_parts.append(f"{chunk}({t_ms:.1f}ms)")
+                            # timeline_str = "[" + ", ".join(timeline_parts) + "]" if timeline_parts else "[]"
+                            # logger.info(
+                            #     "[PREFILL-SIM] extra=%d status=%s reported_time=%.2fms (pred_last=%.2f + chunk0=%.2f + sim=%.2f) "
+                            #     "min_decode_slack=%.2fms min_prefill_slack=%.2fms iterations=%d flow=%s timeline=%s",
+                            #     extra_len, status, reported_time, pred_last, time_consumed, res.total_time_ms,
+                            #     res.min_decode_slack_ms, res.min_prefill_slack_ms, res.iterations,
+                            #     execution_flow, timeline_str
+                            # )
                     if summaries and scenario_changed:
                         logger.info("[PREFILL-SIM] extras summary: %s", ", ".join(summaries))
             except Exception:
@@ -2954,8 +3022,10 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         # Run predictions BEFORE batch formation to guide scheduling decisions
-        self._maybe_run_prefill_simulation()
-        self._predict_future_kv_usage()
+        # Only run simulation-related predictions in SIMULATION mode
+        if self.prefill_schedule_mode == PrefillScheduleMode.SIMULATION:
+            self._maybe_run_prefill_simulation()
+            self._predict_future_kv_usage()
 
         new_batch = self.get_new_batch_prefill()
 
@@ -3180,6 +3250,35 @@ class Scheduler(
             else:
                 # Fallback to BUDGET when TPOT not set
                 logger.debug("PREDICTOR mode: TPOT not set, falling back to BUDGET behavior")
+                effective_chunk_size = self.chunked_prefill_size
+                effective_predictor = None
+                effective_tpot = None
+                effective_target = None
+        elif self.prefill_schedule_mode == PrefillScheduleMode.SLACK:
+            # SLACK mode: use min_decode_slack as target iteration time for predictor
+            min_slack = self._compute_min_valid_decode_slack()
+
+            if min_slack is not None and self.cycle_time_predictor is not None:
+                # Check if current decode batch already exceeds slack
+                pred = self.predict_batch(self.running_batch)
+                if pred > min_slack:
+                    self._abandon_chunked_prefill()
+                    return None
+
+                effective_chunk_size = self.chunked_prefill_size
+                effective_predictor = self.cycle_time_predictor
+                effective_tpot = self.tpot
+                effective_target = min_slack  # Use min_decode_slack as target
+                logger.info(
+                    "SLACK mode: using min_decode_slack=%.2fms as target_iteration_time",
+                    min_slack,
+                )
+            else:
+                # Fallback to BUDGET when no valid slack or predictor unavailable
+                if min_slack is None:
+                    logger.debug("SLACK mode: no valid decode slack, falling back to BUDGET behavior")
+                else:
+                    logger.info("SLACK mode: cycle_time_predictor unavailable, falling back to BUDGET behavior")
                 effective_chunk_size = self.chunked_prefill_size
                 effective_predictor = None
                 effective_tpot = None
@@ -3985,7 +4084,7 @@ class Scheduler(
     def set_tpot(self, recv_req: SetTPOTReqInput) -> SetTPOTReqOutput:
         """Set a global TPOT value on the scheduler. Logs for visibility."""
         try:
-            self.tpot = float(recv_req.tpot) - 1 # LEAVE SOME ROOM
+            self.tpot = float(recv_req.tpot) * 0.97 # LEAVE SOME ROOM
             logger.info(f"[Scheduler] set_tpot received: tpot={self.tpot}")
             self._refresh_iteration_time_target()
             return SetTPOTReqOutput(success=True, tpot=self.tpot, message="ok")

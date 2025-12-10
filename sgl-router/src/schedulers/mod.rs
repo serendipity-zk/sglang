@@ -59,11 +59,13 @@ pub trait SchedulerBase: Send + Sync + Debug + 'static {
             };
 
             // Add pending message NOW, before spawning async task
+            // Store the original body_json for potential resend
             worker.add_pending_message(PendingMessage::new(
                 msg_id,
                 gen,
                 request.route.clone(),
                 request_id,
+                request.body_json.clone(),
             ));
 
             (Some(msg_id), Some(gen))
@@ -581,9 +583,10 @@ mod tests {
             generation,
             "/generate".to_string(),
             Some("req-test".to_string()),
+            body.clone(),
         ));
 
-        let payload = prepare_request_payload("/generate", &body, Some(message_id), Some(generation));
+        let payload = prepare_request_payload("/generate", &body, Some(message_id), Some(generation), 0.0);
         let value = payload.as_ref();
 
         // First message from this worker should have ID 0
@@ -606,7 +609,7 @@ mod tests {
         });
 
         // For non-/generate routes, no message ID should be passed
-        let payload = prepare_request_payload("/v1/chat/completions", &body, None, None);
+        let payload = prepare_request_payload("/v1/chat/completions", &body, None, None, 0.0);
         let value = payload.as_ref();
 
         assert!(value.get("router_message_id").is_none());
@@ -623,7 +626,7 @@ mod tests {
         // Even with message_id/generation, non-object bodies should be rejected
         let message_id = worker.next_message_id();
         let generation = worker.generation();
-        let payload = prepare_request_payload("/generate", &body, Some(message_id), Some(generation));
+        let payload = prepare_request_payload("/generate", &body, Some(message_id), Some(generation), 0.0);
         let value = payload.as_ref();
 
         assert!(value.get("router_message_id").is_none());

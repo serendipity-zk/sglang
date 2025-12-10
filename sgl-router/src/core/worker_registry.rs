@@ -2,7 +2,7 @@
 //!
 //! Provides centralized registry for workers with model-based indexing
 
-use crate::core::{ConnectionMode, Worker, WorkerStats, WorkerType};
+use crate::core::{resend_message, ConnectionMode, Worker, WorkerStats, WorkerType};
 use crate::metrics::RouterMetrics;
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -12,6 +12,8 @@ use url::Url;
 use uuid::Uuid;
 
 const PENDING_MESSAGE_TTL: Duration = Duration::from_secs(60);
+/// Interval for checking and resending unacknowledged messages (50ms)
+const RESEND_CHECK_INTERVAL_MS: u64 = 50;
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -434,6 +436,53 @@ impl WorkerRegistry {
         crate::core::HealthChecker::new(handle, shutdown)
     }
 
+    /// Start a background task that checks for unacknowledged messages and resends them.
+    /// This task runs every 50ms and resends messages that haven't been acknowledged
+    /// within the RESEND_TIMEOUT_MS threshold.
+    pub fn start_resend_checker(&self) -> crate::core::HealthChecker {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let workers_ref = self.workers.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(
+                RESEND_CHECK_INTERVAL_MS,
+            ));
+
+            loop {
+                interval.tick().await;
+
+                // Check for shutdown signal
+                if shutdown_clone.load(Ordering::Acquire) {
+                    tracing::debug!("Registry resend checker shutting down");
+                    break;
+                }
+
+                // Get all workers from registry
+                let workers: Vec<Arc<dyn crate::core::Worker>> = workers_ref
+                    .iter()
+                    .map(|entry| entry.value().clone())
+                    .collect();
+
+                // Check each worker for messages to resend
+                for worker in &workers {
+                    let messages_to_resend = worker.get_messages_to_resend();
+                    for message in &messages_to_resend {
+                        // Resend the message
+                        resend_message(worker.url(), message).await;
+                        // Mark it as resent (increment counter and update timestamp)
+                        worker.mark_resent(message.message_id);
+                    }
+                }
+            }
+        });
+
+        crate::core::HealthChecker::new(handle, shutdown)
+    }
+
     /// Update worker stats for a given worker URL
     pub fn update_stats(&self, worker_url: &str, stats: WorkerStats) {
         if let Some(worker) = self.get_by_url(worker_url) {
@@ -763,7 +812,13 @@ mod tests {
         );
         registry.register(worker.clone());
 
-        let pending = PendingMessage::new(1, 99, "/generate", Some("req-1".into()));
+        let pending = PendingMessage::new(
+            1,
+            99,
+            "/generate",
+            Some("req-1".into()),
+            serde_json::json!({"test": true}),
+        );
         worker.add_pending_message(pending);
         assert_eq!(worker.pending_message_count(), 1);
 
@@ -798,7 +853,13 @@ mod tests {
         );
         registry.register(worker.clone());
 
-        let mut pending = PendingMessage::new(1, 77, "/generate", None);
+        let mut pending = PendingMessage::new(
+            1,
+            77,
+            "/generate",
+            None,
+            serde_json::json!({"test": true}),
+        );
         pending.timestamp = Instant::now() - Duration::from_secs(120);
         worker.add_pending_message(pending);
         assert_eq!(worker.pending_message_count(), 1);

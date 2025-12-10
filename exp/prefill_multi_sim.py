@@ -28,7 +28,15 @@ except ImportError:
     print("Error: Could not import 'sglang_profile'. Make sure you are in the correct directory.")
     sys.exit(1)
 
+try:
+    from rust_predictor.rust_mode_aware_wrapper import RustModeAwarePredictor
+except ImportError:
+    RustModeAwarePredictor = None  # Rust predictor not available
+
+import json
+
 GRANULARITY = 128
+MAX_CHUNK_SIZE = 8192  # Maximum chunk size constraint for planning
 
 
 # ==============================================================================
@@ -222,16 +230,19 @@ class SimulationScenario:
         raw_plans = []
 
         # 1. Power-of-2 equal-division plans (existing)
+        # Constraint: chunk size cannot be larger than MAX_CHUNK_SIZE (8192)
         t_pow2_start = time.perf_counter()
         chunk_size = 1
-        while chunk_size < self.total_len:
+        while chunk_size < self.total_len and chunk_size <= MAX_CHUNK_SIZE:
             p = [chunk_size] * (self.total_len // chunk_size)
             rem = self.total_len % chunk_size
             if rem:
                 p.append(rem)
             raw_plans.append(p)
             chunk_size *= 2
-        raw_plans.append([self.total_len])
+        # Only add full-length plan if it doesn't exceed MAX_CHUNK_SIZE
+        if self.total_len <= MAX_CHUNK_SIZE:
+            raw_plans.append([self.total_len])
         # only get first 4 power-of-2 plans to limit total plans
         raw_plans = raw_plans[-4:]
         t_pow2_end = time.perf_counter()
@@ -353,6 +364,7 @@ class TimelineSimulator:
     """
     @staticmethod
     def simulate(plan: ProposedPlan, slacks: List[float], config: SimulatorConfig, base_decode_ms: float) -> BatchPlanResult:
+        base_decode_ms *= 1.5
         current_slacks = list(slacks)
         min_prefill_slack = min(current_slacks) if current_slacks else 0.0
 
@@ -695,6 +707,64 @@ class PrefillSimulatorEngine:
 # CLI
 # ==============================================================================
 
+def train_predictor_from_jsonl(predictor, jsonl_path: str, max_samples: int = None) -> int:
+    """
+    Train predictor using historical metrics from a JSONL file.
+
+    Args:
+        predictor: Predictor instance (ModeAwarePredictor or RustModeAwarePredictor)
+        jsonl_path: Path to the JSONL file with training data
+        max_samples: Maximum number of samples to use (None = all)
+
+    Returns:
+        Number of samples used for training
+    """
+    samples_used = 0
+
+    with open(jsonl_path, 'r') as f:
+        for line in f:
+            if max_samples is not None and samples_used >= max_samples:
+                break
+
+            try:
+                record = json.loads(line.strip())
+            except json.JSONDecodeError:
+                continue
+
+            # Extract fields from the record
+            batch_size_tokens = record.get('batch_size_tokens', record.get('token_batch_size', 0))
+            prefill_chunk_pairs = record.get('prefill_chunk_pairs', [])
+            kv_tokens_used = record.get('kv_tokens_used', 0)
+            iteration_time_ms = record.get('iteration_time_ms', 0.0)
+            forward_mode = record.get('forward_mode', 'MIXED')
+
+            # Skip invalid records
+            if batch_size_tokens <= 0 or iteration_time_ms <= 0:
+                continue
+
+            # Determine mode
+            if forward_mode == 'DECODE' or not prefill_chunk_pairs:
+                mode = 'DECODE'
+            else:
+                mode = 'MIXED'
+
+            # Submit to predictor for training
+            try:
+                predictor.submit(
+                    batch_size_tokens=batch_size_tokens,
+                    prefill_chunk_pairs=prefill_chunk_pairs,
+                    kv_tokens_used=kv_tokens_used,
+                    iteration_time_ms=iteration_time_ms,
+                    mode=mode
+                )
+                samples_used += 1
+            except Exception as e:
+                # Skip problematic records
+                continue
+
+    return samples_used
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Refactored Batch Simulator")
     parser.add_argument("--prefill-lens", type=int, nargs="*", default=[],
@@ -718,6 +788,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-extra-len", type=int, nargs="+", default=None)
     parser.add_argument("--csv-log-path", type=str, default=None,
                         help="Path to CSV log file for predictor (default: auto-generated)")
+    parser.add_argument("--predictor", type=str, choices=["python", "rust"], default="python",
+                        help="Predictor type: 'python' (ModeAwarePredictor) or 'rust' (RustModeAwarePredictor)")
+    parser.add_argument("--train-data", type=str, default="/sgl-workspace/profile_old/all_metrics.jsonl",
+                        help="Path to JSONL file for training predictor before simulation")
+    parser.add_argument("--max-train-samples", type=int, default=None,
+                        help="Maximum number of training samples to use")
     return parser.parse_args()
 
 def main():
@@ -743,11 +819,34 @@ def main():
     if len(args.prefill_lens) == 0:
         print("Note: Running with empty prefill list (base case has no requests)")
 
-    # Create predictor
-    predictor = ModeAwarePredictor(
-        grid_path=args.grid_path,
-        csv_log_path=args.csv_log_path
-    )
+    # Create predictor based on type
+    if args.predictor == "rust":
+        if RustModeAwarePredictor is None:
+            print("Error: Rust predictor not available. Install knn_workload_predictor wheel.")
+            sys.exit(1)
+        print("[INFO] Using Rust predictor (RustModeAwarePredictor)")
+        predictor = RustModeAwarePredictor(
+            grid_path=args.grid_path,
+            csv_log_path=args.csv_log_path
+        )
+    else:
+        print("[INFO] Using Python predictor (ModeAwarePredictor)")
+        predictor = ModeAwarePredictor(
+            grid_path=args.grid_path,
+            csv_log_path=args.csv_log_path
+        )
+
+    # Train predictor from JSONL if provided
+    if args.train_data:
+        print(f"[INFO] Training predictor from: {args.train_data}")
+        t_train_start = time.perf_counter()
+        samples_used = train_predictor_from_jsonl(
+            predictor,
+            args.train_data,
+            max_samples=args.max_train_samples
+        )
+        t_train_end = time.perf_counter()
+        print(f"[INFO] Trained on {samples_used} samples in {(t_train_end - t_train_start)*1000:.2f} ms")
 
     # Create engine with predictor
     engine = PrefillSimulatorEngine(predictor=predictor, safety_margin_ms=args.safety_margin)
