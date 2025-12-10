@@ -1,0 +1,12 @@
+{
+  "baseline": {
+    "SGLang-Random": "baseline/sglang_random",
+    "SGLang-Round-Robin": "baseline/sglang_round_robin",
+    "Chunked-Prefill": "baseline/sarathi",
+    "SGLang-PD": "baseline/sglang_pd",
+    "Niyama": "baseline/sglang_slack"
+  },
+  "polyserve": {
+    "PolyServe": "polyserve/polyserve"
+  }
+}

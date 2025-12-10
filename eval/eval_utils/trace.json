@@ -1,0 +1,39 @@
+{
+  "traces": [
+    {
+      "name": "lmsys",
+      "path": "/sgl-workspace/sglang/SLO-CSim/trace/arxiv/lmsys.csv",
+      "rate_est": 400.0,
+      "length": 20000,
+      "ranges": [150,600,50]
+    },
+    {
+      "name": "sharegpt",
+      "path": "/sgl-workspace/sglang/SLO-CSim/trace/arxiv/sharegpt.csv",
+      "rate_est": 200.0,
+      "length": 10000,
+      "ranges": [100,400,30]
+    },
+    {
+      "name": "splitwise",
+      "path": "/sgl-workspace/sglang/SLO-CSim/trace/arxiv/splitwise.csv",
+      "rate_est": 150.0,
+      "length": 7500,
+      "ranges": [50,300,25]
+    },
+    {
+      "name": "uniform_512_512",
+      "path": "/sgl-workspace/sglang/SLO-CSim/trace/arxiv/uniform_512_512.csv",
+      "rate_est": 200.0,
+      "length": 10000,
+      "ranges": [50,300,25]
+    },
+    {
+      "name": "uniform_4096_1024",
+      "path": "/sgl-workspace/sglang/SLO-CSim/trace/arxiv/uniform_4096_1024.csv",
+      "rate_est": 25.0,
+      "length": 1250,
+      "ranges": [10,50,5]
+    }
+  ]
+}
