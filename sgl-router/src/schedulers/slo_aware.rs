@@ -143,6 +143,80 @@ impl SloAwareScheduler {
         self.tpot_buckets.len()
     }
 
+    /// Get batch size for a worker at a specific TPOT tier
+    /// Uses nearest key matching if exact key not found
+    fn get_batch_size_for_tier(
+        &self,
+        worker_stats: &WorkerStats,
+        tier_tpot: f32,
+    ) -> i64 {
+        let tier_map = match &worker_stats.batch_size_by_tpot_tier {
+            Some(m) => m,
+            None => return 0,
+        };
+
+        if tier_map.is_empty() {
+            return 0;
+        }
+
+        // Try exact match first (as string)
+        let tier_key = (tier_tpot as i64).to_string();
+        if let Some(&count) = tier_map.get(&tier_key) {
+            return count;
+        }
+
+        // Find nearest numeric key
+        let mut nearest_key: Option<(f64, &String)> = None;
+        for key in tier_map.keys() {
+            if key == "none" {
+                continue;
+            }
+            if let Ok(key_val) = key.parse::<f64>() {
+                let diff = (key_val - tier_tpot as f64).abs();
+                match &nearest_key {
+                    None => nearest_key = Some((diff, key)),
+                    Some((best_diff, _)) if diff < *best_diff => {
+                        nearest_key = Some((diff, key));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        nearest_key
+            .and_then(|(_, key)| tier_map.get(key))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Sort workers within each tier by their batch size for that tier (descending)
+    /// Workers with larger batch sizes are placed first to improve batching efficiency
+    fn sort_tier_workers_by_batch_size(&self, worker_registry: &Arc<crate::core::WorkerRegistry>) {
+        let stats = match self.worker_stats.read() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        for (tier_idx, tier_tpot) in self.tpot_buckets.iter().enumerate() {
+            if let Some(mut worker_ids) = self.tier_workers.get_mut(&tier_idx) {
+                let tier_tpot = *tier_tpot;
+                worker_ids.sort_by(|a, b| {
+                    let a_batch = worker_registry
+                        .get(a)
+                        .and_then(|w| stats.get(w.url()))
+                        .map(|ws| self.get_batch_size_for_tier(ws, tier_tpot))
+                        .unwrap_or(0);
+                    let b_batch = worker_registry
+                        .get(b)
+                        .and_then(|w| stats.get(w.url()))
+                        .map(|ws| self.get_batch_size_for_tier(ws, tier_tpot))
+                        .unwrap_or(0);
+                    b_batch.cmp(&a_batch) // Descending order
+                });
+            }
+        }
+    }
+
     /// Get queue index for a request based on its target TPOT
     /// Returns None if request should be rejected (no target or exceeds max boundary)
     fn get_queue_index(&self, tpot: Option<f32>) -> Option<usize> {
@@ -163,62 +237,84 @@ impl SloAwareScheduler {
     }
 
     /// Initialize workers into SLO tiers
-    /// Uses initial_tier_allocation from config if provided, otherwise distributes evenly via round-robin
-    /// Idle tier (tpot_buckets.len()) is left empty for future autoscaling
+    /// - If auto-scaling is enabled: all workers go to idle tier (will be assigned dynamically)
+    /// - If auto-scaling is disabled: use initial_tier_allocation config or round-robin
     fn initialize_workers(&self, worker_registry: &Arc<crate::core::WorkerRegistry>) {
         let all_workers = worker_registry.get_all_with_ids();
         let num_slo_tiers = self.tpot_buckets.len();
+        let idle_tier_idx = num_slo_tiers;
 
         if all_workers.is_empty() {
             warn!("No workers available for tier initialization");
             return;
         }
 
-        // Use configured tier allocation if provided, otherwise use round-robin
-        match &self.initial_tier_allocation {
-            Some(tier_allocation) => {
-                info!(
-                    "Initializing {} workers into {} SLO tiers using configured allocation {:?}",
-                    all_workers.len(),
-                    num_slo_tiers,
-                    tier_allocation
-                );
+        // Check if auto-scaling is enabled
+        let auto_scaling_enabled = self.auto_scaling
+            .as_ref()
+            .map(|config| config.enabled)
+            .unwrap_or(false);
 
-                // Assign workers to tiers based on configured allocation
-                // If not enough workers, fill from beginning and leave rest empty
-                let mut worker_iter = all_workers.iter();
+        if auto_scaling_enabled {
+            // Auto-scaling enabled: all workers start in idle tier
+            info!(
+                "Auto-scaling enabled: initializing {} workers into idle tier",
+                all_workers.len()
+            );
 
-                for (tier_idx, &count) in tier_allocation.iter().enumerate() {
-                    if tier_idx >= num_slo_tiers {
-                        break; // Don't exceed available tiers
-                    }
-                    for _ in 0..count {
-                        if let Some((worker_id, _worker)) = worker_iter.next() {
-                            self.tier_workers
-                                .entry(tier_idx)
-                                .or_insert_with(Vec::new)
-                                .push(worker_id.clone());
-                        } else {
-                            // No more workers available
-                            break;
+            for (worker_id, _worker) in all_workers.iter() {
+                self.tier_workers
+                    .entry(idle_tier_idx)
+                    .or_insert_with(Vec::new)
+                    .push(worker_id.clone());
+            }
+        } else {
+            // Auto-scaling disabled: use configured tier allocation or round-robin
+            match &self.initial_tier_allocation {
+                Some(tier_allocation) => {
+                    info!(
+                        "Initializing {} workers into {} SLO tiers using configured allocation {:?}",
+                        all_workers.len(),
+                        num_slo_tiers,
+                        tier_allocation
+                    );
+
+                    // Assign workers to tiers based on configured allocation
+                    // If not enough workers, fill from beginning and leave rest empty
+                    let mut worker_iter = all_workers.iter();
+
+                    for (tier_idx, &count) in tier_allocation.iter().enumerate() {
+                        if tier_idx >= num_slo_tiers {
+                            break; // Don't exceed available tiers
+                        }
+                        for _ in 0..count {
+                            if let Some((worker_id, _worker)) = worker_iter.next() {
+                                self.tier_workers
+                                    .entry(tier_idx)
+                                    .or_insert_with(Vec::new)
+                                    .push(worker_id.clone());
+                            } else {
+                                // No more workers available
+                                break;
+                            }
                         }
                     }
                 }
-            }
-            None => {
-                info!(
-                    "Initializing {} workers into {} SLO tiers using round-robin distribution",
-                    all_workers.len(),
-                    num_slo_tiers
-                );
+                None => {
+                    info!(
+                        "Initializing {} workers into {} SLO tiers using round-robin distribution",
+                        all_workers.len(),
+                        num_slo_tiers
+                    );
 
-                // Round-robin assignment across SLO tiers
-                for (idx, (worker_id, _worker)) in all_workers.iter().enumerate() {
-                    let tier_idx = idx % num_slo_tiers;
-                    self.tier_workers
-                        .entry(tier_idx)
-                        .or_insert_with(Vec::new)
-                        .push(worker_id.clone());
+                    // Round-robin assignment across SLO tiers
+                    for (idx, (worker_id, _worker)) in all_workers.iter().enumerate() {
+                        let tier_idx = idx % num_slo_tiers;
+                        self.tier_workers
+                            .entry(tier_idx)
+                            .or_insert_with(Vec::new)
+                            .push(worker_id.clone());
+                    }
                 }
             }
         }
@@ -242,11 +338,11 @@ impl SloAwareScheduler {
             }
         }
 
-        // Log idle tier (should be empty initially)
-        if let Some(idle_workers) = self.tier_workers.get(&num_slo_tiers) {
+        // Log idle tier
+        if let Some(idle_workers) = self.tier_workers.get(&idle_tier_idx) {
             info!(
                 "  Tier {} (idle/autoscaling): {} workers",
-                num_slo_tiers,
+                idle_tier_idx,
                 idle_workers.len()
             );
         }
@@ -1105,14 +1201,16 @@ impl SloAwareScheduler {
                 continue;
             }
 
-            let tier_filtered: Vec<Arc<dyn Worker>> = available
-                .into_iter()
-                .filter(|worker| {
-                    if let Some(worker_id) = config.worker_registry.get_worker_id_by_url(worker.url()) {
-                        tier_worker_ids.contains(&worker_id)
-                    } else {
-                        false
-                    }
+            // Filter to workers in this tier, preserving the sorted order from tier_workers
+            // (tier_workers is sorted by batch size at the start of each tick)
+            let tier_filtered: Vec<Arc<dyn Worker>> = tier_worker_ids
+                .iter()
+                .filter_map(|worker_id| {
+                    available.iter().find(|w| {
+                        config.worker_registry.get_worker_id_by_url(w.url())
+                            .map(|id| &id == worker_id)
+                            .unwrap_or(false)
+                    }).cloned()
                 })
                 .collect();
 
@@ -1299,6 +1397,9 @@ impl Scheduler for SloAwareScheduler {
                         // Update worker stats for admission control
                         let stats = config.worker_registry.get_all_stats();
                         self.update_worker_stats(&stats);
+
+                        // Sort tier workers by batch size (larger batch first for better batching)
+                        self.sort_tier_workers_by_batch_size(&config.worker_registry);
 
                         // Drain queues and dispatch requests
                         self.drain_all_queues(&config, &mut queues).await;

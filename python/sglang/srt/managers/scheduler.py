@@ -870,6 +870,12 @@ class Scheduler(
                         cumulative_prefill = prefix_len + current_chunk
                         prefill_chunk_pairs.append([current_chunk, cumulative_prefill])
 
+        # Count batch size per TPOT tier
+        batch_size_by_tpot_tier = {}
+        for req in batch.reqs or []:
+            tpot_key = str(req.target_tpot_ms) if req.target_tpot_ms is not None else "none"
+            batch_size_by_tpot_tier[tpot_key] = batch_size_by_tpot_tier.get(tpot_key, 0) + 1
+
         # Build metrics payload (field names match router and UI expectations)
         metrics = {
             # UI expects: running_batch_size, queue_reqs, kv_tokens_used, token_capacity
@@ -898,6 +904,8 @@ class Scheduler(
             "batch_size_tokens": total_tokens,
             "num_requests": num_batch_reqs,
             "input_id_len": batch.input_ids.shape[0] if batch.input_ids is not None else 0,
+            # Per-TPOT-tier batch sizes
+            "batch_size_by_tpot_tier": batch_size_by_tpot_tier,
         }
 
         # Compute slack for running batch and waiting queue using router arrival time and SLO hints.

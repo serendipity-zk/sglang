@@ -252,12 +252,22 @@ impl RouterUi {
         Some(tier_map)
     }
 
-    /// Build worker ID mapping (S0, S1, S2, ...) based on scheduler's internal traversal order
+    /// Extract port from worker URL (e.g., "http://localhost:31001" -> "31001")
+    fn extract_port(url: &str) -> String {
+        url.rsplit(':')
+            .next()
+            .and_then(|s| s.trim_end_matches('/').parse::<u16>().ok())
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "?".to_string())
+    }
+
+    /// Build worker ID mapping (A, B, C, ...) based on scheduler's internal traversal order
     /// Returns HashMap<worker_url, (worker_display_id, tier_position)>
+    /// Display ID format: "A(31001)" - letter + port
     /// If SLO-aware scheduler is active, uses tier_workers order; otherwise uses alphabetical order
     fn build_worker_id_map(app_state: &AppState) -> HashMap<String, (String, usize)> {
         let mut worker_id_map = HashMap::new();
-        let mut global_idx = 0;
+        let mut global_idx: u8 = 0;
 
         // Try to get SLO scheduler's tier order
         if let Some(scheduler) = app_state.context.scheduler_registry.try_get_scheduler() {
@@ -274,9 +284,11 @@ impl RouterUi {
                         if let Some(worker_ids) = slo_scheduler.tier_workers.get(&tier_idx) {
                             for (position, worker_id) in worker_ids.iter().enumerate() {
                                 if let Some(worker) = app_state.context.worker_registry.get(worker_id) {
+                                    let letter = (b'A' + (global_idx % 26)) as char;
+                                    let port = Self::extract_port(worker.url());
                                     worker_id_map.insert(
                                         worker.url().to_string(),
-                                        (format!("S{}", global_idx), position)
+                                        (format!("{}({})", letter, port), position)
                                     );
                                     global_idx += 1;
                                 }
@@ -296,19 +308,23 @@ impl RouterUi {
         worker_urls.sort();
 
         for (idx, url) in worker_urls.into_iter().enumerate() {
-            worker_id_map.insert(url, (format!("S{}", idx), idx));
+            let letter = (b'A' + ((idx % 26) as u8)) as char;
+            let port = Self::extract_port(&url);
+            worker_id_map.insert(url, (format!("{}({})", letter, port), idx));
         }
 
         worker_id_map
     }
 
     /// Format worker metrics for display with aligned fields
-    /// Format: "Sx [xx ms]  B:batch  T:tokens  KV:kv_tokens  P:prefill  L:iter_time" (SLO-aware)
-    ///     or: "Sx          B:batch  T:tokens  KV:kv_tokens  P:prefill  L:iter_time" (non-SLO)
+    /// Format: "A(31001) [xx ms]  B:batch  T:tokens  KV:kv_tokens  P:prefill  L:iter_time  N:tier_counts" (SLO-aware)
+    ///     or: "A(31001)          B:batch  T:tokens  KV:kv_tokens  P:prefill  L:iter_time" (non-SLO)
+    /// tpot_buckets: list of all TPOT tier values (e.g., [20.0, 40.0, 80.0]) for showing all tier counts
     fn format_worker_metrics(
         worker_id: &str,
         stats: &crate::core::WorkerStats,
         tpot_boundary: Option<Option<f32>>,
+        tpot_buckets: Option<&[f32]>,
     ) -> String {
         // Extract metrics
         let batch_size = stats.num_requests;
@@ -329,7 +345,52 @@ impl RouterUi {
             None => "L:   --".to_string(),
         };
 
+        // Format batch_size_by_tpot_tier as "N:count1,count2,..." for all tiers
+        // Show counts for all tpot_buckets, defaulting to 0 for missing tiers
+        let tier_counts_str = match (tpot_buckets, &stats.batch_size_by_tpot_tier) {
+            (Some(buckets), Some(tier_map)) => {
+                let counts: Vec<String> = buckets
+                    .iter()
+                    .map(|&tpot| {
+                        let key = (tpot as i64).to_string();
+                        // Try exact match first, then nearest key
+                        let count = tier_map.get(&key).copied().unwrap_or_else(|| {
+                            // Find nearest numeric key
+                            let mut nearest: Option<(f64, i64)> = None;
+                            for (k, &v) in tier_map.iter() {
+                                if k == "none" { continue; }
+                                if let Ok(k_val) = k.parse::<f64>() {
+                                    let diff = (k_val - tpot as f64).abs();
+                                    match nearest {
+                                        None => nearest = Some((diff, v)),
+                                        Some((best_diff, _)) if diff < best_diff => {
+                                            nearest = Some((diff, v));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            // Only use nearest if it's reasonably close (within 50% of tier value)
+                            nearest
+                                .filter(|(diff, _)| *diff < tpot as f64 * 0.5)
+                                .map(|(_, v)| v)
+                                .unwrap_or(0)
+                        });
+                        count.to_string()
+                    })
+                    .collect();
+                format!("N:{}", counts.join(","))
+            }
+            (Some(buckets), None) => {
+                // No tier map, show all zeros
+                let zeros: Vec<&str> = buckets.iter().map(|_| "0").collect();
+                format!("N:{}", zeros.join(","))
+            }
+            _ => "N:-".to_string(),
+        };
+
         // Build the formatted string with aligned columns
+        // Worker ID is now format like "A(31001)" - about 8-9 chars
         match tpot_boundary {
             Some(boundary_opt) => {
                 // SLO-aware scheduler
@@ -338,14 +399,14 @@ impl RouterUi {
                     None => "[  idle   ]".to_string(),
                 };
                 format!(
-                    "{:<4} {}  B:{:<4} T:{:<7} KV:{:<7} P:{}  {}",
-                    worker_id, boundary_str, batch_size, tokens, kv_tokens, prefill_str, last_iter_str
+                    "{:<10} {}  B:{:<4} T:{:<7} KV:{:<7} P:{}  {}  {}",
+                    worker_id, boundary_str, batch_size, tokens, kv_tokens, prefill_str, last_iter_str, tier_counts_str
                 )
             }
             None => {
                 // Non-SLO scheduler (pad to match SLO spacing)
                 format!(
-                    "{:<4}              B:{:<4} T:{:<7} KV:{:<7} P:{}  {}",
+                    "{:<10}              B:{:<4} T:{:<7} KV:{:<7} P:{}  {}",
                     worker_id, batch_size, tokens, kv_tokens, prefill_str, last_iter_str
                 )
             }
@@ -452,37 +513,44 @@ impl RouterUi {
         let worker_id_map = Self::build_worker_id_map(app_state);
 
         // Build reverse tier map for sorting: worker_url -> tier_index
-        let worker_to_tier: HashMap<String, usize> = if let Some(scheduler) = app_state.context.scheduler_registry.try_get_scheduler() {
-            if scheduler.name() == "slo_aware" {
-                if let Some(slo_scheduler) = scheduler.as_any().downcast_ref::<SloAwareScheduler>() {
-                    let mut map = HashMap::new();
-                    for tier_entry in slo_scheduler.tier_workers.iter() {
-                        let tier_idx = *tier_entry.key();
-                        for worker_id in tier_entry.value() {
-                            if let Some(worker) = app_state.context.worker_registry.get(worker_id) {
-                                map.insert(worker.url().to_string(), tier_idx);
+        // Also extract tpot_buckets for displaying tier counts
+        let (worker_to_tier, tpot_buckets): (HashMap<String, usize>, Option<Vec<f32>>) =
+            if let Some(scheduler) = app_state.context.scheduler_registry.try_get_scheduler() {
+                if scheduler.name() == "slo_aware" {
+                    if let Some(slo_scheduler) = scheduler.as_any().downcast_ref::<SloAwareScheduler>() {
+                        let mut map = HashMap::new();
+                        for tier_entry in slo_scheduler.tier_workers.iter() {
+                            let tier_idx = *tier_entry.key();
+                            for worker_id in tier_entry.value() {
+                                if let Some(worker) = app_state.context.worker_registry.get(worker_id) {
+                                    map.insert(worker.url().to_string(), tier_idx);
+                                }
                             }
                         }
+                        (map, Some(slo_scheduler.tpot_buckets.clone()))
+                    } else {
+                        (HashMap::new(), None)
                     }
-                    map
                 } else {
-                    HashMap::new()
+                    (HashMap::new(), None)
                 }
             } else {
-                HashMap::new()
-            }
-        } else {
-            HashMap::new()
-        };
+                (HashMap::new(), None)
+            };
 
         // Build rows with formatted metrics and sorting keys
         let mut rows: Vec<(String, usize, usize)> = Vec::new(); // (metrics_str, tier_index, tier_position)
         for (worker_url, stats) in worker_stats.iter() {
             let (worker_id, tier_position) = worker_id_map.get(worker_url)
                 .map(|(id, pos)| (id.as_str(), *pos))
-                .unwrap_or(("S?", usize::MAX));
+                .unwrap_or(("?", usize::MAX));
             let tpot_boundary = tier_map.as_ref().and_then(|map| map.get(worker_url).copied());
-            let metrics_str = Self::format_worker_metrics(worker_id, stats, tpot_boundary);
+            let metrics_str = Self::format_worker_metrics(
+                worker_id,
+                stats,
+                tpot_boundary,
+                tpot_buckets.as_deref(),
+            );
             let tier_idx = worker_to_tier.get(worker_url).copied().unwrap_or(usize::MAX); // Unknown tier goes last
             rows.push((metrics_str, tier_idx, tier_position));
         }

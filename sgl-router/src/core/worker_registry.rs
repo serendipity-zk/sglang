@@ -837,6 +837,7 @@ mod tests {
             prefill_sim_metrics: None,
             router_generation: Some(99),
             last_received_message_id: Some(1),
+            batch_size_by_tpot_tier: None,
             timestamp: Instant::now(),
         };
 

@@ -147,10 +147,22 @@ class _IterationMetricsState:
                 )
                 slack_section = f"Slack:{min_decode_slack_str}{slack_suffix}".ljust(30)
                 tpot_section = f"tpot:{tpot_str}".ljust(10)
+                # Build by_tier section: counts sorted by TPOT value
+                by_tier_dict = metrics.get("batch_size_by_tpot_tier", {})
+                if by_tier_dict:
+                    sorted_items = sorted(
+                        by_tier_dict.items(),
+                        key=lambda x: (x[0] == "none", float(x[0]) if x[0] != "none" else 0)
+                    )
+                    tier_counts = ", ".join(str(count) for _, count in sorted_items)
+                    by_tier_section = f"by_tier:{tier_counts}".ljust(18)
+                else:
+                    by_tier_section = "by_tier:n/a".ljust(18)
                 prefill_section = f"prefill:{metrics.get('prefill_chunk_pairs', [])}"
                 log_line = (
                     f"{iter_section}| "
                     f"{tpot_section}| "
+                    f"{by_tier_section}| "
                     f"{token_section}| "
                     f"{req_section}| "
                     f"{kv_section}| "

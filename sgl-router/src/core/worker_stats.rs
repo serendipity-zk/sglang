@@ -68,6 +68,10 @@ pub struct WorkerStats {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_received_message_id: Option<i64>,
 
+    /// Batch size breakdown by TPOT tier (e.g., {"40": 5, "80": 3, "none": 2})
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_size_by_tpot_tier: Option<HashMap<String, i64>>,
+
     /// Timestamp when stats were received (not serialized)
     #[serde(skip, default = "Instant::now")]
     pub timestamp: Instant,
@@ -183,6 +187,20 @@ impl WorkerStats {
             .get("last_received_message_id")
             .and_then(|v| v.as_i64());
 
+        // Parse batch_size_by_tpot_tier: {"40": 5, "80": 3, "none": 2}
+        // Keys are TPOT values as strings (or "none"), values are request counts
+        let batch_size_by_tpot_tier = stats
+            .get("batch_size_by_tpot_tier")
+            .and_then(|v| v.as_object())
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| {
+                        let value = v.as_i64()?;
+                        Some((k.clone(), value))
+                    })
+                    .collect()
+            });
+
         Ok(WorkerStats {
             worker_id,
             batch_size_tokens,
@@ -197,6 +215,7 @@ impl WorkerStats {
             prefill_sim_metrics,
             router_generation,
             last_received_message_id,
+            batch_size_by_tpot_tier,
             timestamp: Instant::now(),
         })
     }

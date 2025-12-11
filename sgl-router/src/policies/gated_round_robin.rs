@@ -171,6 +171,7 @@ mod tests {
                 prefill_sim_metrics: None,
                 router_generation: None,
                 last_received_message_id: None,
+                batch_size_by_tpot_tier: None,
                 timestamp: std::time::Instant::now(),
             },
         );
@@ -190,6 +191,7 @@ mod tests {
                 prefill_sim_metrics: None,
                 router_generation: None,
                 last_received_message_id: None,
+                batch_size_by_tpot_tier: None,
                 timestamp: std::time::Instant::now(),
             },
         );
@@ -236,6 +238,7 @@ mod tests {
                 prefill_sim_metrics: None,
                 router_generation: None,
                 last_received_message_id: None,
+                batch_size_by_tpot_tier: None,
                 timestamp: std::time::Instant::now(),
             },
         );
@@ -255,6 +258,7 @@ mod tests {
                 prefill_sim_metrics: None,
                 router_generation: None,
                 last_received_message_id: None,
+                batch_size_by_tpot_tier: None,
                 timestamp: std::time::Instant::now(),
             },
         );
