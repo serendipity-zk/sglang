@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 use crate::core::{PendingMessage, Worker, WorkerRegistry};
 use crate::metrics::RouterMetrics;

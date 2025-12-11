@@ -48,6 +48,10 @@ pub struct SloAwareScheduler {
     worker_letters: Arc<DashMap<String, char>>,
     /// Next letter to assign to new workers
     next_letter: Arc<std::sync::atomic::AtomicU8>,
+    /// Track when each worker last had a request scheduled to it
+    last_scheduled_time: Arc<DashMap<String, std::time::Instant>>,
+    /// Track TTFT violations per tier (for steal decision)
+    tier_violations: Arc<DashMap<usize, AtomicUsize>>,
 }
 
 impl SloAwareScheduler {
@@ -61,6 +65,7 @@ impl SloAwareScheduler {
     ) -> Self {
         let tier_workers = Arc::new(DashMap::new());
         let tier_queue_sizes = Arc::new(DashMap::new());
+        let tier_violations = Arc::new(DashMap::new());
 
         // Initialize empty tier assignments and queue size counters
         // SLO tiers: 0..tpot_buckets.len()-1
@@ -69,6 +74,7 @@ impl SloAwareScheduler {
         for tier_idx in 0..=tpot_buckets.len() {
             tier_workers.insert(tier_idx, Vec::new());
             tier_queue_sizes.insert(tier_idx, AtomicUsize::new(0));
+            tier_violations.insert(tier_idx, AtomicUsize::new(0));
         }
 
         Self {
@@ -85,6 +91,39 @@ impl SloAwareScheduler {
             tpot_client: reqwest::Client::new(),
             worker_letters: Arc::new(DashMap::new()),
             next_letter: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            last_scheduled_time: Arc::new(DashMap::new()),
+            tier_violations,
+        }
+    }
+
+    /// Record that a request was scheduled to this worker
+    fn record_scheduled(&self, worker_url: &str) {
+        self.last_scheduled_time.insert(worker_url.to_string(), std::time::Instant::now());
+    }
+
+    /// Record a TTFT violation for a tier
+    fn record_violation(&self, tier_idx: usize) {
+        if let Some(counter) = self.tier_violations.get(&tier_idx) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Check if tier has recent violations and reset counter
+    fn has_violations_and_reset(&self, tier_idx: usize) -> bool {
+        if let Some(counter) = self.tier_violations.get(&tier_idx) {
+            let violations = counter.swap(0, Ordering::Relaxed);
+            violations > 0
+        } else {
+            false
+        }
+    }
+
+    /// Check if worker has been idle longer than threshold
+    fn is_worker_idle_for(&self, worker_url: &str, threshold_ms: u64) -> bool {
+        if let Some(last_time) = self.last_scheduled_time.get(worker_url) {
+            last_time.elapsed().as_millis() as u64 > threshold_ms
+        } else {
+            true // Never scheduled = considered idle
         }
     }
 
@@ -241,6 +280,22 @@ impl SloAwareScheduler {
         (queue_size + pending_messages as i64) > 0
     }
 
+    /// Check if worker is truly idle (no running requests, no queued, no pending)
+    /// Used for deciding whether to move worker to idle tier
+    fn is_worker_truly_idle(&self, worker: &dyn Worker) -> bool {
+        if let Ok(stats) = self.worker_stats.read() {
+            if let Some(worker_stats) = stats.get(worker.url()) {
+                let num_requests = worker_stats.num_requests;
+                let queue_size = worker_stats.waiting_queue_size;
+                let pending_messages = worker.pending_message_count() as i64;
+
+                // Worker is truly idle only if ALL are zero
+                return num_requests == 0 && queue_size == 0 && pending_messages == 0;
+            }
+        }
+        false // If we can't get stats, assume not idle
+    }
+
     /// Update queue size for a specific tier
     fn set_tier_queue_size(&self, tier_idx: usize, size: usize) {
         if let Some(counter) = self.tier_queue_sizes.get(&tier_idx) {
@@ -347,17 +402,16 @@ impl SloAwareScheduler {
         };
 
         // Step 1: Collect idle workers from SLO tiers and move them to idle tier
+        // Use is_worker_truly_idle() which checks num_requests + queue + pending
         let mut workers_to_move_to_idle: Vec<(usize, WorkerId)> = Vec::new(); // (from_tier, worker_id)
 
         for tier_idx in 0..self.tpot_buckets.len() {
             if let Some(worker_ids) = self.tier_workers.get(&tier_idx) {
                 for worker_id in worker_ids.iter() {
                     if let Some(worker) = worker_registry.get(worker_id) {
-                        if let Some(worker_stats) = stats.get(worker.url()) {
-                            // Worker is idle if it has no requests
-                            if worker_stats.num_requests == 0 {
-                                workers_to_move_to_idle.push((tier_idx, worker_id.clone()));
-                            }
+                        // Worker is idle only if num_requests=0, queue=0, pending=0
+                        if self.is_worker_truly_idle(worker.as_ref()) {
+                            workers_to_move_to_idle.push((tier_idx, worker_id.clone()));
                         }
                     }
                 }
@@ -376,10 +430,17 @@ impl SloAwareScheduler {
                 .or_insert_with(Vec::new)
                 .push(worker_id.clone());
 
-            // Send TPOT update if auto-scaling is enabled
+            // Send TPOT update and log
             if let Some(worker) = worker_registry.get(&worker_id) {
+                let letter = self.get_worker_letter(worker.url());
                 let new_tpot = self.calculate_tpot_for_tier(idle_tier_idx);
                 self.send_tpot_update(worker.url(), new_tpot);
+                info!(
+                    "[IDLE] {} moved from tier {} to idle (TPOT {}ms)",
+                    letter,
+                    self.tpot_buckets[from_tier] as u32,
+                    new_tpot as u64
+                );
             }
         }
 
@@ -398,31 +459,154 @@ impl SloAwareScheduler {
         tiers_with_queue.sort_by(|a, b| b.1.cmp(&a.1));
 
         // Step 3: Assign idle workers to tiers with pending queues
+        // Only assign workers that are truly idle (no pending work)
         if !tiers_with_queue.is_empty() {
             let idle_worker_ids: Vec<WorkerId> = self.tier_workers
                 .get(&idle_tier_idx)
                 .map(|workers| workers.clone())
                 .unwrap_or_default();
 
+            // Filter to only truly idle workers (num_requests=0, queue=0, pending=0)
+            let truly_idle: Vec<&WorkerId> = idle_worker_ids.iter()
+                .filter(|worker_id| {
+                    if let Some(worker) = worker_registry.get(worker_id) {
+                        self.is_worker_truly_idle(worker.as_ref())
+                    } else {
+                        false
+                    }
+                })
+                .collect();
+
             // Assign one idle worker to each tier with pending queue (round-robin)
             for (idle_worker_id, (target_tier_idx, _queue_size)) in
-                idle_worker_ids.iter().zip(tiers_with_queue.iter().cycle()) {
+                truly_idle.iter().zip(tiers_with_queue.iter().cycle()) {
 
                 // Remove from idle tier
                 if let Some(mut worker_ids) = self.tier_workers.get_mut(&idle_tier_idx) {
-                    worker_ids.retain(|id| id != idle_worker_id);
+                    worker_ids.retain(|id| id != *idle_worker_id);
                 }
 
                 // Add to target tier
                 self.tier_workers
                     .entry(*target_tier_idx)
                     .or_insert_with(Vec::new)
-                    .push(idle_worker_id.clone());
+                    .push((*idle_worker_id).clone());
 
                 // Send TPOT update if auto-scaling is enabled
-                if let Some(worker) = worker_registry.get(idle_worker_id) {
+                if let Some(worker) = worker_registry.get(*idle_worker_id) {
+                    let letter = self.get_worker_letter(worker.url());
                     let new_tpot = self.calculate_tpot_for_tier(*target_tier_idx);
                     self.send_tpot_update(worker.url(), new_tpot);
+                    info!(
+                        "[ASSIGN] {} moved from idle to tier {} (TPOT {}ms)",
+                        letter,
+                        self.tpot_buckets[*target_tier_idx] as u32,
+                        new_tpot as u64
+                    );
+                }
+            }
+        }
+
+        // Step 4: Steal from lower tiers if enabled
+        let steal_enabled = self.auto_scaling
+            .as_ref()
+            .map(|config| config.steal_from_lower_tier)
+            .unwrap_or(false);
+
+        let steal_idle_threshold_ms = self.auto_scaling
+            .as_ref()
+            .map(|config| config.steal_idle_threshold_ms)
+            .unwrap_or(1000);
+
+        if steal_enabled {
+
+            // Re-check which tiers still have queues AND have violations
+            let mut tiers_needing_workers: Vec<usize> = Vec::new();
+            for tier_idx in 0..self.tpot_buckets.len() {
+                let has_queue = self.tier_queue_sizes
+                    .get(&tier_idx)
+                    .map(|q| q.load(Ordering::Relaxed) > 0)
+                    .unwrap_or(false);
+                let has_violations = self.has_violations_and_reset(tier_idx);
+
+                if has_queue && has_violations {
+                    tiers_needing_workers.push(tier_idx);
+                    info!(
+                        "[STEAL] tier {} has pending queue and violations, considering steal",
+                        self.tpot_buckets[tier_idx] as u32
+                    );
+                }
+            }
+
+            // For each tier needing workers (with violations), try to steal from lower tiers
+            for target_tier_idx in tiers_needing_workers {
+                let target_tpot = self.tpot_buckets[target_tier_idx] as f64;
+
+                // Look at lower tiers (tier_idx > target_tier_idx means higher TPOT)
+                for source_tier_idx in (target_tier_idx + 1)..self.tpot_buckets.len() {
+                    // Check if source tier has no queue
+                    let source_has_queue = self.tier_queue_sizes
+                        .get(&source_tier_idx)
+                        .map(|q| q.load(Ordering::Relaxed) > 0)
+                        .unwrap_or(false);
+
+                    if source_has_queue {
+                        continue; // Don't steal from tiers that have queued work
+                    }
+
+                    // Get workers in source tier
+                    let source_workers: Vec<WorkerId> = self.tier_workers
+                        .get(&source_tier_idx)
+                        .map(|w| w.clone())
+                        .unwrap_or_default();
+
+                    if source_workers.len() <= 1 {
+                        continue; // Don't leave tier empty, keep at least 1 worker
+                    }
+
+                    // Check last worker's iteration time and idle status
+                    if let Some(last_worker_id) = source_workers.last() {
+                        if let Some(worker) = worker_registry.get(last_worker_id) {
+                            // Check if worker has been idle long enough
+                            if !self.is_worker_idle_for(worker.url(), steal_idle_threshold_ms) {
+                                continue; // Worker recently had requests, don't steal
+                            }
+
+                            let iter_time = stats.get(worker.url())
+                                .and_then(|ws| ws.last_iteration_time_ms)
+                                .unwrap_or(f64::MAX);
+
+                            if iter_time < target_tpot {
+                                // Steal this worker!
+                                let letter = self.get_worker_letter(worker.url());
+
+                                // Remove from source tier
+                                if let Some(mut worker_ids) = self.tier_workers.get_mut(&source_tier_idx) {
+                                    worker_ids.retain(|id| id != last_worker_id);
+                                }
+
+                                // Add to target tier
+                                self.tier_workers
+                                    .entry(target_tier_idx)
+                                    .or_insert_with(Vec::new)
+                                    .push(last_worker_id.clone());
+
+                                // Update TPOT
+                                let new_tpot = self.calculate_tpot_for_tier(target_tier_idx);
+                                self.send_tpot_update(worker.url(), new_tpot);
+
+                                info!(
+                                    "[STEAL] {} (iter={}ms, idle>{}ms) moved from tier {} to tier {} (TPOT {}ms)",
+                                    letter, iter_time as u64, steal_idle_threshold_ms,
+                                    self.tpot_buckets[source_tier_idx] as u32,
+                                    self.tpot_buckets[target_tier_idx] as u32,
+                                    new_tpot as u64
+                                );
+
+                                break; // Only steal one worker per tier per tick
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -562,7 +746,7 @@ impl SloAwareScheduler {
         None
     }
 
-    /// Log status with colored output
+    /// Log status output
     /// Format: [SLO] 10: Q=5 W=[A1, B6] | 20: Q=2 W=[C3] | idle: W=[D0] | 150us
     fn log_status(
         &self,
@@ -570,12 +754,6 @@ impl SloAwareScheduler {
         queues: &[VecDeque<crate::routers::http::scheduler::PendingRequest>],
         tick_us: u64,
     ) {
-        // ANSI color codes
-        const CYAN: &str = "\x1b[36m";
-        const GREEN: &str = "\x1b[32m";
-        const YELLOW: &str = "\x1b[33m";
-        const RESET: &str = "\x1b[0m";
-
         // Get worker stats for iteration times
         let stats = self.worker_stats.read().ok();
 
@@ -596,16 +774,15 @@ impl SloAwareScheduler {
                             .and_then(|ws| ws.last_iteration_time_ms)
                             .map(|t| t as u64)
                             .unwrap_or(0);
-                        worker_strs.push(format!("{}{}{}", letter, iter_time, RESET));
+                        worker_strs.push(format!("{}{}", letter, iter_time));
                     }
                 }
             }
 
-            let queue_color = if queue_size > 0 { YELLOW } else { GREEN };
             parts.push(format!(
-                "{}{}{}: {}Q={}{} W=[{}]",
-                CYAN, *boundary as u32, RESET,
-                queue_color, queue_size, RESET,
+                "{}: Q={} W=[{}]",
+                *boundary as u32,
+                queue_size,
                 worker_strs.join(", ")
             ));
         }
@@ -621,10 +798,10 @@ impl SloAwareScheduler {
                 }
             }
         }
-        parts.push(format!("{}idle{}: W=[{}]", CYAN, RESET, idle_worker_strs.join(", ")));
+        parts.push(format!("idle: W=[{}]", idle_worker_strs.join(", ")));
 
         // Add tick duration
-        parts.push(format!("{}{}us{}", GREEN, tick_us, RESET));
+        parts.push(format!("{}us", tick_us));
 
         info!("[SLO] {}", parts.join(" | "));
     }
@@ -886,6 +1063,7 @@ impl SloAwareScheduler {
                     violated.request_id,
                     violated.target_ttft_ms
                 );
+                self.record_violation(queue_idx);
                 self.handle_timeout(violated);
                 // Don't increment i
             } else {
@@ -973,20 +1151,75 @@ impl SloAwareScheduler {
             }
         }
 
-        // Build index -> worker map for O(1) lookup
-        let schedule_map: HashMap<usize, Arc<dyn Worker>> = schedule_decisions.into_iter().collect();
+        // Build index -> worker map for O(1) lookup and count per-worker scheduling
+        let mut per_worker_count: HashMap<String, usize> = HashMap::new();
+        let schedule_map: HashMap<usize, Arc<dyn Worker>> = schedule_decisions
+            .into_iter()
+            .map(|(idx, worker)| {
+                *per_worker_count.entry(worker.url().to_string()).or_insert(0) += 1;
+                (idx, worker)
+            })
+            .collect();
+
+        let scheduled_count = schedule_map.len();
+        let remaining_count = queue.len() - scheduled_count;
 
         // Build new queue with remaining requests, dispatch scheduled ones
         let old_queue = std::mem::take(queue);
         for (i, request) in old_queue.into_iter().enumerate() {
             if let Some(worker) = schedule_map.get(&i) {
                 RouterUi::dec_queue();
+                // Record that this worker received a request
+                self.record_scheduled(worker.url());
                 let dispatcher = Arc::clone(self);
                 let cfg = Arc::clone(config);
                 dispatcher.dispatch_to_worker(cfg, request, Arc::clone(worker)).await;
             } else {
                 queue.push_back(request);
             }
+        }
+
+        // Log scheduling stats if there was activity or pending requests
+        if scheduled_count > 0 || remaining_count > 0 {
+            let tier_tpot = self.tpot_buckets.get(queue_idx).map(|b| *b as u32).unwrap_or(0);
+
+            // Build per-worker stats string
+            let mut worker_stats_str = Vec::new();
+            for worker_id in tier_worker_ids.iter() {
+                if let Some(worker) = config.worker_registry.get(worker_id) {
+                    let letter = self.get_worker_letter(worker.url());
+                    let count = per_worker_count.get(worker.url()).copied().unwrap_or(0);
+                    worker_stats_str.push(format!("{}={}", letter, count));
+
+                    // If worker got no requests but tier has pending, print diagnostics
+                    if count == 0 && remaining_count > 0 {
+                        if let Ok(stats) = self.worker_stats.read() {
+                            if let Some(ws) = stats.get(worker.url()) {
+                                let has_pending = self.has_pending_work(worker.as_ref());
+                                let prefill_map = ws.prefill_sim_metrics.as_ref()
+                                    .map(|m| {
+                                        let mut entries: Vec<_> = m.iter().collect();
+                                        entries.sort_by_key(|(k, _)| *k);
+                                        entries.iter()
+                                            .map(|(k, v)| format!("{}:{:.0}", k, v))
+                                            .collect::<Vec<_>>()
+                                            .join(",")
+                                    })
+                                    .unwrap_or_else(|| "none".to_string());
+                                info!(
+                                    "[DIAG] tier={} worker={} pending_work={} prefill_map=[{}]",
+                                    tier_tpot, letter, has_pending, prefill_map
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            info!(
+                "[SCHED] tier={}: scheduled={} remaining={} workers=[{}]",
+                tier_tpot, scheduled_count, remaining_count, worker_stats_str.join(" ")
+            );
         }
     }
 }

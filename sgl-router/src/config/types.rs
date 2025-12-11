@@ -245,6 +245,22 @@ pub struct AutoScalingConfig {
     /// TPOT value (in ms) to set when worker is idle
     #[serde(default = "default_idle_tpot_ms")]
     pub idle_tpot_ms: f64,
+
+    /// Allow tiers to steal last worker from lower tiers (higher TPOT) if:
+    /// 1. Current tier has pending queue
+    /// 2. Lower tier has no queue
+    /// 3. Worker's iteration time < current tier's TPOT boundary
+    /// 4. Worker has been idle for > steal_idle_threshold_ms
+    #[serde(default)]
+    pub steal_from_lower_tier: bool,
+
+    /// Time (ms) a worker must be idle (no requests scheduled) before it can be stolen
+    #[serde(default = "default_steal_idle_threshold_ms")]
+    pub steal_idle_threshold_ms: u64,
+}
+
+fn default_steal_idle_threshold_ms() -> u64 {
+    1000 // 1 second
 }
 
 fn default_idle_tpot_ms() -> f64 {
@@ -256,6 +272,8 @@ impl Default for AutoScalingConfig {
         Self {
             enabled: false,
             idle_tpot_ms: 1000.0,
+            steal_from_lower_tier: false,
+            steal_idle_threshold_ms: 1000,
         }
     }
 }
