@@ -818,6 +818,7 @@ mod tests {
             "/generate",
             Some("req-1".into()),
             serde_json::json!({"test": true}),
+            512, // default token count for tests
         );
         worker.add_pending_message(pending);
         assert_eq!(worker.pending_message_count(), 1);
@@ -859,6 +860,7 @@ mod tests {
             "/generate",
             None,
             serde_json::json!({"test": true}),
+            512, // default token count for tests
         );
         pending.timestamp = Instant::now() - Duration::from_secs(120);
         worker.add_pending_message(pending);

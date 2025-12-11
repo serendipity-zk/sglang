@@ -303,6 +303,7 @@ mod tests {
             "/generate".to_string(),
             Some("test-req".to_string()),
             serde_json::json!({"test": true}),
+            512, // default token count for tests
         ));
 
         // Verify worker1 now has pending work
@@ -321,6 +322,7 @@ mod tests {
             "/generate".to_string(),
             Some("test-req-2".to_string()),
             serde_json::json!({"test": true}),
+            512, // default token count for tests
         ));
 
         // Now both workers are busy, should defer

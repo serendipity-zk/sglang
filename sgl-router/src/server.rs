@@ -705,7 +705,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let _log_guard = if !LOGGING_INITIALIZED.swap(true, Ordering::SeqCst) {
         let base_dir = config.log_dir.clone().unwrap_or_else(|| ".".to_string());
         // Use fixed filename (no timestamp) - logs will overwrite
-        let log_file_name = "router.log";
+        let log_file_name = "router.ans";
         let log_file_path = PathBuf::from(&base_dir).join(&log_file_name);
 
         Some(logging::init_logging(LoggingConfig {
@@ -864,9 +864,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.health_check.check_interval_secs
     );
 
-    // Start resend checker for unacknowledged messages
-    let _resend_checker = app_context.worker_registry.start_resend_checker();
-    info!("Started resend checker for unacknowledged messages (50ms interval)");
+    // DISABLED: Start resend checker for unacknowledged messages
+    // Disabled as part of commit 80ef7a8c4 - resend logic was causing issues
+    // let _resend_checker = app_context.worker_registry.start_resend_checker();
+    // info!("Started resend checker for unacknowledged messages (50ms interval)");
 
     // Set up concurrency limiter with queue if configured
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(

@@ -513,6 +513,7 @@ impl Router {
         // Extract SLO fields from the request
         let target_ttft_ms = typed_req.get_target_ttft_ms();
         let target_tpot_ms = typed_req.get_target_tpot_ms();
+        let input_token_count = typed_req.get_input_token_count();
 
         let pending = PendingRequest {
             headers: headers_owned,
@@ -527,6 +528,7 @@ impl Router {
             response_tx,
             target_ttft_ms,
             target_tpot_ms,
+            input_token_count,
         };
 
         match self.pending_tx.try_send(pending) {

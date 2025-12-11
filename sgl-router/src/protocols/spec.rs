@@ -1876,6 +1876,21 @@ impl GenerationRequest for GenerateRequest {
     fn get_arrival_time_ms(&self) -> Option<f64> {
         self.arrival_time_ms
     }
+
+    fn get_input_token_count(&self) -> Option<i64> {
+        // Return actual token count when input_ids are provided directly
+        if let Some(ref input_ids) = self.input_ids {
+            return match input_ids {
+                InputIds::Single(ids) => Some(ids.len() as i64),
+                InputIds::Batch(batches) => {
+                    // For batch requests, return the first batch length
+                    batches.first().map(|b| b.len() as i64)
+                }
+            };
+        }
+        // Text-based input - return None to signal estimation needed
+        None
+    }
 }
 
 // ==================================================================
@@ -2166,6 +2181,12 @@ pub trait GenerationRequest: Send + Sync {
 
     /// Get client-provided arrival timestamp (ms since Unix epoch)
     fn get_arrival_time_ms(&self) -> Option<f64> {
+        None
+    }
+
+    /// Get actual input token count when input_ids are provided directly
+    /// Returns None for text-based requests (token count should be estimated)
+    fn get_input_token_count(&self) -> Option<i64> {
         None
     }
 }

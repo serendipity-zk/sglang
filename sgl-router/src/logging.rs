@@ -107,10 +107,12 @@ pub fn init_logging(config: LoggingConfig) -> LogGuard {
 
     if config.enable_stdout {
         // Configure the console stdout layer
+        // Hide module path and file path for cleaner output
         let stdout_layer = tracing_subscriber::fmt::layer()
             .with_ansi(config.colorize)
-            .with_file(true)
-            .with_line_number(true)
+            .with_target(false)
+            .with_file(false)
+            .with_line_number(false)
             .with_timer(ChronoUtc::new(time_format.clone()));
 
         let stdout_layer = if config.json_format {
@@ -143,8 +145,9 @@ pub fn init_logging(config: LoggingConfig) -> LogGuard {
 
                 let file_layer = tracing_subscriber::fmt::layer()
                     .with_ansi(false)
-                    .with_file(true)
-                    .with_line_number(true)
+                    .with_target(false)
+                    .with_file(false)
+                    .with_line_number(false)
                     .with_timer(ChronoUtc::new(time_format.clone()))
                     .with_writer(non_blocking);
 
@@ -180,8 +183,9 @@ pub fn init_logging(config: LoggingConfig) -> LogGuard {
 
         let file_layer = tracing_subscriber::fmt::layer()
             .with_ansi(false) // Never use ANSI colors in log files
-            .with_file(true)
-            .with_line_number(true)
+            .with_target(false)
+            .with_file(false)
+            .with_line_number(false)
             .with_timer(ChronoUtc::new(time_format))
             .with_writer(non_blocking);
 

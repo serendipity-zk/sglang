@@ -42,6 +42,12 @@ pub struct SloAwareScheduler {
     worker_health_state: Arc<DashMap<String, bool>>,
     /// Enable periodic TPOT updates (500ms interval)
     send_tpot_updates: bool,
+    /// Shared HTTP client for TPOT updates (reused to avoid connection pool overhead)
+    tpot_client: reqwest::Client,
+    /// Persistent worker URL -> letter mapping for logging (A, B, C, ...)
+    worker_letters: Arc<DashMap<String, char>>,
+    /// Next letter to assign to new workers
+    next_letter: Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl SloAwareScheduler {
@@ -76,7 +82,22 @@ impl SloAwareScheduler {
             initial_tier_allocation,
             worker_health_state: Arc::new(DashMap::new()),
             send_tpot_updates,
+            tpot_client: reqwest::Client::new(),
+            worker_letters: Arc::new(DashMap::new()),
+            next_letter: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }
+    }
+
+    /// Get or assign a letter for a worker URL (A, B, C, ... Z, then wraps)
+    fn get_worker_letter(&self, worker_url: &str) -> char {
+        if let Some(letter) = self.worker_letters.get(worker_url) {
+            return *letter;
+        }
+        // Assign new letter
+        let idx = self.next_letter.fetch_add(1, Ordering::Relaxed);
+        let letter = (b'A' + (idx % 26)) as char;
+        self.worker_letters.insert(worker_url.to_string(), letter);
+        letter
     }
 
     fn num_buckets(&self) -> usize {
@@ -269,9 +290,9 @@ impl SloAwareScheduler {
         // Fire-and-forget HTTP POST to /set_tpot endpoint
         let url = format!("{}/set_tpot", worker_url.trim_end_matches('/'));
         let tpot_value = tpot_ms;
+        let client = self.tpot_client.clone(); // Cheap clone - just Arc increment
 
         tokio::spawn(async move {
-            let client = reqwest::Client::new();
             let payload = serde_json::json!({
                 "tpot": tpot_value
             });
@@ -541,6 +562,73 @@ impl SloAwareScheduler {
         None
     }
 
+    /// Log status with colored output
+    /// Format: [SLO] 10: Q=5 W=[A1, B6] | 20: Q=2 W=[C3] | idle: W=[D0] | 150us
+    fn log_status(
+        &self,
+        worker_registry: &Arc<crate::core::WorkerRegistry>,
+        queues: &[VecDeque<crate::routers::http::scheduler::PendingRequest>],
+        tick_us: u64,
+    ) {
+        // ANSI color codes
+        const CYAN: &str = "\x1b[36m";
+        const GREEN: &str = "\x1b[32m";
+        const YELLOW: &str = "\x1b[33m";
+        const RESET: &str = "\x1b[0m";
+
+        // Get worker stats for iteration times
+        let stats = self.worker_stats.read().ok();
+
+        let mut parts = Vec::new();
+
+        // Log each SLO tier
+        for (tier_idx, boundary) in self.tpot_buckets.iter().enumerate() {
+            let queue_size = queues.get(tier_idx).map(|q| q.len()).unwrap_or(0);
+
+            // Get workers in this tier with their iteration times
+            let mut worker_strs = Vec::new();
+            if let Some(worker_ids) = self.tier_workers.get(&tier_idx) {
+                for worker_id in worker_ids.iter() {
+                    if let Some(worker) = worker_registry.get(worker_id) {
+                        let letter = self.get_worker_letter(worker.url());
+                        let iter_time = stats.as_ref()
+                            .and_then(|s| s.get(worker.url()))
+                            .and_then(|ws| ws.last_iteration_time_ms)
+                            .map(|t| t as u64)
+                            .unwrap_or(0);
+                        worker_strs.push(format!("{}{}{}", letter, iter_time, RESET));
+                    }
+                }
+            }
+
+            let queue_color = if queue_size > 0 { YELLOW } else { GREEN };
+            parts.push(format!(
+                "{}{}{}: {}Q={}{} W=[{}]",
+                CYAN, *boundary as u32, RESET,
+                queue_color, queue_size, RESET,
+                worker_strs.join(", ")
+            ));
+        }
+
+        // Log idle tier
+        let idle_tier_idx = self.tpot_buckets.len();
+        let mut idle_worker_strs = Vec::new();
+        if let Some(worker_ids) = self.tier_workers.get(&idle_tier_idx) {
+            for worker_id in worker_ids.iter() {
+                if let Some(worker) = worker_registry.get(worker_id) {
+                    let letter = self.get_worker_letter(worker.url());
+                    idle_worker_strs.push(format!("{}", letter));
+                }
+            }
+        }
+        parts.push(format!("{}idle{}: W=[{}]", CYAN, RESET, idle_worker_strs.join(", ")));
+
+        // Add tick duration
+        parts.push(format!("{}{}us{}", GREEN, tick_us, RESET));
+
+        info!("[SLO] {}", parts.join(" | "));
+    }
+
     /// Linear interpolation to estimate prefill time for a given token count
     /// Uses prefill simulation metrics which map token counts to execution times
     fn interpolate_prefill_time(
@@ -603,17 +691,15 @@ impl SloAwareScheduler {
 
     /// Calculate total pending tokens for a worker (queue + pending messages)
     fn calculate_pending_tokens(&self, worker: &dyn Worker, worker_stats: &WorkerStats) -> i64 {
-        // Sum tokens from waiting queue
+        // Sum tokens from waiting queue (accurate from worker)
         let queue_tokens = worker_stats
             .waiting_queue_info
             .as_ref()
             .map(|info| info.total_extend_len)
             .unwrap_or(0);
 
-        // Add tokens from pending router messages (estimate)
-        let pending_msg_count = worker.pending_message_count() as i64;
-        // Estimate: assume average request has ~512 tokens
-        let pending_msg_tokens = pending_msg_count * 512;
+        // Sum actual tokens from pending messages tracked by the worker
+        let pending_msg_tokens = worker.pending_message_tokens();
 
         queue_tokens + pending_msg_tokens
     }
@@ -861,7 +947,10 @@ impl SloAwareScheduler {
                     self.select_worker_first_available(&tier_filtered)
                 }
                 WorkerSelectionPolicy::TTFTAware { margin_ms } => {
-                    let request_tokens = (request.text.len() / 4) as i64;
+                    // Use actual token count if available (input_ids), otherwise estimate from text
+                    let request_tokens = request
+                        .input_token_count
+                        .unwrap_or_else(|| (request.text.len() / 4) as i64);
                     let target_ttft_ms = request.target_ttft_ms.unwrap_or(1000.0) as f64;
                     let now_ms = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -870,31 +959,12 @@ impl SloAwareScheduler {
                     let elapsed_ms = now_ms - request.arrival_time_ms;
                     let remaining_slack_ms = target_ttft_ms - elapsed_ms;
 
-                    info!(
-                        "[WORKER_SEL] req={} target_ttft={:.1}ms elapsed={:.1}ms remaining_slack={:.1}ms tokens={} tier_workers={}",
-                        request.request_id, target_ttft_ms, elapsed_ms, remaining_slack_ms, request_tokens, tier_filtered.len()
-                    );
-
-                    let result = self.select_worker_ttft_aware(
+                    self.select_worker_ttft_aware(
                         &tier_filtered,
                         request_tokens,
                         remaining_slack_ms,
                         *margin_ms,
-                    );
-
-                    if result.is_none() {
-                        info!(
-                            "[WORKER_SEL] req={} NO worker selected (remaining_slack={:.1}ms)",
-                            request.request_id, remaining_slack_ms
-                        );
-                    } else {
-                        info!(
-                            "[WORKER_SEL] req={} selected worker={}",
-                            request.request_id, result.as_ref().unwrap().url()
-                        );
-                    }
-
-                    result
+                    )
                 }
             };
 
@@ -968,6 +1038,7 @@ impl Scheduler for SloAwareScheduler {
             tpot_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
             let mut receiver_closed = false;
+            let mut tick_count: u64 = 0;
 
             loop {
                 tokio::select! {
@@ -976,47 +1047,11 @@ impl Scheduler for SloAwareScheduler {
                             Some(request) => {
                                 match self.get_queue_index(request.target_tpot_ms) {
                                     Some(queue_idx) => {
-                                        // Valid request - add to appropriate queue
-                                        let target_tpot_ms = request.target_tpot_ms;
-                                        let target_ttft_ms = request.target_ttft_ms.unwrap_or(1000.0) as f64;
-                                        let request_id = request.request_id.clone();
-                                        let now_ms = SystemTime::now()
-                                            .duration_since(UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_millis() as f64;
-                                        let elapsed_ms = now_ms - request.arrival_time_ms;
-                                        let remaining_slack_ms = target_ttft_ms - elapsed_ms;
-
                                         queues[queue_idx].push_back(request);
                                         self.set_tier_queue_size(queue_idx, queues[queue_idx].len());
-                                        info!("Timestamp {}, request_id={}, Request added to queue {}: target_tpot={:?}, elapsed={:.1}ms, remaining_slack={:.1}ms",
-                                              chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
-                                              request_id,
-                                              queue_idx,
-                                              target_tpot_ms,
-                                              elapsed_ms,
-                                              remaining_slack_ms);
                                     }
                                     None => {
-                                        // Request should be rejected
-                                        let reason = if request.target_tpot_ms.is_none() {
-                                            "no SLO target specified"
-                                        } else if let Some(max_boundary) = self.tpot_buckets.last() {
-                                            if request.target_tpot_ms.unwrap() > *max_boundary {
-                                                "exceeds maximum SLO boundary"
-                                            } else {
-                                                "invalid SLO target"
-                                            }
-                                        } else {
-                                            "no SLO tiers configured"
-                                        };
-                                        warn!(
-                                            "Rejecting request: {} (target_tpot={:?}, max_boundary={:?})",
-                                            reason,
-                                            request.target_tpot_ms,
-                                            self.tpot_buckets.last()
-                                        );
-                                        // Handle timeout for rejected request
+                                        // Request rejected - no valid tier
                                         self.handle_timeout(request);
                                     }
                                 }
@@ -1025,39 +1060,40 @@ impl Scheduler for SloAwareScheduler {
                         }
                     }
                     _ = ticker.tick() => {
-                        info!("Timestamp {}, Scheduler tick started", chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
+                        tick_count += 1;
+                        let tick_start = std::time::Instant::now();
+
                         // Update worker stats for admission control
                         let stats = config.worker_registry.get_all_stats();
                         self.update_worker_stats(&stats);
 
-                        // Time the scheduling decision
-                        let start = std::time::Instant::now();
+                        // Drain queues and dispatch requests
                         self.drain_all_queues(&config, &mut queues).await;
-                        let duration_us = start.elapsed().as_micros() as u64;
-                        self.last_schedule_duration_us.store(duration_us, Ordering::Relaxed);
 
-                        // Update queue sizes for UI after draining
+                        // Update queue sizes for UI
                         for (queue_idx, queue) in queues.iter().enumerate() {
                             self.set_tier_queue_size(queue_idx, queue.len());
                         }
 
-                        // Dynamic worker reclassification based on load
+                        // Dynamic worker reclassification
                         self.schedule_worker(&config.worker_registry);
 
-                        // Monitor worker health state changes and update TPOT/UI accordingly
+                        // Monitor worker health
                         self.monitor_worker_health(&config.worker_registry);
+
+                        let tick_us = tick_start.elapsed().as_micros() as u64;
+                        self.last_schedule_duration_us.store(tick_us, Ordering::Relaxed);
+
+                        // Log status every 100 ticks (~500ms) with colored output
+                        if tick_count % 100 == 0 {
+                            self.log_status(&config.worker_registry, &queues, tick_us);
+                        }
 
                         if receiver_closed && queues.iter().all(|queue| queue.is_empty()) {
                             break;
                         }
-
-                        // Only log if tick took meaningful time (≥10μs)
-                        if duration_us >= 10 {
-                            info!("Timestamp {}, Scheduler tick completed after {} us", chrono::Utc::now().timestamp_millis() as f64 / 1000.0, duration_us);
-                        }
                     }
                     _ = tpot_ticker.tick() => {
-                        // Periodic TPOT updates every 500ms
                         self.send_periodic_tpot_updates(&config.worker_registry);
                     }
                 }

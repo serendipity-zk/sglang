@@ -41,6 +41,8 @@ pub trait SchedulerBase: Send + Sync + Debug + 'static {
         request: PendingRequest,
         worker: Arc<dyn Worker>,
     ) {
+        let dispatch_fn_start = std::time::Instant::now();
+
         // Generate message ID and add pending message BEFORE async spawn
         // This prevents race conditions where multiple requests select the same worker
         let (message_id, generation) = if request.route == "/generate" {
@@ -60,22 +62,39 @@ pub trait SchedulerBase: Send + Sync + Debug + 'static {
 
             // Add pending message NOW, before spawning async task
             // Store the original body_json for potential resend
+            // Use actual token count if available, otherwise estimate from text
+            let input_token_count = request
+                .input_token_count
+                .unwrap_or_else(|| (request.text.len() / 4) as i64);
+            let add_pending_start = std::time::Instant::now();
             worker.add_pending_message(PendingMessage::new(
                 msg_id,
                 gen,
                 request.route.clone(),
                 request_id,
                 request.body_json.clone(),
+                input_token_count,
             ));
+            let add_pending_us = add_pending_start.elapsed().as_micros() as u64;
+            if add_pending_us > 500 {
+                tracing::warn!("add_pending_message took {}us", add_pending_us);
+            }
 
             (Some(msg_id), Some(gen))
         } else {
             (None, None)
         };
 
+        let spawn_start = std::time::Instant::now();
         tokio::spawn(async move {
             process_pending(self, config, request, worker, message_id, generation).await;
         });
+        let spawn_us = spawn_start.elapsed().as_micros() as u64;
+
+        let total_us = dispatch_fn_start.elapsed().as_micros() as u64;
+        if total_us > 500 {
+            tracing::warn!("dispatch_to_worker total={}us (spawn={}us)", total_us, spawn_us);
+        }
     }
 
     async fn send_http_request(
@@ -194,6 +213,7 @@ async fn process_pending<S: SchedulerBase + ?Sized>(
         response_tx,
         target_ttft_ms: _,
         target_tpot_ms: _,
+        input_token_count: _,
     } = pending;
 
     let start = Instant::now();
@@ -291,7 +311,7 @@ async fn dispatch_request<S: SchedulerBase + ?Sized>(
     generation: Option<i64>,
     arrival_time_ms: f64,
 ) -> Response {
-    info!(
+    tracing::debug!(
         "Selected worker for model: {} worker_url={}",
         model_id.unwrap_or("default"),
         worker.url()
@@ -584,6 +604,7 @@ mod tests {
             "/generate".to_string(),
             Some("req-test".to_string()),
             body.clone(),
+            512, // default token count for tests
         ));
 
         let payload = prepare_request_payload("/generate", &body, Some(message_id), Some(generation), 0.0);

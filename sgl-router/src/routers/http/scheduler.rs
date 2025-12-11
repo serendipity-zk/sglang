@@ -26,6 +26,8 @@ pub struct PendingRequest {
     pub target_ttft_ms: Option<f32>,
     /// Target time per output token (SLO) in milliseconds
     pub target_tpot_ms: Option<f32>,
+    /// Number of input tokens (actual count when input_ids provided, None for text-based)
+    pub input_token_count: Option<i64>,
 }
 
 /// Configuration and shared state required by scheduler implementations.

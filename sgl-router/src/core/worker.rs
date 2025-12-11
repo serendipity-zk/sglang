@@ -46,6 +46,8 @@ pub struct PendingMessage {
     pub last_send_time: Instant,
     /// Request body stored for potential resend (contains router_generation and router_message_id)
     pub body_json: serde_json::Value,
+    /// Number of input tokens for this request (for TTFT estimation)
+    pub input_token_count: i64,
 }
 
 impl PendingMessage {
@@ -56,6 +58,7 @@ impl PendingMessage {
         route: impl Into<String>,
         request_id: Option<String>,
         body_json: serde_json::Value,
+        input_token_count: i64,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -67,6 +70,7 @@ impl PendingMessage {
             resend_count: 0,
             last_send_time: now,
             body_json,
+            input_token_count,
         }
     }
 
@@ -175,6 +179,9 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Get number of messages dispatched but not yet acknowledged by the worker.
     fn pending_message_count(&self) -> usize;
+
+    /// Get total input tokens for pending messages (for TTFT estimation)
+    fn pending_message_tokens(&self) -> i64;
 
     /// Track a dispatched message until it is acknowledged.
     fn add_pending_message(&self, message: PendingMessage);
@@ -644,6 +651,14 @@ impl Worker for BasicWorker {
         self.pending_messages.read().len()
     }
 
+    fn pending_message_tokens(&self) -> i64 {
+        self.pending_messages
+            .read()
+            .iter()
+            .map(|msg| msg.input_token_count)
+            .sum()
+    }
+
     fn add_pending_message(&self, message: PendingMessage) {
         let mut pending = self.pending_messages.write();
         pending.push(message);
@@ -812,6 +827,10 @@ impl Worker for DPAwareWorker {
 
     fn pending_message_count(&self) -> usize {
         self.base_worker.pending_message_count()
+    }
+
+    fn pending_message_tokens(&self) -> i64 {
+        self.base_worker.pending_message_tokens()
     }
 
     fn add_pending_message(&self, message: PendingMessage) {
@@ -2035,6 +2054,7 @@ mod tests {
             "/generate",
             Some(format!("req-{id}")),
             serde_json::json!({"test": true}),
+            512, // default token count for tests
         )
     }
 
