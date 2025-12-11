@@ -629,7 +629,7 @@ impl SloAwareScheduler {
         let stats = self.worker_stats.read().ok()?;
         let worker_stats = stats.get(worker.url());
         if worker_stats.is_none() {
-            info!("[TTFT_EST] worker={} no worker_stats", worker.url());
+            // info!("[TTFT_EST] worker={} no worker_stats", worker.url());
             return None;
         }
         let worker_stats = worker_stats.unwrap();
@@ -637,7 +637,7 @@ impl SloAwareScheduler {
         // Get prefill sim metrics
         let sim_metrics = worker_stats.prefill_sim_metrics.as_ref();
         if sim_metrics.is_none() {
-            info!("[TTFT_EST] worker={} no prefill_sim_metrics", worker.url());
+            // info!("[TTFT_EST] worker={} no prefill_sim_metrics", worker.url());
             return None;
         }
         let sim_metrics = sim_metrics.unwrap();
@@ -651,18 +651,18 @@ impl SloAwareScheduler {
         // Interpolate to get estimated time
         let estimated_ms = self.interpolate_prefill_time(sim_metrics, total_tokens, pending_tokens);
         if estimated_ms.is_none() {
-            info!(
-                "[TTFT_EST] worker={} interpolate failed total_tokens={} pending={}",
-                worker.url(), total_tokens, pending_tokens
-            );
+            // info!(
+            //     "[TTFT_EST] worker={} interpolate failed total_tokens={} pending={}",
+            //     worker.url(), total_tokens, pending_tokens
+            // );
             return None;
         }
         let estimated_ms = estimated_ms.unwrap();
 
-        info!(
-            "[TTFT_EST] worker={} pending={} new={} total={} est={:.1}ms margin={:.1}ms",
-            worker.url(), pending_tokens, new_request_tokens, total_tokens, estimated_ms, margin_ms
-        );
+        // info!(
+        //     "[TTFT_EST] worker={} pending={} new={} total={} est={:.1}ms margin={:.1}ms",
+        //     worker.url(), pending_tokens, new_request_tokens, total_tokens, estimated_ms, margin_ms
+        // );
 
         // Add safety margin
         Some(estimated_ms + margin_ms)
@@ -701,16 +701,16 @@ impl SloAwareScheduler {
         for worker in workers {
             if let Some(estimated_ttft) = self.estimate_ttft(worker.as_ref(), request_tokens, margin_ms) {
                 if estimated_ttft <= remaining_slack_ms {
-                    info!(
-                        "[TTFT_SEL] worker={} ACCEPT est={:.1}ms <= slack={:.1}ms",
-                        worker.url(), estimated_ttft, remaining_slack_ms
-                    );
+                    // info!(
+                    //     "[TTFT_SEL] worker={} ACCEPT est={:.1}ms <= slack={:.1}ms",
+                    //     worker.url(), estimated_ttft, remaining_slack_ms
+                    // );
                     return Some(Arc::clone(worker));
                 } else {
-                    info!(
-                        "[TTFT_SEL] worker={} REJECT est={:.1}ms > slack={:.1}ms",
-                        worker.url(), estimated_ttft, remaining_slack_ms
-                    );
+                    // info!(
+                    //     "[TTFT_SEL] worker={} REJECT est={:.1}ms > slack={:.1}ms",
+                    //     worker.url(), estimated_ttft, remaining_slack_ms
+                    // );
                 }
             }
         }
@@ -978,15 +978,24 @@ impl Scheduler for SloAwareScheduler {
                                     Some(queue_idx) => {
                                         // Valid request - add to appropriate queue
                                         let target_tpot_ms = request.target_tpot_ms;
+                                        let target_ttft_ms = request.target_ttft_ms.unwrap_or(1000.0) as f64;
                                         let request_id = request.request_id.clone();
+                                        let now_ms = SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_millis() as f64;
+                                        let elapsed_ms = now_ms - request.arrival_time_ms;
+                                        let remaining_slack_ms = target_ttft_ms - elapsed_ms;
 
                                         queues[queue_idx].push_back(request);
                                         self.set_tier_queue_size(queue_idx, queues[queue_idx].len());
-                                        info!("Timestamp {}, request_id={}, Request added to queue {}: target_tpot={:?}",
+                                        info!("Timestamp {}, request_id={}, Request added to queue {}: target_tpot={:?}, elapsed={:.1}ms, remaining_slack={:.1}ms",
                                               chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
                                               request_id,
                                               queue_idx,
-                                              target_tpot_ms);
+                                              target_tpot_ms,
+                                              elapsed_ms,
+                                              remaining_slack_ms);
                                     }
                                     None => {
                                         // Request should be rejected
@@ -1016,6 +1025,7 @@ impl Scheduler for SloAwareScheduler {
                         }
                     }
                     _ = ticker.tick() => {
+                        info!("Timestamp {}, Scheduler tick started", chrono::Utc::now().timestamp_millis() as f64 / 1000.0);
                         // Update worker stats for admission control
                         let stats = config.worker_registry.get_all_stats();
                         self.update_worker_stats(&stats);

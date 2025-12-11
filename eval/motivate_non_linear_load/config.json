@@ -1,0 +1,23 @@
+{
+  "traces": [
+    {
+      "name": "lmsys",
+      "path": "/sgl-workspace/sglang/SLO-CSim/trace/arxiv/lmsys.csv"
+    },
+    {
+      "name": "sharegpt",
+      "path": "/sgl-workspace/sglang/SLO-CSim/trace/arxiv/sharegpt.csv"
+    },
+    {
+      "name": "splitwise",
+      "path": "/sgl-workspace/sglang/SLO-CSim/trace/arxiv/splitwise.csv"
+    }
+  ],
+  "rates": [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 65, 70, 75, 80, 85, 90, 95, 100],
+  "duration_seconds": 60,
+  "servers": {
+    "num_gpus": 8,
+    "ports": [31001, 31002, 31003, 31004, 31005, 31006, 31007, 31008],
+    "host": "0.0.0.0"
+  }
+}
