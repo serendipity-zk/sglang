@@ -23,7 +23,7 @@ python -m auto_rate_slog_rust \
   --tokenizer meta-llama/Llama-3.1-8B-Instruct \
   --base-url http://0.0.0.0:40010/v1 \
   --model meta-llama/Llama-3.1-8B-Instruct \
-  --start-rate 50.0 \
+  --start-rate 300 \
   --target-attainment 0.95 \
-  --max-requests 5000 \
+  --max-requests 15000 \
   "${resume_flag[@]}"

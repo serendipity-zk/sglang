@@ -9,6 +9,11 @@
   },
   "auto_scaling": {
     "enabled": true,
-    "idle_tpot_ms": 1000.0
+    "idle_tpot_ms": 1000.0,
+    "steal_from_lower_tier": true,
+    "steal_idle_threshold_ms": 1000,
+    "promote_to_faster_tier": true,
+    "promotion_ttft_slack_threshold_ms": 250,
+    "promotion_idle_threshold_ms": 500
   }
 }

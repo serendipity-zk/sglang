@@ -9,6 +9,8 @@
   },
   "auto_scaling": {
     "enabled": true,
-    "idle_tpot_ms": 1000.0
+    "idle_tpot_ms": 1000.0,
+    "steal_from_lower_tier": true,
+    "steal_idle_threshold_ms": 1000
   }
 }
