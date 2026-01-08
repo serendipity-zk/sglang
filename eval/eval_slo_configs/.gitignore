@@ -1,0 +1,20 @@
+# Results directory
+results/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+*.ans
+
+# Plots
+*.png
+*.pdf
+
+# Data
+*.csv
+*.json
+!config.json

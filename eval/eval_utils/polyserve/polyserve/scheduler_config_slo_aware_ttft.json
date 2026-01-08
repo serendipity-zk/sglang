@@ -5,10 +5,12 @@
   "send_tpot_updates": true,
   "worker_selection_policy": {
     "type": "TTFTAware",
-    "margin_ms": 100.0
+    "margin_ms": 50.0
   },
   "auto_scaling": {
-    "enabled": false,
-    "idle_tpot_ms": 1000.0
+    "enabled": true,
+    "idle_tpot_ms": 1000.0,
+    "steal_from_lower_tier": true,
+    "steal_idle_threshold_ms": 1000
   }
 }

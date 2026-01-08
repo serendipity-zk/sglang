@@ -16,7 +16,7 @@ from matplotlib.lines import Line2D
 from plot_utils import (
     load_and_filter_data,
     sort_traces,
-    sort_methods,
+    sort_configs,
     get_style,
     plot_single_trace,
     ensure_output_dir,
@@ -24,15 +24,15 @@ from plot_utils import (
 )
 
 
-def interpolate_rate_at_attainment(df_method, target_attainment):
+def interpolate_rate_at_attainment(df_config, target_attainment):
     """
-    Find the rate at which attainment crosses the target threshold using linear interpolation.
+    Find the rate at which min_tier_attainment crosses the target threshold using linear interpolation.
 
     Returns the interpolated rate, or None if no crossing is found.
     """
-    df_sorted = df_method.sort_values("rate")
+    df_sorted = df_config.sort_values("rate")
     rates = df_sorted["rate"].values
-    attainments = df_sorted["attainment"].values
+    attainments = df_sorted["min_tier_attainment"].values
 
     # Find the crossing point (attainment goes from >= target to < target)
     for i in range(len(attainments) - 1):
@@ -42,8 +42,6 @@ def interpolate_rate_at_attainment(df_method, target_attainment):
         # Check if the target attainment is crossed between these two points
         if att_curr >= target_attainment > att_next:
             # Linear interpolation
-            # target = att_curr + (att_next - att_curr) * (rate - rate_curr) / (rate_next - rate_curr)
-            # Solve for rate:
             rate_curr = rates[i]
             rate_next = rates[i + 1]
 
@@ -71,40 +69,48 @@ def print_trace_statistics(df, target_attainment=TARGET_ATTAINMENT):
     traces = sort_traces(traces)
 
     print("\n" + "=" * 80)
-    print(f"STATISTICS: Goodput (rate at {int(target_attainment * 100)}% attainment)")
+    print(f"STATISTICS: Goodput (rate at {int(target_attainment * 100)}% min-tier attainment)")
     print("=" * 80)
 
     for trace in traces:
         print(f"\n--- Trace: {trace} ---")
         df_trace = df[df["trace"] == trace]
-        methods = df_trace["method"].unique()
-        methods = sort_methods(methods)
+        configs = df_trace["config"].unique()
+        configs = sort_configs(configs)
 
-        # Calculate goodput for each method
+        # Calculate goodput for each config
         goodputs = {}
-        for method in methods:
-            df_method = df_trace[df_trace["method"] == method]
-            goodput = interpolate_rate_at_attainment(df_method, target_attainment)
-            goodputs[method] = goodput
+        for config in configs:
+            df_config = df_trace[df_trace["config"] == config]
+            goodput = interpolate_rate_at_attainment(df_config, target_attainment)
+            goodputs[config] = goodput
 
             if goodput is not None:
-                print(f"  {method:25s}: {goodput:8.2f} req/s")
+                print(f"  {config:25s}: {goodput:8.2f} req/s")
             else:
-                print(f"  {method:25s}: N/A (never achieves {int(target_attainment * 100)}%)")
+                print(f"  {config:25s}: N/A (never achieves {int(target_attainment * 100)}%)")
 
-        # Find best baseline (excluding PolyServe/TierServe)
-        baseline_methods = [m for m in methods if m != "PolyServe"]
-        baseline_goodputs = {m: goodputs[m] for m in baseline_methods if goodputs.get(m) is not None}
+        # Calculate gains relative to baseline (no_autoscaling / Static)
+        baseline_config = "no_autoscaling"
+        if baseline_config in goodputs and goodputs[baseline_config] is not None:
+            baseline_goodput = goodputs[baseline_config]
+            print(f"\n  Gains over {baseline_config} (Static):")
+            for config in configs:
+                if config != baseline_config and goodputs[config] is not None:
+                    gain = (goodputs[config] - baseline_goodput) / baseline_goodput * 100
+                    gain_abs = goodputs[config] - baseline_goodput
+                    print(f"    {config:23s}: {gain:+6.1f}% ({gain_abs:+.2f} req/s)")
 
-        if baseline_goodputs:
-            best_baseline = max(baseline_goodputs, key=baseline_goodputs.get)
-            best_baseline_goodput = baseline_goodputs[best_baseline]
-
-            # Print TierServe speedup over best baseline
-            if "PolyServe" in goodputs and goodputs["PolyServe"] is not None:
-                tierserve_goodput = goodputs["PolyServe"]
-                speedup = (tierserve_goodput - best_baseline_goodput) / best_baseline_goodput * 100
-                print(f"\n  TierServe speedup over best baseline ({best_baseline}): {speedup:+.1f}%")
+        # Also show gains relative to ttft (TierServe) if available
+        compare_config = "ttft"
+        if compare_config in goodputs and goodputs[compare_config] is not None:
+            compare_goodput = goodputs[compare_config]
+            print(f"\n  Gains over {compare_config} (TierServe):")
+            for config in configs:
+                if config != compare_config and goodputs[config] is not None:
+                    gain = (goodputs[config] - compare_goodput) / compare_goodput * 100
+                    gain_abs = goodputs[config] - compare_goodput
+                    print(f"    {config:23s}: {gain:+6.1f}% ({gain_abs:+.2f} req/s)")
 
     print("\n" + "=" * 80)
 
@@ -118,7 +124,6 @@ def plot_all_traces_grid(df, output_path: str):
     n_cols = min(3, n_traces)
     n_rows = (n_traces + n_cols - 1) // n_cols
 
-    # Figure size: ~3.3in per column for double-column paper
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.3 * n_cols, 2.5 * n_rows))
 
     if n_traces == 1:
@@ -133,14 +138,13 @@ def plot_all_traces_grid(df, output_path: str):
     for idx in range(n_traces, len(axes)):
         axes[idx].set_visible(False)
 
-    # Collect all unique methods across all traces for legend
-    all_methods = df["method"].unique()
-    all_methods = sort_methods(all_methods)
+    # Create legend
+    all_configs = df["config"].unique()
+    all_configs = sort_configs(all_configs)
 
-    # Create custom legend handles for all methods
     legend_handles = []
-    for method in all_methods:
-        style = get_style(method)
+    for config in all_configs:
+        style = get_style(config)
         handle = Line2D([0], [0], color=style["color"], marker=style["marker"],
                         linestyle=style["linestyle"], label=style["label"],
                         markerfacecolor="white", markeredgewidth=1.2, markersize=5)
@@ -158,22 +162,12 @@ def plot_all_traces_grid(df, output_path: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Plot rate vs attainment grid")
-    parser.add_argument(
-        "--input",
-        default="results/aggregated_results.csv",
-        help="Input CSV file (default: results/aggregated_results.csv)",
-    )
-    parser.add_argument(
-        "--output",
-        default="results/figures/rate_vs_attainment_grid.pdf",
-        help="Output file path (default: results/figures/rate_vs_attainment_grid.pdf)",
-    )
-    parser.add_argument(
-        "--format",
-        default=None,
-        choices=["pdf", "png", "svg"],
-        help="Output format (overrides extension in --output)",
-    )
+    parser.add_argument("--input", default="results/aggregated_results.csv",
+                        help="Input CSV file")
+    parser.add_argument("--output", default="results/figures/rate_vs_attainment_grid.pdf",
+                        help="Output file path")
+    parser.add_argument("--format", default=None, choices=["pdf", "png", "svg"],
+                        help="Output format (overrides extension)")
     args = parser.parse_args()
 
     df = load_and_filter_data(args.input)

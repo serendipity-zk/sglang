@@ -95,7 +95,7 @@ METHOD_LABELS = {
     "SGLang-Random": "SGLang-Random",
     "Chunked-Prefill": "Chunked-Prefill",
     "SGLang-Round-Robin": "SGLang-RR",
-    "PolyServe": "PolyServe",
+    "PolyServe": "TierServe",
 }
 
 # Display names for traces
