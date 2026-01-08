@@ -355,26 +355,26 @@ impl RouterUi {
                         let key = (tpot as i64).to_string();
                         // Try exact match first, then nearest key
                         let count = tier_map.get(&key).copied().unwrap_or_else(|| {
-                            // Find nearest numeric key
+                            // Find nearest numeric key within 0.8x-1.2x range
                             let mut nearest: Option<(f64, i64)> = None;
                             for (k, &v) in tier_map.iter() {
                                 if k == "none" { continue; }
                                 if let Ok(k_val) = k.parse::<f64>() {
-                                    let diff = (k_val - tpot as f64).abs();
-                                    match nearest {
-                                        None => nearest = Some((diff, v)),
-                                        Some((best_diff, _)) if diff < best_diff => {
-                                            nearest = Some((diff, v));
+                                    let ratio = k_val / tpot as f64;
+                                    // Only consider if within 0.8x-1.2x range (20% tolerance)
+                                    if ratio >= 0.8 && ratio <= 1.2 {
+                                        let diff = (k_val - tpot as f64).abs();
+                                        match nearest {
+                                            None => nearest = Some((diff, v)),
+                                            Some((best_diff, _)) if diff < best_diff => {
+                                                nearest = Some((diff, v));
+                                            }
+                                            _ => {}
                                         }
-                                        _ => {}
                                     }
                                 }
                             }
-                            // Only use nearest if it's reasonably close (within 50% of tier value)
-                            nearest
-                                .filter(|(diff, _)| *diff < tpot as f64 * 0.5)
-                                .map(|(_, v)| v)
-                                .unwrap_or(0)
+                            nearest.map(|(_, v)| v).unwrap_or(0)
                         });
                         count.to_string()
                     })

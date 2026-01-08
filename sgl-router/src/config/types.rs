@@ -257,6 +257,18 @@ pub struct AutoScalingConfig {
     /// Time (ms) a worker must be idle (no requests scheduled) before it can be stolen
     #[serde(default = "default_steal_idle_threshold_ms")]
     pub steal_idle_threshold_ms: u64,
+
+    /// Enable request promotion to faster tiers when TTFT slack is tight
+    #[serde(default)]
+    pub promote_to_faster_tier: bool,
+
+    /// TTFT slack threshold (ms) - requests with remaining slack below this may be promoted
+    #[serde(default = "default_promotion_ttft_slack_threshold_ms")]
+    pub promotion_ttft_slack_threshold_ms: u64,
+
+    /// Time (ms) a server in faster tier must be idle before accepting promoted requests
+    #[serde(default = "default_promotion_idle_threshold_ms")]
+    pub promotion_idle_threshold_ms: u64,
 }
 
 fn default_steal_idle_threshold_ms() -> u64 {
@@ -267,6 +279,14 @@ fn default_idle_tpot_ms() -> f64 {
     1000.0
 }
 
+fn default_promotion_ttft_slack_threshold_ms() -> u64 {
+    250 // 250ms default - promote when <250ms slack remaining
+}
+
+fn default_promotion_idle_threshold_ms() -> u64 {
+    500 // 500ms default
+}
+
 impl Default for AutoScalingConfig {
     fn default() -> Self {
         Self {
@@ -274,6 +294,9 @@ impl Default for AutoScalingConfig {
             idle_tpot_ms: 1000.0,
             steal_from_lower_tier: false,
             steal_idle_threshold_ms: 1000,
+            promote_to_faster_tier: false,
+            promotion_ttft_slack_threshold_ms: 250,
+            promotion_idle_threshold_ms: 500,
         }
     }
 }

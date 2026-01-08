@@ -706,6 +706,9 @@ impl SloAwareScheduler {
                 }
             }
         }
+
+        // Step 5: Reassign servers based on batch composition
+        self.reassign_servers_by_batch_composition(worker_registry);
     }
 
     /// Monitor worker health state changes and react accordingly
@@ -1041,6 +1044,18 @@ impl SloAwareScheduler {
         elapsed_ms > target_ttft as f64
     }
 
+    /// Get remaining TTFT slack for a request in milliseconds
+    /// Returns None if no TTFT target is specified
+    fn get_ttft_slack_ms(&self, req: &PendingRequest) -> Option<f64> {
+        let target_ttft = req.target_ttft_ms? as f64;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as f64;
+        let elapsed_ms = now_ms - req.arrival_time_ms;
+        Some(target_ttft - elapsed_ms)
+    }
+
     /// TTFT-aware worker selection (without fallback)
     /// Returns worker that can meet remaining TTFT slack, or None to retry later
     fn select_worker_ttft_aware(
@@ -1320,6 +1335,340 @@ impl SloAwareScheduler {
             );
         }
     }
+
+    /// Promote pending requests with tight TTFT slack to faster tiers
+    /// Called AFTER drain_all_queues() to handle requests that couldn't be scheduled
+    ///
+    /// Algorithm:
+    /// 1. Start from 2nd highest priority tier (index 1) and iterate to lowest priority
+    /// 2. For each source tier, check if higher tier (target) meets criteria:
+    ///    - Target tier has no pending queue
+    ///    - Target tier's last server is idle for promotion_idle_threshold_ms
+    /// 3. For requests in source tier with tight TTFT slack:
+    ///    - Try to dispatch directly to target tier's last server
+    ///    - If that server is full/busy, try prior servers in target tier
+    /// 4. On successful dispatch, remove request from source queue
+    async fn promote_pending_requests(
+        self: &Arc<Self>,
+        config: &Arc<SchedulerConfig>,
+        queues: &mut [VecDeque<PendingRequest>],
+    ) {
+        let promote_enabled = self
+            .auto_scaling
+            .as_ref()
+            .map(|c| c.promote_to_faster_tier)
+            .unwrap_or(false);
+
+        if !promote_enabled {
+            return;
+        }
+
+        let slack_threshold_ms = self
+            .auto_scaling
+            .as_ref()
+            .map(|c| c.promotion_ttft_slack_threshold_ms)
+            .unwrap_or(250) as f64;
+
+        let idle_threshold_ms = self
+            .auto_scaling
+            .as_ref()
+            .map(|c| c.promotion_idle_threshold_ms)
+            .unwrap_or(500);
+
+        let mut total_promoted = 0;
+
+        // Start from 2nd highest priority tier (index 1)
+        for source_tier_idx in 1..self.tpot_buckets.len() {
+            let source_queue = &mut queues[source_tier_idx];
+            if source_queue.is_empty() {
+                continue;
+            }
+
+            // Try higher (tighter) tiers as targets (lower indices)
+            for target_tier_idx in 0..source_tier_idx {
+                // Check if target tier has no pending queue
+                let target_has_queue = self
+                    .tier_queue_sizes
+                    .get(&target_tier_idx)
+                    .map(|q| q.load(Ordering::Relaxed) > 0)
+                    .unwrap_or(false);
+
+                if target_has_queue {
+                    continue;
+                }
+
+                // Get workers in target tier (sorted by batch size, larger first)
+                let target_workers: Vec<WorkerId> = self
+                    .tier_workers
+                    .get(&target_tier_idx)
+                    .map(|w| w.clone())
+                    .unwrap_or_default();
+
+                if target_workers.is_empty() {
+                    continue;
+                }
+
+                // Iterate workers from LAST (smaller batch) to FIRST (larger batch)
+                // Try last worker first, if full try prior workers
+                for worker_id in target_workers.iter().rev() {
+                    if let Some(worker) = config.worker_registry.get(worker_id) {
+                        // Check if worker is idle long enough
+                        if !self.is_worker_idle_for(worker.url(), idle_threshold_ms) {
+                            continue;
+                        }
+
+                        // Check if worker has no pending work (not full)
+                        if self.has_pending_work(worker.as_ref()) {
+                            continue; // Server full, try prior worker
+                        }
+
+                        // Found an eligible worker! Try to promote requests
+                        let mut promoted_idx: Option<usize> = None;
+
+                        for (idx, request) in source_queue.iter().enumerate() {
+                            // Check TTFT slack
+                            if let Some(slack_ms) = self.get_ttft_slack_ms(request) {
+                                // Promote if slack is tight but still positive
+                                if slack_ms > 0.0 && slack_ms < slack_threshold_ms {
+                                    promoted_idx = Some(idx);
+
+                                    let letter = self.get_worker_letter(worker.url());
+                                    info!(
+                                        "[PROMOTE] request {} (slack={:.0}ms) from tier {} to tier {} via worker {}",
+                                        request.request_id,
+                                        slack_ms,
+                                        self.tpot_buckets[source_tier_idx] as u32,
+                                        self.tpot_buckets[target_tier_idx] as u32,
+                                        letter
+                                    );
+
+                                    // Only promote one request per worker at a time
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Remove promoted request and dispatch
+                        if let Some(idx) = promoted_idx {
+                            let request = source_queue.remove(idx).unwrap();
+                            self.record_scheduled(worker.url());
+                            RouterUi::dec_queue();
+
+                            let dispatcher = Arc::clone(self);
+                            let cfg = Arc::clone(config);
+                            dispatcher
+                                .dispatch_to_worker(cfg, request, Arc::clone(&worker))
+                                .await;
+
+                            // Update source queue size
+                            self.set_tier_queue_size(source_tier_idx, source_queue.len());
+
+                            total_promoted += 1;
+
+                            // After promoting one request, break to check next source tier
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Log promotion summary
+        if total_promoted > 0 {
+            info!("[PROMOTE] total promoted this tick: {}", total_promoted);
+        } else {
+            // Log if no promotions happened but there were pending requests with tight slack
+            self.log_promotion_candidates(queues);
+        }
+    }
+
+    /// Check if any requests in the queues could potentially be promoted
+    /// Used for logging/debugging when no promotions occur
+    fn log_promotion_candidates(&self, queues: &[VecDeque<PendingRequest>]) {
+        let promote_enabled = self
+            .auto_scaling
+            .as_ref()
+            .map(|c| c.promote_to_faster_tier)
+            .unwrap_or(false);
+
+        if !promote_enabled {
+            return;
+        }
+
+        let slack_threshold_ms = self
+            .auto_scaling
+            .as_ref()
+            .map(|c| c.promotion_ttft_slack_threshold_ms)
+            .unwrap_or(250) as f64;
+
+        let mut candidates_by_tier: Vec<(usize, usize)> = Vec::new(); // (tier_idx, count)
+
+        for source_tier_idx in 1..self.tpot_buckets.len() {
+            let source_queue = &queues[source_tier_idx];
+            let mut candidate_count = 0;
+
+            for request in source_queue.iter() {
+                if let Some(slack_ms) = self.get_ttft_slack_ms(request) {
+                    if slack_ms > 0.0 && slack_ms < slack_threshold_ms {
+                        candidate_count += 1;
+                    }
+                }
+            }
+
+            if candidate_count > 0 {
+                candidates_by_tier.push((source_tier_idx, candidate_count));
+            }
+        }
+
+        if !candidates_by_tier.is_empty() {
+            let candidates_str: Vec<String> = candidates_by_tier
+                .iter()
+                .map(|(tier_idx, count)| {
+                    format!("tier{}:{}", self.tpot_buckets[*tier_idx] as u32, count)
+                })
+                .collect();
+            info!(
+                "[PROMOTE] candidates not promoted (no eligible target workers): [{}]",
+                candidates_str.join(", ")
+            );
+        }
+    }
+
+    /// Reassign servers to appropriate tiers based on batch composition
+    /// If a server only contains requests from other tiers (not its assigned tier):
+    /// - Find the tightest tier among requests currently on the server
+    /// - Reassign server to that tier
+    ///
+    /// Example: Server in tier 0 (40ms) has only tier 1 (50ms) and tier 2 (60ms) requests
+    /// -> Reassign to tier 1 (50ms) as it's the tightest among actual requests
+    fn reassign_servers_by_batch_composition(
+        &self,
+        worker_registry: &Arc<crate::core::WorkerRegistry>,
+    ) {
+        let reassign_enabled = self
+            .auto_scaling
+            .as_ref()
+            .map(|c| c.promote_to_faster_tier)
+            .unwrap_or(false);
+
+        if !reassign_enabled {
+            return;
+        }
+
+        let stats = if let Ok(cached_stats) = self.worker_stats.read() {
+            cached_stats.clone()
+        } else {
+            return;
+        };
+
+        let num_tiers = self.tpot_buckets.len();
+
+        // For each SLO tier, check its workers
+        for tier_idx in 0..num_tiers {
+            let worker_ids: Vec<WorkerId> = self
+                .tier_workers
+                .get(&tier_idx)
+                .map(|w| w.clone())
+                .unwrap_or_default();
+
+            for worker_id in worker_ids.iter() {
+                if let Some(worker) = worker_registry.get(worker_id) {
+                    if let Some(worker_stats) = stats.get(worker.url()) {
+                        // Get batch composition by tier
+                        if let Some(batch_by_tier) = &worker_stats.batch_size_by_tpot_tier {
+                            let current_tpot = self.tpot_buckets[tier_idx];
+
+                            // Find the tightest (lowest TPOT) tier with requests on this server
+                            let mut tightest_tier_idx: Option<usize> = None;
+                            let mut has_own_tier_requests = false;
+
+                            for (tpot_str, count) in batch_by_tier.iter() {
+                                if *count == 0 {
+                                    continue;
+                                }
+                                if tpot_str == "none" {
+                                    continue;
+                                }
+
+                                // Parse TPOT string to find corresponding tier using closest match
+                                if let Ok(tpot_val) = tpot_str.parse::<f64>() {
+                                    // Check if this is the server's own tier (within 0.8x-1.2x range)
+                                    let ratio = tpot_val / current_tpot as f64;
+                                    if ratio >= 0.8 && ratio <= 1.2 {
+                                        has_own_tier_requests = true;
+                                    }
+
+                                    // Find which tier this TPOT corresponds to (closest match within 0.8x-1.2x)
+                                    let mut best_match: Option<(usize, f64)> = None;
+                                    for (t_idx, &boundary) in self.tpot_buckets.iter().enumerate() {
+                                        let tier_ratio = tpot_val / boundary as f64;
+                                        // Only consider if within 0.8x-1.2x range (20% tolerance)
+                                        if tier_ratio >= 0.8 && tier_ratio <= 1.2 {
+                                            let diff = (tpot_val - boundary as f64).abs();
+                                            match best_match {
+                                                None => best_match = Some((t_idx, diff)),
+                                                Some((_, best_diff)) if diff < best_diff => {
+                                                    best_match = Some((t_idx, diff));
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+
+                                    if let Some((matched_tier_idx, _)) = best_match {
+                                        // Track tightest tier (lowest index = tightest TPOT)
+                                        match tightest_tier_idx {
+                                            None => tightest_tier_idx = Some(matched_tier_idx),
+                                            Some(current_tightest)
+                                                if matched_tier_idx < current_tightest =>
+                                            {
+                                                tightest_tier_idx = Some(matched_tier_idx);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+
+                            // If server has no requests from its own tier but has from other tiers
+                            // Reassign to the tightest tier among its current requests
+                            if !has_own_tier_requests {
+                                if let Some(target_tier) = tightest_tier_idx {
+                                    if target_tier != tier_idx {
+                                        let letter = self.get_worker_letter(worker.url());
+
+                                        // Remove from current tier
+                                        if let Some(mut workers) =
+                                            self.tier_workers.get_mut(&tier_idx)
+                                        {
+                                            workers.retain(|id| id != worker_id);
+                                        }
+
+                                        // Add to target tier
+                                        self.tier_workers
+                                            .entry(target_tier)
+                                            .or_insert_with(Vec::new)
+                                            .push(worker_id.clone());
+
+                                        // Update TPOT
+                                        let new_tpot = self.calculate_tpot_for_tier(target_tier);
+                                        self.send_tpot_update(worker.url(), new_tpot);
+
+                                        info!(
+                                            "[REASSIGN] {} moved from tier {} to tier {} (tightest among batch requests)",
+                                            letter,
+                                            self.tpot_buckets[tier_idx] as u32,
+                                            self.tpot_buckets[target_tier] as u32
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl SchedulerBase for SloAwareScheduler {}
@@ -1403,6 +1752,9 @@ impl Scheduler for SloAwareScheduler {
 
                         // Drain queues and dispatch requests
                         self.drain_all_queues(&config, &mut queues).await;
+
+                        // Promote pending requests with tight TTFT slack to faster tiers
+                        self.promote_pending_requests(&config, &mut queues).await;
 
                         // Update queue sizes for UI
                         for (queue_idx, queue) in queues.iter().enumerate() {
