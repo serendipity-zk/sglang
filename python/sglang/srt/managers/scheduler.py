@@ -144,6 +144,7 @@ from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
 from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
+from sglang.srt.managers.scheduler_sidecar_mixin import SchedulerSidecarMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.iteration_target import compute_iteration_target
 from sglang.srt.managers.scheduler_update_weights_mixin import (
@@ -248,6 +249,7 @@ class Scheduler(
     SchedulerMetricsMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
+    SchedulerSidecarMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -362,6 +364,9 @@ class Scheduler(
             self.send_metrics_from_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
             )
+
+        # Init SLO scheduler sidecar client and drain buffers
+        self.init_sidecar(server_args)
 
         # Init tokenizer
         self.init_tokenizer()
@@ -1421,6 +1426,9 @@ class Scheduler(
                     trace_event("schedule", req.rid)
 
             if batch:
+                # Snapshot KV before run_batch (for FinishedIterationData)
+                if self.slo_client is not None:
+                    self._pre_batch_kv_used = self._get_token_info()[0]
                 # Measure iteration time
                 batch_start_time = time.perf_counter()
                 result = self.run_batch(batch)
@@ -1432,8 +1440,16 @@ class Scheduler(
                 batch.iteration_id = self.iteration_count
                 # Report metrics
                 self._collect_and_report_iteration_metrics(batch, iteration_time_ms)
+                # Drain 🟢 CurrentSnapshot (what GPU just executed)
+                # Normal loop: iteration_count already incremented above
+                if self.slo_client is not None:
+                    self._drain_current_snapshot(batch, self.iteration_count)
 
                 self.process_batch_result(batch, result)
+                # Drain 🔴 FinishedIterationData (iteration just completed)
+                # Normal loop: _pre_batch_kv_used is correct (no overlap overwrite)
+                if self.slo_client is not None:
+                    self._drain_finished_iteration(batch, iteration_time_ms, self._pre_batch_kv_used)
             else:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -1476,10 +1492,19 @@ class Scheduler(
                 for req in batch.reqs:
                     trace_event("schedule", req.rid)
 
+            # Shift KV snapshot BEFORE the if-batch block so that even when
+            # batch=None (pipeline flush), _prev holds the value from before
+            # the PREVIOUS batch ran — which is what FinishedIterationData needs.
+            if self.slo_client is not None:
+                self._prev_pre_batch_kv_used = self._pre_batch_kv_used
+
             if batch:
                 batch.launch_done = threading.Event()
                 # Mark the start time for this batch
                 batch.iteration_start_time = time.perf_counter()
+                # Snapshot KV before run_batch (for FinishedIterationData of THIS batch)
+                if self.slo_client is not None:
+                    self._pre_batch_kv_used = self._get_token_info()[0]
                 run_start = time.perf_counter()
                 result = self.run_batch(batch)
                 run_batch_time_ms = (time.perf_counter() - run_start) * 1000
@@ -1495,6 +1520,11 @@ class Scheduler(
                 metrics_running_time_ms = (
                     time.perf_counter() - metrics_running_start
                 ) * 1000
+
+                # Drain 🟢 CurrentSnapshot: what GPU is actively executing NOW
+                # Overlap loop: iteration_count not yet incremented for this batch
+                if self.slo_client is not None:
+                    self._drain_current_snapshot(batch, self.iteration_count + 1)
 
                 # Optional: Debug log running batch snapshot
                 if getattr(self.server_args, "enable_debug_metrics", False):
@@ -1560,6 +1590,10 @@ class Scheduler(
                     metrics_complete_time_ms = (
                         time.perf_counter() - metrics_complete_start
                     ) * 1000
+                    # Drain 🔴 FinishedIterationData (gpu_elapsed path)
+                    # Overlap loop: use _prev_pre_batch_kv_used (from before THIS batch ran)
+                    if self.slo_client is not None:
+                        self._drain_finished_iteration(tmp_batch, gpu_elapsed_ms, self._prev_pre_batch_kv_used)
                 elif hasattr(tmp_batch, 'iteration_start_time'):
                     # Increment iteration counter for completed iteration
                     self.iteration_count += 1
@@ -1580,6 +1614,10 @@ class Scheduler(
                     metrics_complete_time_ms = (
                         time.perf_counter() - metrics_complete_start
                     ) * 1000
+                    # Drain 🔴 FinishedIterationData (wall-clock fallback path)
+                    # Overlap loop: use _prev_pre_batch_kv_used (from before THIS batch ran)
+                    if self.slo_client is not None:
+                        self._drain_finished_iteration(tmp_batch, iteration_time_ms, self._prev_pre_batch_kv_used)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
@@ -2155,6 +2193,10 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             trace_slice_end("process req", req.rid, auto_next_anon=True)
+
+        # Track accepted requests for sidecar (after successful enqueue)
+        if self.slo_client is not None:
+            self._accepted_since_last_send += 1
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
@@ -3028,6 +3070,11 @@ class Scheduler(
                 else:
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
+
+        # Drain 🔵 SchedulingContext + Assemble + Send to sidecar
+        if self.slo_client is not None and self.slo_scheduler_mode != "internal":
+            self._drain_scheduling_context()
+            self._assemble_and_send_engine_state()
 
         # Run predictions BEFORE batch formation to guide scheduling decisions
         # Only run simulation-related predictions in SIMULATION mode

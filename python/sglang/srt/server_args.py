@@ -244,6 +244,11 @@ class ServerArgs:
     predictor_log_path: Optional[str] = None
     prefill_schedule_mode: str = "budget"  # "budget", "predictor", "simulation", "slack"
 
+    # SLO scheduler sidecar
+    slo_scheduler_addr: Optional[str] = None  # e.g. "ipc:///tmp/sglang_slo_scheduler_0.sock"
+    slo_scheduler_timeout_ms: int = 50
+    slo_scheduler_mode: str = "internal"  # "internal" | "shadow" | "sidecar"
+
     # API related
     api_key: Optional[str] = None
     served_model_name: Optional[str] = None
@@ -1691,6 +1696,27 @@ class ServerArgs:
             default=ServerArgs.prefill_schedule_mode,
             choices=["budget", "predictor", "simulation", "slack"],
             help="Prefill scheduling strategy: budget (greedy fill), predictor (TPOT-aware binary search), simulation (plan-guided), slack (min_decode_slack target)",
+        )
+
+        # SLO scheduler sidecar
+        parser.add_argument(
+            "--slo-scheduler-addr",
+            type=str,
+            default=ServerArgs.slo_scheduler_addr,
+            help="ZMQ address of SLO scheduler sidecar (e.g. ipc:///tmp/sglang_slo_scheduler_0.sock). If not set, sidecar is disabled.",
+        )
+        parser.add_argument(
+            "--slo-scheduler-timeout-ms",
+            type=int,
+            default=ServerArgs.slo_scheduler_timeout_ms,
+            help="ZMQ receive timeout in ms when waiting for sidecar decision (default: 50).",
+        )
+        parser.add_argument(
+            "--slo-scheduler-mode",
+            type=str,
+            default=ServerArgs.slo_scheduler_mode,
+            choices=["internal", "shadow", "sidecar"],
+            help="SLO scheduling mode: internal (engine-only), shadow (both run, compare), sidecar (sidecar decides).",
         )
 
         # API related
