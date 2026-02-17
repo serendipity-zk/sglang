@@ -606,6 +606,24 @@ class PrefillSimulatorEngine:
         if len(base_total_prefill_lens) == 0 and already_prefilled_lens is not None and len(already_prefilled_lens) > 0:
             raise ValueError("already_prefilled_lens must be empty when base_total_prefill_lens is empty")
 
+        # # Log all simulation inputs for engine/sidecar comparison
+        # import logging as _logging
+        # _logger = _logging.getLogger(__name__)
+        # _logger.warning(
+        #     "[SIMENGINE-INPUT] decode_batch=%d kv_cache=%d tpot_ms=%.2f "
+        #     "slack_decode_ms=%.2f safety_margin_ms=%.1f base_decode_ms=%.3f "
+        #     "decode_recovery_rate=%.3f n_reqs=%d total_lens=%s already=%s "
+        #     "slacks=%s",
+        #     self.config.decode_batch, self.config.kv_cache, self.config.tpot_ms,
+        #     self.config.slack_decode_ms, self.config.safety_margin_ms,
+        #     self.predictor.base_decode_ms,
+        #     self.config.tpot_ms - self.predictor.base_decode_ms * 1.5,
+        #     len(base_total_prefill_lens),
+        #     list(base_total_prefill_lens)[:10],
+        #     list(base_prefilled)[:10],
+        #     [round(s, 1) for s in list(base_slacks)[:10]],
+        # )
+
         t_scenario_start = time.perf_counter()
         # 1. Create Scenarios
         scenarios: List[SimulationScenario] = []
@@ -668,7 +686,17 @@ class PrefillSimulatorEngine:
             final_results.append(best)
 
         t_sim_end = time.perf_counter()
-        # print(f"[PERF] simulate+select: {(t_sim_end - t_sim_start)*1000:.3f} ms (simulate: {total_sim_time*1000:.3f} ms, select: {total_select_time*1000:.3f} ms) - {total_plans_simulated} plans")
+
+        # # Log simulation output for first result (base case)
+        # if final_results:
+        #     _r = final_results[0]
+        #     _logger.warning(
+        #         "[SIMENGINE-OUTPUT] flow=%s times=%s plan=%s success=%s "
+        #         "decode_feasible=%s min_decode_slack=%.2f base_decode_ms=%.3f",
+        #         _r.execution_flow, [round(t, 2) for t in (_r.execution_times or [])],
+        #         _r.base_plan, _r.success, _r.decode_feasible,
+        #         _r.min_decode_slack_ms, base_decode,
+        #     )
 
         return final_results
 

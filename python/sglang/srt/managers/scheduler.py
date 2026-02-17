@@ -1060,15 +1060,30 @@ class Scheduler(
             # Get mode for mode-aware predictor
             mode_str = _forward_mode_to_string(batch.forward_mode)
 
+            # # Log predictor inputs for debugging sidecar mismatch
+            # logger.warning(
+            #     "[ENGINE_PREDICTOR_SUBMIT] iter=%d batch_size_tokens=%d n_prefill_pairs=%d "
+            #     "prefill_pairs=%s kv_tokens_used=%d actual_time_ms=%.3f mode=%s forward_mode=%s",
+            #     self.iteration_count, total_tokens, len(prefill_chunk_pairs),
+            #     prefill_chunk_pairs[:5],  # first 5 pairs to avoid log spam
+            #     num_used, iteration_time_ms, mode_str,
+            #     batch.forward_mode.name if batch.forward_mode else "NONE",
+            # )
+
             # Call submit with mode parameter (for multi-mode predictor) or without (for old predictor)
             if getattr(self.cycle_time_predictor, "is_multimode", False):
-                self.cycle_time_predictor.submit(
+                pred, err = self.cycle_time_predictor.submit(
                     batch_size_tokens=total_tokens,
                     prefill_chunk_pairs=prefill_chunk_pairs,
                     kv_tokens_used=num_used,
                     iteration_time_ms=iteration_time_ms,
                     mode=mode_str,
                 )
+                # logger.warning(
+                #     "[ENGINE_PREDICTOR_RESULT] iter=%d pred=%.3f err=%.3f n_seen=%d",
+                #     self.iteration_count, pred, err,
+                #     getattr(self.cycle_time_predictor, '_n_seen', -1),
+                # )
             else:
                 # Old predictor without mode parameter
                 self.cycle_time_predictor.submit(
@@ -2857,7 +2872,17 @@ class Scheduler(
                 self._last_prefill_sim_kv_cache = num_used
                 self._last_prefill_sim_prefill_lens = total_prefill_lens.copy()
             
-            # take a look how should we handle this iteration
+            # # take a look how should we handle this iteration
+            # logger.warning(
+            #     "[ENGINE-SIM-INPUT] decode_batch=%d kv_cache=%d tpot_ms=%.2f slack_decode_ms=%.2f "
+            #     "safety_margin_ms=%.1f n_candidates=%d total_prefill_lens=%s already_prefilled=%s "
+            #     "prefill_slacks=%s",
+            #     decode_batch, num_used, tpot_effective, decode_slack_ms,
+            #     self.prefill_sim_engine.safety_margin_ms,
+            #     len(total_prefill_lens), total_prefill_lens[:10],
+            #     already_prefilled_lens[:10],
+            #     [round(s, 1) for s in prefill_slacks[:10]],
+            # )
             t0 = time.time()
             self._last_prefill_sim_results = self.prefill_sim_engine.evaluate_extras(
                 total_prefill_lens,
@@ -2866,7 +2891,16 @@ class Scheduler(
                 already_prefilled_lens=already_prefilled_lens,
             )
             t1 = time.time()
-            
+
+            # # Log simulation output for comparison with sidecar
+            # if self._last_prefill_sim_results and len(self._last_prefill_sim_results) > 0:
+            #     _r = self._last_prefill_sim_results[0]
+            #     logger.warning(
+            #         "[ENGINE-SIM-OUTPUT] execution_flow=%s execution_times=%s "
+            #         "base_plan=%s success=%s decode_feasible=%s min_decode_slack=%.2f",
+            #         _r.execution_flow, [round(t, 2) for t in (_r.execution_times or [])],
+            #         _r.base_plan, _r.success, _r.decode_feasible, _r.min_decode_slack_ms,
+            #     )
 
             # Part 1: Handle base case (extra_len = 0)
             res = None  # Initialize to avoid scope issues
@@ -3083,6 +3117,7 @@ class Scheduler(
             self._predict_future_kv_usage()
 
         new_batch = self.get_new_batch_prefill()
+        self._shadow_log_decisions()
 
         need_dp_attn_preparation = require_mlp_sync(self.server_args)
 
@@ -3249,6 +3284,7 @@ class Scheduler(
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            self._shadow_capture_decode_only("resource_constraint", **self._shadow_common_context())
             return None
 
         running_bs = len(self.running_batch.reqs)
@@ -3263,6 +3299,7 @@ class Scheduler(
             and not self.try_preemption
         ):
             self.running_batch.batch_is_full = True
+            self._shadow_capture_decode_only("resource_constraint", **self._shadow_common_context())
             return None
 
         if self.enable_hierarchical_cache:
@@ -3282,6 +3319,15 @@ class Scheduler(
             sim_budget = self._get_simulation_chunk_budget()
             if sim_budget == 0:
                 logger.debug("SIMULATION mode: decode-only iteration per simulation plan")
+                _ctx = self._shadow_common_context()
+                _base = self._last_prefill_sim_results[0] if self._last_prefill_sim_results else None
+                _ctx.update(
+                    sim_budget=sim_budget,
+                    sim_execution_flow=list(getattr(_base, 'execution_flow', []) or []) if _base else None,
+                    sim_decode_slack_ms=self.prefill_sim_engine.config.slack_decode_ms if self.prefill_sim_engine and self.prefill_sim_engine.config else None,
+                    sim_safety_margin_ms=getattr(self.prefill_sim_engine, 'safety_margin_ms', None),
+                )
+                self._shadow_capture_decode_only("simulation", **_ctx)
                 self._abandon_chunked_prefill()  # Safe cleanup before return
                 return None
             # sim_budget is pure prefill tokens; add decode_tokens back because
@@ -3293,6 +3339,9 @@ class Scheduler(
         elif self.prefill_schedule_mode == PrefillScheduleMode.PREDICTOR:
             pred = self.predict_batch(self.running_batch)
             if self.target_iteration_time_ms is not None and pred > self.target_iteration_time_ms:
+                _ctx = self._shadow_common_context()
+                _ctx.update(pred_decode_time=pred, target_iteration_time_ms=self.target_iteration_time_ms)
+                self._shadow_capture_decode_only("predictor", **_ctx)
                 self._abandon_chunked_prefill()  # Safe cleanup before return
                 return None
             
@@ -3317,6 +3366,9 @@ class Scheduler(
                 # Check if current decode batch already exceeds slack
                 pred = self.predict_batch(self.running_batch)
                 if pred > min_slack:
+                    _ctx = self._shadow_common_context()
+                    _ctx.update(pred_decode_time=pred, min_decode_slack_ms=min_slack)
+                    self._shadow_capture_decode_only("slack", **_ctx)
                     self._abandon_chunked_prefill()
                     return None
 
@@ -3344,6 +3396,23 @@ class Scheduler(
             effective_predictor = None
             effective_tpot = None
             effective_target = None
+
+        # Shadow mode: capture internal scheduling decision
+        if self.slo_scheduler_mode == "shadow":
+            _mode = self.prefill_schedule_mode.value
+            _slack = min_slack if self.prefill_schedule_mode == PrefillScheduleMode.SLACK else None
+            _ctx = self._shadow_common_context()
+            if self.prefill_schedule_mode == PrefillScheduleMode.SIMULATION:
+                _base = self._last_prefill_sim_results[0] if self._last_prefill_sim_results else None
+                _ctx.update(
+                    sim_budget=sim_budget,
+                    sim_execution_flow=list(getattr(_base, 'execution_flow', []) or []) if _base else None,
+                    sim_decode_slack_ms=self.prefill_sim_engine.config.slack_decode_ms if self.prefill_sim_engine and self.prefill_sim_engine.config else None,
+                    sim_safety_margin_ms=getattr(self.prefill_sim_engine, 'safety_margin_ms', None),
+                )
+            elif self.prefill_schedule_mode == PrefillScheduleMode.PREDICTOR:
+                _ctx.update(target_iteration_time_ms=self.target_iteration_time_ms)
+            self._shadow_capture_pre_batch(effective_target, _mode, _slack, **_ctx)
 
         # Prefill policy
         adder = PrefillAdder(
@@ -3451,6 +3520,8 @@ class Scheduler(
         # Print stats
         if self.current_scheduler_metrics_enabled():
             self.log_prefill_stats(adder, can_run_list, running_bs)
+
+        self._shadow_capture_post_batch(adder.log_input_tokens, len(can_run_list))
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(

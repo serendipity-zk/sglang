@@ -274,6 +274,29 @@ def main():
                         help="使用 tmux 打开4个纵向pane，分别显示每个server的UI (不自动attach)" )
     parser.add_argument("--tmux-attach", action="store_true",
                         help="创建 tmux UI 后自动 attach（Ctrl-C 将不会被本进程接收）")
+    # ── SLO Sidecar options ──
+    parser.add_argument("--with-sidecar", action="store_true",
+                        help="为每个 worker 启动一个 SLO scheduler sidecar 进程")
+    parser.add_argument("--sidecar-mode", default="shadow",
+                        choices=["shadow", "sidecar"],
+                        help="Sidecar 调度模式 (shadow=对比记录, sidecar=完全接管)")
+    # --sidecar-grid-path is defined below as an override flag (auto-inferred from --predictor-grid-path)
+    parser.add_argument("--sidecar-timeout-ms", type=int, default=50,
+                        help="Engine → sidecar RPC 超时 (ms)")
+    parser.add_argument("--sidecar-log-level", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="Sidecar 日志级别")
+    parser.add_argument("--sidecar-schedule-mode", default=None,
+                        choices=["greedy_kv", "predictor", "simulation", "slack"],
+                        help="Override: sidecar 调度策略 (默认从 --prefill-schedule-mode 推断)")
+    parser.add_argument("--sidecar-max-prefill-tokens", type=int, default=None,
+                        help="Override: sidecar 最大 prefill tokens (默认从 --chunked-prefill-size 推断)")
+    parser.add_argument("--sidecar-default-tpot-ms", type=float, default=50.0,
+                        help="Sidecar 默认 TPOT 目标 (ms), engine 运行时通过 ZMQ 同步")
+    parser.add_argument("--sidecar-grid-path", default=None,
+                        help="Override: sidecar grid 文件路径 (默认从 --predictor-grid-path 推断)")
+    parser.add_argument("--sidecar-router-url", default=None,
+                        help="Override: sidecar router URL (默认从 --router-metrics-url 推断)")
     args = parser.parse_args()
 
     ports = [int(p.strip()) for p in args.ports.split(",") if p.strip()]
@@ -335,8 +358,88 @@ def main():
 
     procs = []
     logs = []
+    sidecar_procs = []
+    sidecar_logs = []
     tmux_session = None
     try:
+        # 启动 sidecar 进程（先于 worker，确保 socket 就绪）
+        if args.with_sidecar:
+            # Auto-infer ALL sidecar config from engine --extra-worker-args.
+            # Explicit --sidecar-* flags override auto-inferred values.
+            extra = args.extra_worker_args.split() if args.extra_worker_args else []
+
+            def _extract(flag, default=None):
+                """Extract value following a flag from extra-worker-args."""
+                if flag in extra:
+                    try:
+                        return extra[extra.index(flag) + 1]
+                    except IndexError:
+                        pass
+                return default
+
+            # Engine flag → sidecar flag mapping (auto-deduce)
+            _MODE_MAP = {
+                "simulation": "simulation", "predictor": "predictor",
+                "slack": "slack", "budget": "greedy_kv",
+            }
+            engine_mode = _extract("--prefill-schedule-mode")
+            sc_schedule_mode = args.sidecar_schedule_mode
+            if sc_schedule_mode is None and engine_mode:
+                sc_schedule_mode = _MODE_MAP.get(engine_mode, engine_mode)
+            sc_schedule_mode = sc_schedule_mode or "predictor"
+
+            sc_max_prefill = args.sidecar_max_prefill_tokens
+            if sc_max_prefill is None:
+                raw = _extract("--chunked-prefill-size")
+                sc_max_prefill = int(raw) if raw else 8192
+            sc_max_prefill = sc_max_prefill or 8192
+
+            sc_grid_path = args.sidecar_grid_path
+            if sc_grid_path is None:
+                sc_grid_path = _extract("--predictor-grid-path")
+            if not sc_grid_path:
+                print("WARNING: no grid path for sidecar (no --predictor-grid-path in extra-worker-args)")
+
+            sc_router_url = args.sidecar_router_url
+            if sc_router_url is None:
+                sc_router_url = _extract("--router-metrics-url")
+
+            sc_tpot = args.sidecar_default_tpot_ms
+
+            print(f"\n=== Starting SLO scheduler sidecars (mode={args.sidecar_mode}) ===")
+            print(f"  schedule-mode={sc_schedule_mode}  max-prefill={sc_max_prefill}  tpot={sc_tpot}ms  grid={sc_grid_path}")
+            if sc_router_url:
+                print(f"  router-url={sc_router_url}")
+            for idx, (gpu, port) in enumerate(zip(gpus, ports), start=1):
+                worker_id = idx - 1  # 0-indexed to match sidecar convention
+                zmq_addr = f"ipc:///tmp/sglang_slo_scheduler_{worker_id}.sock"
+                sidecar_cmd = [
+                    sys.executable, "-m", "slo_scheduler.server.main",
+                    "--worker-id", str(worker_id),
+                    "--log-level", args.sidecar_log_level,
+                    "--schedule-mode", sc_schedule_mode,
+                    "--max-prefill-tokens", str(sc_max_prefill),
+                    "--default-tpot-ms", str(sc_tpot),
+                ]
+                if sc_grid_path:
+                    sidecar_cmd.extend(["--grid-path", sc_grid_path])
+                if sc_router_url:
+                    sidecar_cmd.extend(["--router-url", sc_router_url])
+                sidecar_log_path = os.path.join(
+                    args.log_dir, f"sidecar_w{idx}_gpu{gpu}_p{port}.log"
+                )
+                prefix = f"sidecar-w{idx}"
+                print(f"  Sidecar {idx}: worker_id={worker_id} bind={zmq_addr}")
+                print(f"    Log: {sidecar_log_path}")
+                sc_proc, sc_logf = start_proc(
+                    sidecar_cmd, prefix=prefix, logfile_path=sidecar_log_path
+                )
+                sidecar_procs.append(sc_proc)
+                sidecar_logs.append(sc_logf)
+            # Brief pause to let sidecars bind their ZMQ sockets
+            time.sleep(1.0)
+            print(f"  {len(sidecar_procs)} sidecars started.\n")
+
         # 启动 workers
         for idx, (gpu, port) in enumerate(zip(gpus, ports), start=1):
             env = {"CUDA_VISIBLE_DEVICES": gpu}
@@ -347,6 +450,16 @@ def main():
             ]
             if args.extra_worker_args:
                 cmd.extend(args.extra_worker_args.split())
+
+            # Inject sidecar connection args into each worker
+            if args.with_sidecar:
+                worker_id = idx - 1
+                zmq_addr = f"ipc:///tmp/sglang_slo_scheduler_{worker_id}.sock"
+                cmd.extend([
+                    "--slo-scheduler-addr", zmq_addr,
+                    "--slo-scheduler-mode", args.sidecar_mode,
+                    "--slo-scheduler-timeout-ms", str(args.sidecar_timeout_ms),
+                ])
 
             # Add unique predictor log path for this worker (no timestamp - overwrites)
             predictor_log_path = os.path.join(
@@ -362,6 +475,8 @@ def main():
             print(f"Starting worker {idx} on GPU {gpu} port {port}")
             print(f"  Worker log:    {log_path}")
             print(f"  Predictor log: {predictor_log_path}")
+            if args.with_sidecar:
+                print(f"  Sidecar addr:  ipc:///tmp/sglang_slo_scheduler_{idx-1}.sock ({args.sidecar_mode})")
             proc, logf = start_proc(cmd, env=env, prefix=prefix, logfile_path=log_path)
             procs.append(proc)
             logs.append(logf)
@@ -433,6 +548,16 @@ def main():
                 lf.close()
             except Exception:
                 pass
+        # Stop sidecar processes after workers
+        if sidecar_procs:
+            print("Stopping sidecar processes...")
+            for p in sidecar_procs:
+                kill_proc_tree(p)
+            for lf in sidecar_logs:
+                try:
+                    lf.close()
+                except Exception:
+                    pass
         print("All workers terminated.")
 
 if __name__ == "__main__":

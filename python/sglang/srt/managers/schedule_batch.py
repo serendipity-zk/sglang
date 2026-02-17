@@ -1621,6 +1621,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def prepare_for_decode(self):
+        # NOTE: This does NOT reset req.extend_input_len for decode requests.
+        # Each req retains its extend_input_len from the last init_next_round_input()
+        # or mix_with_running() call, which may be stale (e.g. the original prefill
+        # chunk size rather than 1).  Callers that inspect extend_input_len must
+        # check batch.forward_mode.is_decode() and force extend_len=1 themselves.
+        # See: predict_batch() in scheduler.py, _predict_ongoing_cycle_time() in
+        # slo_scheduler, and _req_to_request_info() in scheduler_sidecar_mixin.py.
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
 
