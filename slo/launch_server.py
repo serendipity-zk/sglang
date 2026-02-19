@@ -401,7 +401,10 @@ def main():
                 print("WARNING: no grid path for sidecar (no --predictor-grid-path in extra-worker-args)")
 
             sc_router_url = args.sidecar_router_url
-            if sc_router_url is None:
+            if sc_router_url is None and args.sidecar_mode != "shadow":
+                # Only auto-infer router URL in sidecar mode (not shadow).
+                # In shadow mode, the engine pushes its own metrics to the router;
+                # having the sidecar also push creates duplicate "ghost" workers in the UI.
                 sc_router_url = _extract("--router-metrics-url")
 
             sc_tpot = args.sidecar_default_tpot_ms

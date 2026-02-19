@@ -68,36 +68,58 @@ class SLOSchedulerClient:
             self._record_failure()
             return None
 
+        t_start = time.monotonic()
+
         # Poll for response
         if not self.socket.poll(self.timeout_ms):
             self._record_failure()
             return None
 
-        # Receive and deserialize
-        try:
-            frames = self.socket.recv_multipart(flags=zmq.DONTWAIT)
-            decision = pickle.loads(frames[-1])
-        except Exception:
-            logger.exception("SLOSchedulerClient: recv/deserialize failed")
-            self._record_failure()
-            return None
+        # Drain-and-retry loop: consume all buffered responses looking for an
+        # exact match on current_iteration.  If the buffer only contained stale
+        # responses (e.g. from a fallback period, or the sidecar being 1 iteration
+        # behind), poll again with the remaining time budget.  Repeat until we
+        # either find the match or exhaust the timeout.
+        best = None
+        drained = 0
+        while True:
+            # Drain all immediately available responses
+            try:
+                while True:
+                    frames = self.socket.recv_multipart(flags=zmq.DONTWAIT)
+                    candidate = pickle.loads(frames[-1])
+                    if candidate.iteration_count == current_iteration:
+                        best = candidate
+                        break  # Exact match
+                    drained += 1
+            except zmq.Again:
+                pass  # Buffer empty
+            except Exception:
+                logger.exception("SLOSchedulerClient: recv/deserialize failed")
+                self._record_failure()
+                return None
 
-        # Staleness check
-        # NOTE: stale decisions return None but do NOT call _record_failure().
-        # This is intentional — transient sidecar lag (1-2 iterations behind) should
-        # degrade gracefully to internal scheduling without triggering fallback mode.
-        # If the sidecar is persistently stale, the engine silently uses internal
-        # decisions (all returns are None) but remains ready to accept fresh ones.
-        if decision.iteration_count != current_iteration:
-            logger.debug(
-                f"SLOSchedulerClient: stale decision "
-                f"(got iter={decision.iteration_count}, expected={current_iteration})"
+            if best is not None:
+                break
+
+            # No match yet — poll again if time remains
+            elapsed_ms = (time.monotonic() - t_start) * 1000
+            remaining_ms = int(self.timeout_ms - elapsed_ms)
+            if remaining_ms <= 0 or not self.socket.poll(remaining_ms):
+                break  # Timeout exhausted
+
+        if drained > 0:
+            logger.info(
+                f"SLOSchedulerClient: drained {drained} stale responses "
+                f"(expected iter={current_iteration})"
             )
+
+        if best is None:
             return None
 
         # Success — reset failure tracking
         self._record_success()
-        return decision
+        return best
 
     def _record_failure(self):
         self.consecutive_failures += 1
