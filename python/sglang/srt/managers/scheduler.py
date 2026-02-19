@@ -3313,92 +3313,54 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
-        # Determine prefill parameters based on schedule mode
+        # ── Step 1: Compute internal scheduling decision (no early returns) ──
+        internal_decode_only = False
+        effective_chunk_size = self.chunked_prefill_size
+        effective_predictor = None
+        effective_tpot = None
+        effective_target = None
+
         if self.prefill_schedule_mode == PrefillScheduleMode.SIMULATION:
-            # SIMULATION mode: use prefill_sim_engine execution plan
             sim_budget = self._get_simulation_chunk_budget()
             if sim_budget == 0:
                 logger.debug("SIMULATION mode: decode-only iteration per simulation plan")
-                _ctx = self._shadow_common_context()
-                _base = self._last_prefill_sim_results[0] if self._last_prefill_sim_results else None
-                _ctx.update(
-                    sim_budget=sim_budget,
-                    sim_execution_flow=list(getattr(_base, 'execution_flow', []) or []) if _base else None,
-                    sim_decode_slack_ms=self.prefill_sim_engine.config.slack_decode_ms if self.prefill_sim_engine and self.prefill_sim_engine.config else None,
-                    sim_safety_margin_ms=getattr(self.prefill_sim_engine, 'safety_margin_ms', None),
-                )
-                self._shadow_capture_decode_only("simulation", **_ctx)
-                self._abandon_chunked_prefill()  # Safe cleanup before return
-                return None
-            # sim_budget is pure prefill tokens; add decode_tokens back because
-            # PrefillAdder will subtract them (it expects total token budget)
-            effective_chunk_size = sim_budget + decode_tokens
-            effective_predictor = None
-            effective_tpot = None
-            effective_target = None
+                internal_decode_only = True
+            else:
+                # sim_budget is pure prefill tokens; add decode_tokens back because
+                # PrefillAdder will subtract them (it expects total token budget)
+                effective_chunk_size = sim_budget + decode_tokens
         elif self.prefill_schedule_mode == PrefillScheduleMode.PREDICTOR:
             pred = self.predict_batch(self.running_batch)
             if self.target_iteration_time_ms is not None and pred > self.target_iteration_time_ms:
-                _ctx = self._shadow_common_context()
-                _ctx.update(pred_decode_time=pred, target_iteration_time_ms=self.target_iteration_time_ms)
-                self._shadow_capture_decode_only("predictor", **_ctx)
-                self._abandon_chunked_prefill()  # Safe cleanup before return
-                return None
-            
-            # PREDICTOR mode: binary search with cycle_time_predictor
-            if self.tpot is not None and self.cycle_time_predictor is not None:
-                effective_chunk_size = self.chunked_prefill_size
+                internal_decode_only = True
+            elif self.tpot is not None and self.cycle_time_predictor is not None:
                 effective_predictor = self.cycle_time_predictor
                 effective_tpot = self.tpot
                 effective_target = self.target_iteration_time_ms
             else:
-                # Fallback to BUDGET when TPOT not set
                 logger.debug("PREDICTOR mode: TPOT not set, falling back to BUDGET behavior")
-                effective_chunk_size = self.chunked_prefill_size
-                effective_predictor = None
-                effective_tpot = None
-                effective_target = None
         elif self.prefill_schedule_mode == PrefillScheduleMode.SLACK:
-            # SLACK mode: use min_decode_slack as target iteration time for predictor
             min_slack = self._compute_min_valid_decode_slack()
-
             if min_slack is not None and self.cycle_time_predictor is not None:
-                # Check if current decode batch already exceeds slack
                 pred = self.predict_batch(self.running_batch)
                 if pred > min_slack:
-                    _ctx = self._shadow_common_context()
-                    _ctx.update(pred_decode_time=pred, min_decode_slack_ms=min_slack)
-                    self._shadow_capture_decode_only("slack", **_ctx)
-                    self._abandon_chunked_prefill()
-                    return None
-
-                effective_chunk_size = self.chunked_prefill_size
-                effective_predictor = self.cycle_time_predictor
-                effective_tpot = self.tpot
-                effective_target = min_slack  # Use min_decode_slack as target
-                logger.info(
-                    "SLACK mode: using min_decode_slack=%.2fms as target_iteration_time",
-                    min_slack,
-                )
+                    internal_decode_only = True
+                else:
+                    effective_predictor = self.cycle_time_predictor
+                    effective_tpot = self.tpot
+                    effective_target = min_slack
+                    logger.info(
+                        "SLACK mode: using min_decode_slack=%.2fms as target_iteration_time",
+                        min_slack,
+                    )
             else:
-                # Fallback to BUDGET when no valid slack or predictor unavailable
                 if min_slack is None:
                     logger.debug("SLACK mode: no valid decode slack, falling back to BUDGET behavior")
                 else:
                     logger.info("SLACK mode: cycle_time_predictor unavailable, falling back to BUDGET behavior")
-                effective_chunk_size = self.chunked_prefill_size
-                effective_predictor = None
-                effective_tpot = None
-                effective_target = None
-        else:
-            # BUDGET mode (default): greedy fill up to budget
-            effective_chunk_size = self.chunked_prefill_size
-            effective_predictor = None
-            effective_tpot = None
-            effective_target = None
 
-        # Shadow mode: capture internal scheduling decision
-        if self.slo_scheduler_mode == "shadow":
+        # ── Step 2: Shadow/sidecar logging (always captures internal decision) ──
+        if self.slo_scheduler_mode in ("shadow", "sidecar"):
             _mode = self.prefill_schedule_mode.value
             _slack = min_slack if self.prefill_schedule_mode == PrefillScheduleMode.SLACK else None
             _ctx = self._shadow_common_context()
@@ -3411,8 +3373,33 @@ class Scheduler(
                     sim_safety_margin_ms=getattr(self.prefill_sim_engine, 'safety_margin_ms', None),
                 )
             elif self.prefill_schedule_mode == PrefillScheduleMode.PREDICTOR:
-                _ctx.update(target_iteration_time_ms=self.target_iteration_time_ms)
-            self._shadow_capture_pre_batch(effective_target, _mode, _slack, **_ctx)
+                _ctx.update(pred_decode_time=pred, target_iteration_time_ms=self.target_iteration_time_ms)
+            elif self.prefill_schedule_mode == PrefillScheduleMode.SLACK:
+                _ctx.update(min_decode_slack_ms=min_slack)
+                # pred exists only when min_slack and predictor were both available
+                if min_slack is not None and self.cycle_time_predictor is not None:
+                    _ctx.update(pred_decode_time=pred)
+            if internal_decode_only:
+                self._shadow_capture_decode_only(_mode, **_ctx)
+            else:
+                self._shadow_capture_pre_batch(effective_target, _mode, _slack, **_ctx)
+
+        # ── Step 3: Apply decision (sidecar overrides internal if available) ──
+        if self.slo_scheduler_mode == "sidecar" and self._last_sidecar_decision is not None:
+            decision = self._last_sidecar_decision
+            if decision.decode_only_iteration or decision.max_prefill_tokens <= 0:
+                self._abandon_chunked_prefill()
+                return None
+            sidecar_budget = max(0, decision.max_prefill_tokens)
+            if self.chunked_prefill_size is not None:
+                sidecar_budget = min(sidecar_budget, self.chunked_prefill_size)
+            effective_chunk_size = sidecar_budget + decode_tokens
+            effective_target = decision.target_iteration_time_ms
+            effective_predictor = None
+            effective_tpot = None
+        elif internal_decode_only:
+            self._abandon_chunked_prefill()
+            return None
 
         # Prefill policy
         adder = PrefillAdder(

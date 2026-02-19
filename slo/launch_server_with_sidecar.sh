@@ -1,3 +1,18 @@
+#!/bin/bash
+# Launch server with SLO scheduler sidecar.
+# Usage: bash launch_server_with_sidecar.sh [shadow|sidecar]
+#   shadow  - (default) both internal and sidecar run, decisions logged for comparison
+#   sidecar - sidecar decisions applied, internal runs for metrics/fallback
+
+MODE="${1:-shadow}"
+if [[ "$MODE" != "shadow" && "$MODE" != "sidecar" ]]; then
+  echo "Usage: $0 [shadow|sidecar]"
+  echo "  shadow  - log both decisions for comparison (default)"
+  echo "  sidecar - apply sidecar decisions"
+  exit 1
+fi
+echo "Starting with sidecar mode: $MODE"
+
 # Cleanup stale IPC sockets
 rm -f /tmp/sglang_slo_scheduler_0.sock /tmp/sglang_slo_scheduler_1.sock /tmp/sglang_slo_scheduler_2.sock /tmp/sglang_slo_scheduler_3.sock /tmp/sglang_slo_scheduler_4.sock /tmp/sglang_slo_scheduler_5.sock /tmp/sglang_slo_scheduler_6.sock /tmp/sglang_slo_scheduler_7.sock 2>/dev/null
 
@@ -13,5 +28,5 @@ python launch_server.py \
   --predictor-log-dir /sgl-workspace/sglang/slo/logs/predictor \
   --extra-worker-args " --prefill-schedule-mode simulation --enable-mixed-chunk --chunked-prefill-size 4096 --router-metrics-url http://0.0.0.0:40010 --enable-iteration-metrics --iteration-metrics-interval 1 --predictor-type mode_aware --predictor-grid-path /sgl-workspace/sglang/sglang_profile/mode_3d.json" \
   --with-sidecar \
-  --sidecar-mode shadow \
+  --sidecar-mode "$MODE" \
   --tmux-ui \

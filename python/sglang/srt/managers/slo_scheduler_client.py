@@ -8,7 +8,7 @@ import zmq
 logger = logging.getLogger(__name__)
 
 MAX_CONSECUTIVE_FAILURES = 3
-FALLBACK_PROBE_INTERVAL_S = 5.0
+FALLBACK_PROBE_INTERVAL_S = 0.5
 
 
 class SLOSchedulerClient:
