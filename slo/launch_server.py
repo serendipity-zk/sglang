@@ -278,8 +278,8 @@ def main():
     parser.add_argument("--with-sidecar", action="store_true",
                         help="为每个 worker 启动一个 SLO scheduler sidecar 进程")
     parser.add_argument("--sidecar-mode", default="shadow",
-                        choices=["shadow", "sidecar"],
-                        help="Sidecar 调度模式 (shadow=对比记录, sidecar=完全接管)")
+                        choices=["shadow", "shadow-sidecar", "sidecar"],
+                        help="Sidecar 调度模式 (shadow=对比记录, shadow-sidecar=sidecar决策+内部仍运行, sidecar=内部禁用)")
     # --sidecar-grid-path is defined below as an override flag (auto-inferred from --predictor-grid-path)
     parser.add_argument("--sidecar-timeout-ms", type=int, default=50,
                         help="Engine → sidecar RPC 超时 (ms)")

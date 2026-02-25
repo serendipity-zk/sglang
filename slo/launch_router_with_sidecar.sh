@@ -1,9 +1,9 @@
 #!/bin/bash
 # Launch router with sidecar awareness (TPOT routing + stats mode).
 # Usage: bash launch_router_with_sidecar.sh [shadow|shadow-sidecar|sidecar]
-#   shadow          - (default) engine stats used for routing; sidecar stats logged to shadow_stats.jsonl
-#   shadow-sidecar  - sidecar stats used for routing; engine stats logged to shadow_stats.jsonl
-#   sidecar         - sidecar stats used for routing; engine stats ignored; TPOT sent to sidecars only
+#   shadow          - (default) engine stats for routing; sidecar stats logged to shadow_stats.jsonl
+#   shadow-sidecar  - sidecar stats for routing; engine stats logged to shadow_stats.jsonl
+#   sidecar         - sidecar stats for routing; engine stats suppressed (internal SLO disabled)
 
 MODE="${1:-shadow}"
 if [[ "$MODE" != "shadow" && "$MODE" != "shadow-sidecar" && "$MODE" != "sidecar" ]]; then

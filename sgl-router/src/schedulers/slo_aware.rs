@@ -56,7 +56,7 @@ pub struct SloAwareScheduler {
     sidecar_urls: Option<Vec<String>>,
     /// Worker URL → Sidecar URL mapping (built from positional sidecar_urls during initialize_workers)
     sidecar_url_map: RwLock<HashMap<String, String>>,
-    /// Stats routing mode: "internal" | "shadow" | "sidecar"
+    /// Stats routing mode: "internal" | "shadow" | "shadow-sidecar" | "sidecar"
     stats_mode: String,
 }
 

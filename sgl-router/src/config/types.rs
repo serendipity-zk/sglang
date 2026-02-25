@@ -76,7 +76,7 @@ pub struct RouterConfig {
     /// Sidecar HTTP URLs, 1:1 positional match with worker URLs
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar_urls: Option<Vec<String>>,
-    /// Stats/TPOT routing mode: "internal" | "shadow" | "sidecar"
+    /// Stats/TPOT routing mode: "internal" | "shadow" | "shadow-sidecar" | "sidecar"
     #[serde(default = "default_stats_mode")]
     pub stats_mode: String,
 }

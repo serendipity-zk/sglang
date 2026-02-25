@@ -436,7 +436,7 @@ class SchedulerSidecarMixin:
         """
         if self._shadow_log_file is not None:
             return
-        if self.slo_scheduler_mode not in ("shadow", "sidecar"):
+        if self.slo_scheduler_mode not in ("shadow", "shadow-sidecar", "sidecar"):
             return
         import os
         fname = f"shadow_decisions_{self.worker_id}.jsonl"
@@ -445,7 +445,7 @@ class SchedulerSidecarMixin:
 
     def _shadow_common_context(self: "Scheduler") -> dict:
         """Capture common scheduler state for shadow logging debug fields."""
-        if self.slo_scheduler_mode not in ("shadow", "sidecar"):
+        if self.slo_scheduler_mode not in ("shadow", "shadow-sidecar", "sidecar"):
             return {}
         num_used = self._get_token_info()[0]
         running_bs = len(self.running_batch.reqs) if self.running_batch and self.running_batch.reqs else 0
@@ -460,7 +460,7 @@ class SchedulerSidecarMixin:
 
     def _shadow_capture_decode_only(self: "Scheduler", mode: str, **kwargs):
         """Capture internal decode-only decision for shadow logging."""
-        if self.slo_scheduler_mode not in ("shadow", "sidecar"):
+        if self.slo_scheduler_mode not in ("shadow", "shadow-sidecar", "sidecar"):
             return
         self._shadow_internal_snapshot = _InternalDecisionSnapshot(
             decode_only=True,
@@ -471,7 +471,7 @@ class SchedulerSidecarMixin:
 
     def _shadow_capture_pre_batch(self: "Scheduler", effective_target, mode: str, min_slack=None, **kwargs):
         """Capture internal pre-batch scheduling decision for shadow logging."""
-        if self.slo_scheduler_mode not in ("shadow", "sidecar"):
+        if self.slo_scheduler_mode not in ("shadow", "shadow-sidecar", "sidecar"):
             return
         self._shadow_internal_snapshot = _InternalDecisionSnapshot(
             decode_only=False,
@@ -483,7 +483,7 @@ class SchedulerSidecarMixin:
 
     def _shadow_capture_post_batch(self: "Scheduler", prefill_tokens: int, num_admitted: int):
         """Update shadow snapshot with actual post-batch numbers."""
-        if self.slo_scheduler_mode not in ("shadow", "sidecar"):
+        if self.slo_scheduler_mode not in ("shadow", "shadow-sidecar", "sidecar"):
             return
         if self._shadow_internal_snapshot is not None:
             self._shadow_internal_snapshot.actual_prefill_tokens = prefill_tokens
@@ -491,7 +491,7 @@ class SchedulerSidecarMixin:
 
     def _shadow_log_decisions(self: "Scheduler"):
         """Log both internal and sidecar decisions to JSONL file."""
-        if self.slo_scheduler_mode not in ("shadow", "sidecar"):
+        if self.slo_scheduler_mode not in ("shadow", "shadow-sidecar", "sidecar"):
             return
 
         import json
@@ -516,7 +516,7 @@ class SchedulerSidecarMixin:
         record = {
             "ts_ms": time.time() * 1000,
             "iteration": self.iteration_count,
-            "applied": "sidecar" if self.slo_scheduler_mode == "sidecar" and sidecar is not None else "internal",
+            "applied": "sidecar" if self.slo_scheduler_mode in ("shadow-sidecar", "sidecar") and sidecar is not None else "internal",
             "internal": asdict(internal) if internal else None,
             "sidecar": {
                 "iteration_count": sidecar.iteration_count,

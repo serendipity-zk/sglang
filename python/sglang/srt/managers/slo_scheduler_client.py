@@ -1,7 +1,6 @@
 """ZMQ DEALER client for communicating with the SLO scheduler sidecar."""
 
 import logging
-import pickle
 import time
 import zmq
 
@@ -57,7 +56,8 @@ class SLOSchedulerClient:
 
         # Serialize and send
         try:
-            payload = pickle.dumps(engine_state, protocol=pickle.HIGHEST_PROTOCOL)
+            from slo_scheduler.messages.serialization import serialize_engine_state
+            payload = serialize_engine_state(engine_state)
             self.socket.send_multipart([b"", payload], flags=zmq.DONTWAIT)
         except zmq.Again:
             logger.warning("SLOSchedulerClient: send HWM reached, dropping message")
@@ -87,7 +87,8 @@ class SLOSchedulerClient:
             try:
                 while True:
                     frames = self.socket.recv_multipart(flags=zmq.DONTWAIT)
-                    candidate = pickle.loads(frames[-1])
+                    from slo_scheduler.messages.serialization import deserialize_decision
+                    candidate = deserialize_decision(frames[-1])
                     if candidate.iteration_count == current_iteration:
                         best = candidate
                         break  # Exact match

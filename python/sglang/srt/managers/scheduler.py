@@ -820,6 +820,13 @@ class Scheduler(
         if not self.server_args.enable_iteration_metrics:
             return
 
+        # In sidecar mode, engine does not report to router — sidecar handles it
+        if self.slo_scheduler_mode == "sidecar":
+            if destinations is None:
+                destinations = ["log", "ui"]
+            elif "router" in destinations:
+                destinations = [d for d in destinations if d != "router"]
+
         # Auto-include debug destination for completed iterations when flag is set
         if (getattr(self.server_args, "enable_debug_metrics", False)
                 and iteration_time_ms is not None):
@@ -1003,7 +1010,8 @@ class Scheduler(
             # iteration_time_ms semantically represents elapsed iteration time; we now pass gpu_elapsed_ms here
             metrics["iteration_time_ms"] = round(iteration_time_ms, 2)
             self.last_iteration_time_ms = float(iteration_time_ms)
-            self._record_iteration_time(iteration_time_ms)
+            if self.slo_scheduler_mode != "sidecar":
+                self._record_iteration_time(iteration_time_ms)
 
         if self.last_iteration_time_ms is not None:
             metrics["last_iteration_time_ms"] = round(
@@ -1064,7 +1072,8 @@ class Scheduler(
         )
 
         # Train the online predictor with this iteration's data
-        if self.cycle_time_predictor is not None and iteration_time_ms is not None:
+        # In sidecar mode, the sidecar owns predictor training
+        if self.cycle_time_predictor is not None and iteration_time_ms is not None and self.slo_scheduler_mode != "sidecar":
             # Get mode for mode-aware predictor
             mode_str = _forward_mode_to_string(batch.forward_mode)
 
@@ -1104,6 +1113,9 @@ class Scheduler(
     def _report_idle_metrics_if_needed(self):
         """Emit idle metrics updates to the router at a fixed cadence while idle."""
         if not self.server_args.enable_iteration_metrics:
+            return
+        # In sidecar mode, engine does not report to router — sidecar handles it
+        if self.slo_scheduler_mode == "sidecar":
             return
 
         now = time.perf_counter()
@@ -1549,7 +1561,9 @@ class Scheduler(
                 # process_batch_result below).  Use +1 to maintain the temporal
                 # invariant: scheduling.iteration_count = current.iteration_count + 1.
                 if self.slo_client is not None:
+                    _t_cs = time.perf_counter()
                     self._drain_current_snapshot(batch, self.iteration_count + 1)
+                    self._last_drain_cs_ms = (time.perf_counter() - _t_cs) * 1000
 
                 # Optional: Debug log running batch snapshot
                 if getattr(self.server_args, "enable_debug_metrics", False):
@@ -1618,7 +1632,9 @@ class Scheduler(
                     # Drain 🔴 FinishedIterationData (gpu_elapsed path)
                     # Overlap loop: use _prev_pre_batch_kv_used (from before THIS batch ran)
                     if self.slo_client is not None:
+                        _t_fi = time.perf_counter()
                         self._drain_finished_iteration(tmp_batch, gpu_elapsed_ms, self._prev_pre_batch_kv_used)
+                        self._last_drain_fi_ms = (time.perf_counter() - _t_fi) * 1000
                 elif hasattr(tmp_batch, 'iteration_start_time'):
                     # Increment iteration counter for completed iteration
                     self.iteration_count += 1
@@ -1642,14 +1658,19 @@ class Scheduler(
                     # Drain 🔴 FinishedIterationData (wall-clock fallback path)
                     # Overlap loop: use _prev_pre_batch_kv_used (from before THIS batch ran)
                     if self.slo_client is not None:
+                        _t_fi = time.perf_counter()
                         self._drain_finished_iteration(tmp_batch, iteration_time_ms, self._prev_pre_batch_kv_used)
+                        self._last_drain_fi_ms = (time.perf_counter() - _t_fi) * 1000
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
                 self._report_idle_metrics_if_needed()
 
             self.last_batch = batch
-            self.last_cycle_time_prediction = self.predict_batch(batch)
+            if self.slo_scheduler_mode != "sidecar":
+                self.last_cycle_time_prediction = self.predict_batch(batch)
+            else:
+                self.last_cycle_time_prediction = 0.0
 
             loop_total_ms = (
                 recv_time_ms
@@ -1671,11 +1692,19 @@ class Scheduler(
                 if self._prefill_sim_runtime_ms is not None
                 else 0.0
             )
+            # Sub-breakdown of sidecar overhead
+            _bb = getattr(self, '_last_batch_breakdown', (0.0, 0.0, 0.0, 0.0, 0.0))
+            _dcs = getattr(self, '_last_drain_cs_ms', 0.0)
+            _dfi = getattr(self, '_last_drain_fi_ms', 0.0)
+            self._last_drain_cs_ms = 0.0
+            self._last_drain_fi_ms = 0.0
             if self.last_batch is not None or batch is not None:
                 logger.info(
                     "\033[94m[TIME]: since_last=%.3f gpu=%.3f loop=%.3f "
                     "recv=%.3f input=%.3f batch=%.3f run=%.3f mr=%.3f md=%.3f "
-                    "mc=%.3f pd=%.3f pm=%.3f kvf=%.3f psim=%.3f\033[0m",
+                    "mc=%.3f pd=%.3f pm=%.3f kvf=%.3f psim=%.3f "
+                    "merge=%.3f drain=%.3f zmq=%.3f pfill=%.3f shlog=%.3f "
+                    "dcs=%.3f dfi=%.3f\033[0m",
                     since_last_ms,
                     gpu_elapsed_ms,
                     loop_total_ms,
@@ -1690,6 +1719,8 @@ class Scheduler(
                     process_result_main_time_ms,
                     kv_forecast_time_ms,
                     prefill_sim_time_ms,
+                    _bb[0], _bb[1], _bb[2], _bb[3], _bb[4],
+                    _dcs, _dfi,
                 )
 
 
@@ -3066,6 +3097,7 @@ class Scheduler(
             logger.exception("Failed to run prefill simulator")
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        _t_merge_start = time.perf_counter()
         # Gather finished requests before they are filtered out of batches.
         finished_for_observation: List[Req] = []
         if self.last_batch is not None:
@@ -3076,7 +3108,9 @@ class Scheduler(
             finished_for_observation.extend(
                 [req for req in self.running_batch.reqs if req.finished()]
             )
-        self._submit_decode_length_observations(finished_for_observation)
+        # In sidecar mode, KV forecast is skipped so decode-length observations are unnecessary
+        if self.slo_scheduler_mode != "sidecar":
+            self._submit_decode_length_observations(finished_for_observation)
 
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
@@ -3115,19 +3149,33 @@ class Scheduler(
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
+        _merge_ms = (time.perf_counter() - _t_merge_start) * 1000
+
         # Drain 🔵 SchedulingContext + Assemble + Send to sidecar
+        _t_drain = time.perf_counter()
+        _drain_ms = 0.0
+        _zmq_ms = 0.0
         if self.slo_client is not None and self.slo_scheduler_mode != "internal":
             self._drain_scheduling_context()
+            _drain_ms = (time.perf_counter() - _t_drain) * 1000
+            _t_zmq = time.perf_counter()
             self._assemble_and_send_engine_state()
+            _zmq_ms = (time.perf_counter() - _t_zmq) * 1000
 
         # Run predictions BEFORE batch formation to guide scheduling decisions
         # Only run simulation-related predictions in SIMULATION mode
-        if self.prefill_schedule_mode == PrefillScheduleMode.SIMULATION:
+        # In sidecar mode, internal SLO logic is disabled — sidecar handles this
+        if self.prefill_schedule_mode == PrefillScheduleMode.SIMULATION and self.slo_scheduler_mode != "sidecar":
             self._maybe_run_prefill_simulation()
             self._predict_future_kv_usage()
 
+        _t_prefill = time.perf_counter()
         new_batch = self.get_new_batch_prefill()
+        _prefill_ms = (time.perf_counter() - _t_prefill) * 1000
+        _t_shadow = time.perf_counter()
         self._shadow_log_decisions()
+        _shadow_ms = (time.perf_counter() - _t_shadow) * 1000
+        self._last_batch_breakdown = (_merge_ms, _drain_ms, _zmq_ms, _prefill_ms, _shadow_ms)
 
         need_dp_attn_preparation = require_mlp_sync(self.server_args)
 
@@ -3330,72 +3378,80 @@ class Scheduler(
         effective_tpot = None
         effective_target = None
 
-        if self.prefill_schedule_mode == PrefillScheduleMode.SIMULATION:
-            sim_budget = self._get_simulation_chunk_budget()
-            if sim_budget == 0:
-                logger.debug("SIMULATION mode: decode-only iteration per simulation plan")
-                internal_decode_only = True
-            else:
-                # sim_budget is pure prefill tokens; add decode_tokens back because
-                # PrefillAdder will subtract them (it expects total token budget)
-                effective_chunk_size = sim_budget + decode_tokens
-        elif self.prefill_schedule_mode == PrefillScheduleMode.PREDICTOR:
-            pred = self.predict_batch(self.running_batch)
-            if self.target_iteration_time_ms is not None and pred > self.target_iteration_time_ms:
-                internal_decode_only = True
-            elif self.tpot is not None and self.cycle_time_predictor is not None:
-                effective_predictor = self.cycle_time_predictor
-                effective_tpot = self.tpot
-                effective_target = self.target_iteration_time_ms
-            else:
-                logger.debug("PREDICTOR mode: TPOT not set, falling back to BUDGET behavior")
-        elif self.prefill_schedule_mode == PrefillScheduleMode.SLACK:
-            min_slack = self._compute_min_valid_decode_slack()
-            if min_slack is not None and self.cycle_time_predictor is not None:
-                pred = self.predict_batch(self.running_batch)
-                if pred > min_slack:
+        # In sidecar mode, skip all internal SLO computation — sidecar handles scheduling
+        if self.slo_scheduler_mode != "sidecar":
+            if self.prefill_schedule_mode == PrefillScheduleMode.SIMULATION:
+                sim_budget = self._get_simulation_chunk_budget()
+                if sim_budget == 0:
+                    logger.debug("SIMULATION mode: decode-only iteration per simulation plan")
                     internal_decode_only = True
                 else:
+                    # sim_budget is pure prefill tokens; add decode_tokens back because
+                    # PrefillAdder will subtract them (it expects total token budget)
+                    effective_chunk_size = sim_budget + decode_tokens
+            elif self.prefill_schedule_mode == PrefillScheduleMode.PREDICTOR:
+                pred = self.predict_batch(self.running_batch)
+                if self.target_iteration_time_ms is not None and pred > self.target_iteration_time_ms:
+                    internal_decode_only = True
+                elif self.tpot is not None and self.cycle_time_predictor is not None:
                     effective_predictor = self.cycle_time_predictor
                     effective_tpot = self.tpot
-                    effective_target = min_slack
-                    logger.info(
-                        "SLACK mode: using min_decode_slack=%.2fms as target_iteration_time",
-                        min_slack,
-                    )
-            else:
-                if min_slack is None:
-                    logger.debug("SLACK mode: no valid decode slack, falling back to BUDGET behavior")
+                    effective_target = self.target_iteration_time_ms
                 else:
-                    logger.info("SLACK mode: cycle_time_predictor unavailable, falling back to BUDGET behavior")
+                    logger.debug("PREDICTOR mode: TPOT not set, falling back to BUDGET behavior")
+            elif self.prefill_schedule_mode == PrefillScheduleMode.SLACK:
+                min_slack = self._compute_min_valid_decode_slack()
+                if min_slack is not None and self.cycle_time_predictor is not None:
+                    pred = self.predict_batch(self.running_batch)
+                    if pred > min_slack:
+                        internal_decode_only = True
+                    else:
+                        effective_predictor = self.cycle_time_predictor
+                        effective_tpot = self.tpot
+                        effective_target = min_slack
+                        logger.info(
+                            "SLACK mode: using min_decode_slack=%.2fms as target_iteration_time",
+                            min_slack,
+                        )
+                else:
+                    if min_slack is None:
+                        logger.debug("SLACK mode: no valid decode slack, falling back to BUDGET behavior")
+                    else:
+                        logger.info("SLACK mode: cycle_time_predictor unavailable, falling back to BUDGET behavior")
 
         # ── Step 2: Shadow/sidecar logging (always captures internal decision) ──
-        if self.slo_scheduler_mode in ("shadow", "sidecar"):
-            _mode = self.prefill_schedule_mode.value
-            _slack = min_slack if self.prefill_schedule_mode == PrefillScheduleMode.SLACK else None
-            _ctx = self._shadow_common_context()
-            if self.prefill_schedule_mode == PrefillScheduleMode.SIMULATION:
-                _base = self._last_prefill_sim_results[0] if self._last_prefill_sim_results else None
-                _ctx.update(
-                    sim_budget=sim_budget,
-                    sim_execution_flow=list(getattr(_base, 'execution_flow', []) or []) if _base else None,
-                    sim_decode_slack_ms=self.prefill_sim_engine.config.slack_decode_ms if self.prefill_sim_engine and self.prefill_sim_engine.config else None,
-                    sim_safety_margin_ms=getattr(self.prefill_sim_engine, 'safety_margin_ms', None),
-                )
-            elif self.prefill_schedule_mode == PrefillScheduleMode.PREDICTOR:
-                _ctx.update(pred_decode_time=pred, target_iteration_time_ms=self.target_iteration_time_ms)
-            elif self.prefill_schedule_mode == PrefillScheduleMode.SLACK:
-                _ctx.update(min_decode_slack_ms=min_slack)
-                # pred exists only when min_slack and predictor were both available
-                if min_slack is not None and self.cycle_time_predictor is not None:
-                    _ctx.update(pred_decode_time=pred)
-            if internal_decode_only:
-                self._shadow_capture_decode_only(_mode, **_ctx)
+        if self.slo_scheduler_mode in ("shadow", "shadow-sidecar", "sidecar"):
+            if self.slo_scheduler_mode == "sidecar":
+                # Internal SLO skipped; log simplified snapshot
+                _ctx = self._shadow_common_context()
+                self._shadow_capture_pre_batch(None, "sidecar_only", None, **_ctx)
             else:
-                self._shadow_capture_pre_batch(effective_target, _mode, _slack, **_ctx)
+                # shadow / shadow-sidecar: full internal capture
+                _mode = self.prefill_schedule_mode.value
+                _slack = min_slack if self.prefill_schedule_mode == PrefillScheduleMode.SLACK else None
+                _ctx = self._shadow_common_context()
+                if self.prefill_schedule_mode == PrefillScheduleMode.SIMULATION:
+                    _base = self._last_prefill_sim_results[0] if self._last_prefill_sim_results else None
+                    _ctx.update(
+                        sim_budget=sim_budget,
+                        sim_execution_flow=list(getattr(_base, 'execution_flow', []) or []) if _base else None,
+                        sim_decode_slack_ms=self.prefill_sim_engine.config.slack_decode_ms if self.prefill_sim_engine and self.prefill_sim_engine.config else None,
+                        sim_safety_margin_ms=getattr(self.prefill_sim_engine, 'safety_margin_ms', None),
+                    )
+                elif self.prefill_schedule_mode == PrefillScheduleMode.PREDICTOR:
+                    _ctx.update(pred_decode_time=pred, target_iteration_time_ms=self.target_iteration_time_ms)
+                elif self.prefill_schedule_mode == PrefillScheduleMode.SLACK:
+                    _ctx.update(min_decode_slack_ms=min_slack)
+                    # pred exists only when min_slack and predictor were both available
+                    if min_slack is not None and self.cycle_time_predictor is not None:
+                        _ctx.update(pred_decode_time=pred)
+                if internal_decode_only:
+                    self._shadow_capture_decode_only(_mode, **_ctx)
+                else:
+                    self._shadow_capture_pre_batch(effective_target, _mode, _slack, **_ctx)
 
         # ── Step 3: Apply decision (sidecar overrides internal if available) ──
-        if self.slo_scheduler_mode == "sidecar" and self._last_sidecar_decision is not None:
+        if self.slo_scheduler_mode in ("shadow-sidecar", "sidecar") and self._last_sidecar_decision is not None:
             decision = self._last_sidecar_decision
             if decision.decode_only_iteration or decision.max_prefill_tokens <= 0:
                 self._abandon_chunked_prefill()
@@ -3407,7 +3463,7 @@ class Scheduler(
             effective_target = decision.target_iteration_time_ms
             effective_predictor = None
             effective_tpot = None
-        elif self.slo_scheduler_mode == "sidecar":
+        elif self.slo_scheduler_mode in ("shadow-sidecar", "sidecar"):
             # Sidecar unavailable — fallback to chunked_prefill_size (no SLO awareness)
             pass
         elif internal_decode_only:
@@ -4212,7 +4268,8 @@ class Scheduler(
         try:
             self.tpot = float(recv_req.tpot) * 0.97 # LEAVE SOME ROOM
             logger.info(f"[Scheduler] set_tpot received: tpot={self.tpot}")
-            self._refresh_iteration_time_target()
+            if self.slo_scheduler_mode != "sidecar":
+                self._refresh_iteration_time_target()
             return SetTPOTReqOutput(success=True, tpot=self.tpot, message="ok")
         except Exception as e:
             logger.error(f"[Scheduler] set_tpot error: {e}")

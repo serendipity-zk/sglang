@@ -247,7 +247,7 @@ class ServerArgs:
     # SLO scheduler sidecar
     slo_scheduler_addr: Optional[str] = None  # e.g. "ipc:///tmp/sglang_slo_scheduler_0.sock"
     slo_scheduler_timeout_ms: int = 50
-    slo_scheduler_mode: str = "internal"  # "internal" | "shadow" | "sidecar"
+    slo_scheduler_mode: str = "internal"  # "internal" | "shadow" | "shadow-sidecar" | "sidecar"
 
     # API related
     api_key: Optional[str] = None
@@ -1715,8 +1715,8 @@ class ServerArgs:
             "--slo-scheduler-mode",
             type=str,
             default=ServerArgs.slo_scheduler_mode,
-            choices=["internal", "shadow", "sidecar"],
-            help="SLO scheduling mode: internal (engine-only), shadow (both run, compare), sidecar (sidecar decides).",
+            choices=["internal", "shadow", "shadow-sidecar", "sidecar"],
+            help="SLO scheduling mode: internal (engine-only), shadow (both run, engine decides), shadow-sidecar (both run, sidecar decides), sidecar (internal disabled, sidecar only).",
         )
 
         # API related
