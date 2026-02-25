@@ -3,6 +3,7 @@ mod test_pd_routing {
     use serde_json::json;
     use sglang_router_rs::config::{
         CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+        SchedulerConfig,
     };
     use sglang_router_rs::core::{BasicWorkerBuilder, Worker, WorkerType};
     use sglang_router_rs::routers::http::pd_types::get_hostname;
@@ -208,6 +209,9 @@ mod test_pd_routing {
                 model_path: None,
                 tokenizer_path: None,
                 history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+                sidecar_urls: None,
+                stats_mode: "internal".to_string(),
+                scheduler: SchedulerConfig::default(),
             };
 
             let app_context =

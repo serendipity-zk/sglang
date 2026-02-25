@@ -1537,7 +1537,9 @@ class Scheduler(
                 ) * 1000
 
                 # Drain 🟢 CurrentSnapshot: what GPU is actively executing NOW
-                # Overlap loop: iteration_count not yet incremented for this batch
+                # Overlap loop: iteration_count not yet incremented (happens after
+                # process_batch_result below).  Use +1 to maintain the temporal
+                # invariant: scheduling.iteration_count = current.iteration_count + 1.
                 if self.slo_client is not None:
                     self._drain_current_snapshot(batch, self.iteration_count + 1)
 
@@ -3397,6 +3399,9 @@ class Scheduler(
             effective_target = decision.target_iteration_time_ms
             effective_predictor = None
             effective_tpot = None
+        elif self.slo_scheduler_mode == "sidecar":
+            # Sidecar unavailable — fallback to chunked_prefill_size (no SLO awareness)
+            pass
         elif internal_decode_only:
             self._abandon_chunked_prefill()
             return None

@@ -121,17 +121,9 @@ class SchedulerSidecarMixin:
         Args:
             batch: The batch just launched on GPU.
             iteration_count: The iteration number for this batch.
-                In overlap loop: self.iteration_count + 1 (not yet incremented).
-                In normal loop: self.iteration_count (already incremented).
-
-        NOTE (overlap warmup): On the second pass of the overlap loop, the
-        previous _drain_current_snapshot set iteration_count = N+1 but
-        self.iteration_count has not yet been incremented (happens later when
-        processing the first real batch result).  This means the next
-        _assemble_and_send_engine_state sees scheduling.iteration_count ==
-        current.iteration_count (both N+1) instead of scheduling = current + 1.
-        This is a one-time startup transient that self-corrects after the first
-        batch result is processed and iteration_count increments.
+                Both loops pass self.iteration_count (the engine's counter).
+                This ensures current.iteration_count matches the engine's
+                router metrics report (iteration_num = self.iteration_count).
         """
         from slo_scheduler.messages.engine_state import CurrentSnapshot
         num_used = self._get_token_info()[0]
@@ -146,6 +138,42 @@ class SchedulerSidecarMixin:
             except AttributeError:
                 fwd_mode_str = str(fwd_mode)
 
+        # Batch composition for router reporting. In the overlap loop the router
+        # receives metrics from the RUNNING batch (scheduler.py:1530), so these
+        # must come from the batch just launched, not the completed one.
+        prefill_tokens = 0
+        decode_tokens = 0
+        prefill_chunk_pairs = []
+        if fwd_mode == ForwardMode.EXTEND:
+            prefill_tokens = batch.extend_num_tokens if batch.extend_num_tokens else 0
+        elif fwd_mode == ForwardMode.DECODE:
+            decode_tokens = len(batch.reqs) if batch.reqs else 0
+        elif fwd_mode == ForwardMode.MIXED:
+            prefill_tokens = (
+                batch.extend_num_tokens - len(batch.decoding_reqs)
+                if batch.extend_num_tokens else 0
+            )
+            decode_tokens = len(batch.decoding_reqs) if batch.decoding_reqs else 0
+
+        if fwd_mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            prefix_lens = getattr(batch, "prefix_lens", None)
+            extend_lens = getattr(batch, "extend_lens", None)
+            decoding_reqs = (
+                set(batch.decoding_reqs)
+                if getattr(batch, "decoding_reqs", None) else None
+            )
+            if prefix_lens is not None and extend_lens is not None and batch.reqs is not None:
+                for i, req in enumerate(batch.reqs):
+                    if fwd_mode == ForwardMode.MIXED and decoding_reqs and req in decoding_reqs:
+                        continue
+                    chunk = extend_lens[i] if i < len(extend_lens) else 0
+                    if chunk and chunk > 0:
+                        cumulative = (prefix_lens[i] if i < len(prefix_lens) else 0) + chunk
+                        prefill_chunk_pairs.append([int(chunk), int(cumulative)])
+
+        # Router ack tracking
+        ack_gen, ack_last_id = self.router_ack_tracker.get_state()
+
         self._pending_current = CurrentSnapshot(
             iteration_count=iteration_count,
             timestamp_ms=now_ms,
@@ -155,6 +183,10 @@ class SchedulerSidecarMixin:
             kv_capacity=self.max_total_num_tokens,
             running_requests=[self._req_to_request_info(r) for r in (batch.reqs or [])],
             forward_mode=fwd_mode_str,
+            batch_size_tokens=prefill_tokens + decode_tokens,
+            prefill_chunk_pairs=prefill_chunk_pairs,
+            router_generation=ack_gen,
+            router_last_ack_id=ack_last_id,
         )
 
     def _drain_finished_iteration(self: "Scheduler", tmp_batch, actual_time_ms, kv_tokens_used: int):
@@ -351,6 +383,7 @@ class SchedulerSidecarMixin:
             current = self._pending_current
         else:
             num_used = self._get_token_info()[0]
+            ack_gen, ack_last_id = self.router_ack_tracker.get_state()
             current = CurrentSnapshot(
                 iteration_count=self.iteration_count,
                 timestamp_ms=time.time() * 1000,
@@ -358,6 +391,8 @@ class SchedulerSidecarMixin:
                 num_waiting_requests=len(self.waiting_queue),
                 kv_tokens_used=num_used,
                 kv_capacity=self.max_total_num_tokens,
+                router_generation=ack_gen,
+                router_last_ack_id=ack_last_id,
             )
         scheduling = self._pending_scheduling  # always just drained
 
@@ -369,8 +404,6 @@ class SchedulerSidecarMixin:
             current=current,
             scheduling=scheduling,
             accepted_requests_count=self._accepted_since_last_send,
-            # DEPRECATED in Phase 5: router will call sidecar /set_tpot directly.
-            engine_tpot_ms=getattr(self, 'tpot', None),
         )
 
         # # Debug: log every message sent to sidecar

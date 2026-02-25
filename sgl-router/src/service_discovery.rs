@@ -603,10 +603,13 @@ mod tests {
         let scheduler = crate::schedulers::SchedulerFactory::create_from_config(
             &router_config.scheduler,
             policy_registry.clone(),
+            router_config.sidecar_urls.clone(),
+            router_config.stats_mode.clone(),
         );
         let scheduler_registry = Arc::new(crate::schedulers::SchedulerRegistry::new(scheduler));
         let app_context = Arc::new(AppContext {
             client: reqwest::Client::new(),
+            stats_mode: router_config.stats_mode.clone(),
             router_config: router_config.clone(),
             rate_limiter: Arc::new(TokenBucket::new(1000, 1000)),
             worker_registry,
@@ -617,6 +620,7 @@ mod tests {
             tool_parser_registry: None,     // HTTP mode doesn't need tool parser
             router_manager: None,           // Test doesn't need router manager
             response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
+            shadow_stats_logger: None,      // Service discovery doesn't use shadow mode
         });
 
         let router = Router::new(&app_context).await.unwrap();

@@ -36,12 +36,45 @@ use serde::Deserialize;
 use serde_json::json;
 use std::{
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
-    sync::Arc,
-    time::Duration,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{net::TcpListener, signal, spawn};
 use tracing::{error, info, warn, Level};
+
+/// Dedicated shadow stats logger for JSONL comparison output.
+/// Writes engine vs sidecar stats side-by-side for offline analysis.
+pub struct ShadowStatsLogger {
+    writer: Mutex<std::io::BufWriter<std::fs::File>>,
+    write_count: AtomicU64,
+}
+
+impl ShadowStatsLogger {
+    pub fn new(path: &str) -> Result<Self, String> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|e| format!("Failed to open shadow stats log {}: {}", path, e))?;
+        Ok(Self {
+            writer: Mutex::new(std::io::BufWriter::new(file)),
+            write_count: AtomicU64::new(0),
+        })
+    }
+
+    pub fn log(&self, record: &serde_json::Value) {
+        if let Ok(mut w) = self.writer.lock() {
+            use std::io::Write;
+            let _ = writeln!(w, "{}", record);
+            let count = self.write_count.fetch_add(1, Ordering::Relaxed);
+            if count % 100 == 0 {
+                let _ = w.flush();
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AppContext {
@@ -56,6 +89,8 @@ pub struct AppContext {
     pub scheduler_registry: Arc<crate::schedulers::SchedulerRegistry>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub response_storage: SharedResponseStorage,
+    pub stats_mode: String,
+    pub shadow_stats_logger: Option<Arc<ShadowStatsLogger>>,
 }
 
 impl AppContext {
@@ -102,6 +137,8 @@ impl AppContext {
         let scheduler = crate::schedulers::SchedulerFactory::create_from_config(
             &router_config.scheduler,
             policy_registry.clone(),
+            router_config.sidecar_urls.clone(),
+            router_config.stats_mode.clone(),
         );
         let scheduler_registry = Arc::new(crate::schedulers::SchedulerRegistry::new(scheduler));
 
@@ -111,6 +148,17 @@ impl AppContext {
         let response_storage: SharedResponseStorage = match router_config.history_backend {
             HistoryBackend::Memory => Arc::new(MemoryResponseStorage::new()),
             HistoryBackend::None => Arc::new(NoOpResponseStorage::new()),
+        };
+
+        // Initialize shadow stats logger if in shadow mode
+        let stats_mode = router_config.stats_mode.clone();
+        let shadow_stats_logger = if stats_mode == "shadow" || stats_mode == "shadow-sidecar" {
+            let log_dir = router_config.log_dir.as_deref().unwrap_or(".");
+            let path = format!("{}/shadow_stats.jsonl", log_dir);
+            info!("Shadow mode: logging engine/sidecar stats comparison to {}", path);
+            Some(Arc::new(ShadowStatsLogger::new(&path)?))
+        } else {
+            None
         };
 
         Ok(Self {
@@ -125,6 +173,8 @@ impl AppContext {
             scheduler_registry,
             router_manager,
             response_storage,
+            stats_mode,
+            shadow_stats_logger,
         })
     }
 }
@@ -344,11 +394,101 @@ async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Respons
     state.router.get_worker_loads().await
 }
 
+/// Log both engine and sidecar stats side-by-side for shadow mode comparison.
+///
+/// `logged_stats`: the non-authoritative stats (just arrived, NOT used for routing).
+/// `logged_source`: "sidecar" (shadow mode) or "engine" (shadow-sidecar mode).
+///
+/// The authoritative stats are fetched from the worker registry (already stored there).
+/// Stats may be from different iterations due to arrival timing;
+/// the offline analyzer matches by iteration_num.
+fn shadow_log_stats(
+    state: &Arc<AppState>,
+    logged_stats: &crate::core::WorkerStats,
+    logged_source: &str,
+) {
+    let worker_url = state
+        .context
+        .worker_registry
+        .resolve_worker_url(&logged_stats.worker_id)
+        .unwrap_or_else(|| logged_stats.worker_id.clone());
+
+    // The registry holds the authoritative stats (the other source)
+    let registry_stats = state.context.worker_registry.get_stats(&worker_url);
+
+    // Serialize full WorkerStats (timestamp field is #[serde(skip)], all others included)
+    let stats_to_json = |s: &crate::core::WorkerStats| {
+        serde_json::to_value(s).unwrap_or_default()
+    };
+
+    let (engine_json, sidecar_json) = if logged_source == "sidecar" {
+        // shadow mode: logged=sidecar (param), authoritative=engine (registry)
+        (
+            registry_stats.as_ref().map(|e| stats_to_json(e)),
+            Some(stats_to_json(logged_stats)),
+        )
+    } else {
+        // shadow-sidecar mode: logged=engine (param), authoritative=sidecar (registry)
+        (
+            Some(stats_to_json(logged_stats)),
+            registry_stats.as_ref().map(|s| stats_to_json(s)),
+        )
+    };
+
+    let record = serde_json::json!({
+        "ts_ms": SystemTime::now().duration_since(UNIX_EPOCH)
+            .unwrap_or_default().as_millis() as u64,
+        "worker_id": worker_url,
+        "engine": engine_json,
+        "sidecar": sidecar_json,
+    });
+
+    if let Some(logger) = &state.context.shadow_stats_logger {
+        logger.log(&record);
+    }
+}
+
 // Worker stats endpoint for receiving metrics from workers
 async fn worker_stats(
     State(state): State<Arc<AppState>>,
     Json(stats): Json<serde_json::Value>,
 ) -> Response {
+    // Parse stats_source BEFORE constructing WorkerStats (not stored in WorkerStats struct)
+    let stats_source = stats.get("stats_source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("engine");
+
+    let mode = &state.context.stats_mode;
+
+    // Mode-based routing decision
+    match (mode.as_str(), stats_source) {
+        ("internal", "sidecar") => {
+            tracing::debug!("[STATS_SKIP] sidecar stats in internal mode");
+            return (StatusCode::OK, "Ignored").into_response();
+        }
+        ("sidecar", "engine") => {
+            tracing::debug!("[STATS_SKIP] engine stats in sidecar mode");
+            return (StatusCode::OK, "Ignored").into_response();
+        }
+        ("shadow", "sidecar") => {
+            // Engine authoritative: log sidecar stats to JSONL, don't update registry
+            match crate::core::WorkerStats::from_json(&stats) {
+                Ok(sidecar_stats) => shadow_log_stats(&state, &sidecar_stats, "sidecar"),
+                Err(e) => tracing::warn!("Failed to parse sidecar stats: {}", e),
+            }
+            return (StatusCode::OK, "Logged").into_response();
+        }
+        ("shadow-sidecar", "engine") => {
+            // Sidecar authoritative: log engine stats to JSONL, don't update registry
+            match crate::core::WorkerStats::from_json(&stats) {
+                Ok(engine_stats) => shadow_log_stats(&state, &engine_stats, "engine"),
+                Err(e) => tracing::warn!("Failed to parse engine stats: {}", e),
+            }
+            return (StatusCode::OK, "Logged").into_response();
+        }
+        _ => {} // Accept and process normally
+    }
+
     // Parse stats into structured format
     let mut worker_stats = match crate::core::WorkerStats::from_json(&stats) {
         Ok(s) => s,

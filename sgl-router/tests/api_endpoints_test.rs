@@ -10,6 +10,7 @@ use reqwest::Client;
 use serde_json::json;
 use sglang_router_rs::config::{
     CircuitBreakerConfig, ConnectionMode, PolicyConfig, RetryConfig, RouterConfig, RoutingMode,
+    SchedulerConfig,
 };
 use sglang_router_rs::routers::{RouterFactory, RouterTrait};
 use std::sync::Arc;
@@ -59,6 +60,9 @@ impl TestContext {
             model_path: None,
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+            sidecar_urls: None,
+            stats_mode: "internal".to_string(),
+            scheduler: SchedulerConfig::default(),
         };
 
         Self::new_with_config(config, worker_configs).await
@@ -1402,6 +1406,9 @@ mod error_tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+            sidecar_urls: None,
+            stats_mode: "internal".to_string(),
+            scheduler: SchedulerConfig::default(),
         };
 
         let ctx = TestContext::new_with_config(
@@ -1761,6 +1768,9 @@ mod pd_mode_tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+            sidecar_urls: None,
+            stats_mode: "internal".to_string(),
+            scheduler: SchedulerConfig::default(),
         };
 
         // Create app context
@@ -1924,6 +1934,9 @@ mod request_id_tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: sglang_router_rs::config::HistoryBackend::Memory,
+            sidecar_urls: None,
+            stats_mode: "internal".to_string(),
+            scheduler: SchedulerConfig::default(),
         };
 
         let ctx = TestContext::new_with_config(

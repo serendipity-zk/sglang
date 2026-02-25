@@ -297,6 +297,11 @@ def main():
                         help="Override: sidecar grid 文件路径 (默认从 --predictor-grid-path 推断)")
     parser.add_argument("--sidecar-router-url", default=None,
                         help="Override: sidecar router URL (默认从 --router-metrics-url 推断)")
+    parser.add_argument("--sidecar-http-port-base", type=int, default=18100,
+                        help="Base HTTP port for sidecar /set_tpot endpoints (idx 0-based added)")
+    parser.add_argument("--stats-mode", default="shadow",
+                        choices=["internal", "shadow", "shadow-sidecar", "sidecar"],
+                        help="Router stats/TPOT routing mode (passed to router --stats-mode)")
     args = parser.parse_args()
 
     ports = [int(p.strip()) for p in args.ports.split(",") if p.strip()]
@@ -401,10 +406,12 @@ def main():
                 print("WARNING: no grid path for sidecar (no --predictor-grid-path in extra-worker-args)")
 
             sc_router_url = args.sidecar_router_url
-            if sc_router_url is None and args.sidecar_mode != "shadow":
-                # Only auto-infer router URL in sidecar mode (not shadow).
-                # In shadow mode, the engine pushes its own metrics to the router;
-                # having the sidecar also push creates duplicate "ghost" workers in the UI.
+            if sc_router_url is None and args.stats_mode != "internal":
+                # Sidecar pushes stats to router in all non-internal stats modes:
+                #   shadow         — router logs sidecar stats to JSONL for comparison
+                #   shadow-sidecar — sidecar is authoritative, router uses these stats
+                #   sidecar        — sidecar is sole stats source
+                # Only skip in "internal" mode (router ignores sidecar stats entirely).
                 sc_router_url = _extract("--router-metrics-url")
 
             sc_tpot = args.sidecar_default_tpot_ms
@@ -416,6 +423,7 @@ def main():
             for idx, (gpu, port) in enumerate(zip(gpus, ports), start=1):
                 worker_id = idx - 1  # 0-indexed to match sidecar convention
                 zmq_addr = f"ipc:///tmp/sglang_slo_scheduler_{worker_id}.sock"
+                http_port = args.sidecar_http_port_base + worker_id
                 sidecar_cmd = [
                     sys.executable, "-m", "slo_scheduler.server.main",
                     "--worker-id", str(worker_id),
@@ -423,6 +431,7 @@ def main():
                     "--schedule-mode", sc_schedule_mode,
                     "--max-prefill-tokens", str(sc_max_prefill),
                     "--default-tpot-ms", str(sc_tpot),
+                    "--http-port", str(http_port),
                 ]
                 if sc_grid_path:
                     sidecar_cmd.extend(["--grid-path", sc_grid_path])
@@ -489,6 +498,16 @@ def main():
             for port in ports:
                 ok = wait_port(args.host, port, timeout=600)
                 print(f"Wait {args.host}:{port} -> {'READY' if ok else 'TIMEOUT'}")
+
+        # Print router args for sidecar mode
+        if args.with_sidecar and args.stats_mode != "internal":
+            sidecar_http_urls = [
+                f"http://{args.host}:{args.sidecar_http_port_base + i}"
+                for i in range(len(ports))
+            ]
+            print(f"\n=== Router sidecar args (add to router launch command) ===")
+            print(f"  --sidecar-urls {' '.join(sidecar_http_urls)}")
+            print(f"  --stats-mode {args.stats_mode}")
 
         print("\nWorkers started. 按 Ctrl-C 结束所有 worker。\n")
 

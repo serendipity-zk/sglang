@@ -66,7 +66,7 @@ $RUST_BINARY \
   --tokenizer meta-llama/Llama-3.1-8B-Instruct \
   --base-url http://0.0.0.0:40010/v1 \
   --model meta-llama/Llama-3.1-8B-Instruct \
-  --rate 400 \
+  --rate 100 \
   --max-requests 20000 \
   --log-path /sgl-workspace/sglang/slo/logs/rust_client_output.jsonl \
   --elapsed-dump-path /sgl-workspace/sglang/slo/logs/rust_elapsed_timelines.pkl \

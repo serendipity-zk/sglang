@@ -196,6 +196,9 @@ async fn test_unsupported_endpoints() {
         session_params: None,
         return_hidden_states: false,
         rid: None,
+        target_ttft_ms: None,
+        target_tpot_ms: None,
+        arrival_time_ms: None,
     };
 
     let response = router.route_generate(None, &generate_request, None, "test-request-id").await;

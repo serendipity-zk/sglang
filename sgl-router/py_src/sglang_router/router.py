@@ -150,6 +150,23 @@ class Router:
         args_dict.pop("mini_lb")
         args_dict.pop("scheduler_config_file", None)
 
+        # Validate stats_mode requires SLO-aware scheduler
+        stats_mode = args_dict.get("stats_mode", "internal")
+        if stats_mode != "internal":
+            scheduler_config = args_dict.get("scheduler_config")
+            if scheduler_config:
+                parsed = json.loads(scheduler_config)
+                if parsed.get("type") != "slo_aware":
+                    raise ValueError(
+                        f"--stats-mode={stats_mode} requires SLO-aware scheduler "
+                        f"(scheduler type is '{parsed.get('type', 'eager')}')"
+                    )
+            else:
+                raise ValueError(
+                    f"--stats-mode={stats_mode} requires SLO-aware scheduler "
+                    f"(no scheduler config provided)"
+                )
+
         return Router(_Router(**args_dict))
 
     def start(self) -> None:

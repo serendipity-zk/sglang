@@ -516,6 +516,8 @@ impl CliArgs {
                 "none" => HistoryBackend::None,
                 _ => HistoryBackend::Memory,
             },
+            sidecar_urls: None,
+            stats_mode: "internal".to_string(),
         })
     }
 

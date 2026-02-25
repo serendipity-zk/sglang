@@ -88,6 +88,9 @@ class RouterArgs:
     tokenizer_path: Optional[str] = None
     # Scheduler configuration
     scheduler_config_file: Optional[str] = None
+    # Sidecar configuration
+    sidecar_urls: Optional[List[str]] = None
+    stats_mode: str = "internal"
 
     @staticmethod
     def add_cli_args(
@@ -454,6 +457,25 @@ class RouterArgs:
             type=str,
             default=None,
             help="Path to JSON file containing scheduler configuration (type, TPOT buckets, worker selection policy, auto-scaling). If not specified, defaults to eager scheduler.",
+        )
+        # Sidecar configuration
+        parser.add_argument(
+            f"--{prefix}sidecar-urls",
+            type=str,
+            nargs="+",
+            default=None,
+            help="Sidecar HTTP URLs, 1:1 positional match with --worker-urls. "
+                 "e.g., http://host:18100 http://host:18101",
+        )
+        parser.add_argument(
+            f"--{prefix}stats-mode",
+            type=str,
+            default="internal",
+            choices=["internal", "shadow", "shadow-sidecar", "sidecar"],
+            help="Stats/TPOT routing mode: internal (engine-only), "
+                 "shadow (engine authoritative, sidecar logged), "
+                 "shadow-sidecar (sidecar authoritative, engine logged), "
+                 "sidecar (sidecar-only)",
         )
 
     @classmethod

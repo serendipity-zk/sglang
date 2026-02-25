@@ -73,10 +73,20 @@ pub struct RouterConfig {
     /// History backend configuration (memory or none, default: memory)
     #[serde(default = "default_history_backend")]
     pub history_backend: HistoryBackend,
+    /// Sidecar HTTP URLs, 1:1 positional match with worker URLs
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_urls: Option<Vec<String>>,
+    /// Stats/TPOT routing mode: "internal" | "shadow" | "sidecar"
+    #[serde(default = "default_stats_mode")]
+    pub stats_mode: String,
 }
 
 fn default_history_backend() -> HistoryBackend {
     HistoryBackend::Memory
+}
+
+fn default_stats_mode() -> String {
+    "internal".to_string()
 }
 
 /// History backend configuration
@@ -525,6 +535,8 @@ impl Default for RouterConfig {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
+            sidecar_urls: None,
+            stats_mode: default_stats_mode(),
         }
     }
 }
@@ -1093,6 +1105,8 @@ mod tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
+            sidecar_urls: None,
+            stats_mode: default_stats_mode(),
         };
 
         assert!(config.mode.is_pd_mode());
@@ -1158,6 +1172,8 @@ mod tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
+            sidecar_urls: None,
+            stats_mode: default_stats_mode(),
         };
 
         assert!(!config.mode.is_pd_mode());
@@ -1219,6 +1235,8 @@ mod tests {
             model_path: None,
             tokenizer_path: None,
             history_backend: default_history_backend(),
+            sidecar_urls: None,
+            stats_mode: default_stats_mode(),
         };
 
         assert!(config.has_service_discovery());

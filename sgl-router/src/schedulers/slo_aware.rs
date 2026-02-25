@@ -52,6 +52,12 @@ pub struct SloAwareScheduler {
     last_scheduled_time: Arc<DashMap<String, std::time::Instant>>,
     /// Track TTFT violations per tier (for steal decision)
     tier_violations: Arc<DashMap<usize, AtomicUsize>>,
+    /// Sidecar URLs passed from config (used to build sidecar_url_map during initialize_workers)
+    sidecar_urls: Option<Vec<String>>,
+    /// Worker URL → Sidecar URL mapping (built from positional sidecar_urls during initialize_workers)
+    sidecar_url_map: RwLock<HashMap<String, String>>,
+    /// Stats routing mode: "internal" | "shadow" | "sidecar"
+    stats_mode: String,
 }
 
 impl SloAwareScheduler {
@@ -62,6 +68,8 @@ impl SloAwareScheduler {
         auto_scaling: Option<AutoScalingConfig>,
         initial_tier_allocation: Option<Vec<usize>>,
         send_tpot_updates: bool,
+        sidecar_urls: Option<Vec<String>>,
+        stats_mode: String,
     ) -> Self {
         let tier_workers = Arc::new(DashMap::new());
         let tier_queue_sizes = Arc::new(DashMap::new());
@@ -93,6 +101,9 @@ impl SloAwareScheduler {
             next_letter: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             last_scheduled_time: Arc::new(DashMap::new()),
             tier_violations,
+            sidecar_urls,
+            sidecar_url_map: RwLock::new(HashMap::new()),
+            stats_mode,
         }
     }
 
@@ -346,6 +357,50 @@ impl SloAwareScheduler {
                 idle_workers.len()
             );
         }
+
+        // Build sidecar URL map if sidecar_urls were provided
+        if let Some(ref sidecar_urls) = self.sidecar_urls {
+            // IMPORTANT: all_workers comes from DashMap whose iteration order is
+            // non-deterministic.  sidecar_urls are positionally paired with the
+            // original --worker-urls CLI order (sorted ascending by URL).  We must
+            // sort the collected worker URLs so the zip pairs each worker with its
+            // correct sidecar.
+            let mut worker_urls: Vec<String> = all_workers.iter()
+                .map(|(_, worker)| worker.url().to_string())
+                .collect();
+            worker_urls.sort();
+
+            if sidecar_urls.len() != worker_urls.len() {
+                // HARD FAIL: mismatch means TPOT goes to wrong sidecars
+                panic!(
+                    "FATAL: --sidecar-urls count ({}) does not match worker count ({}). \
+                     Each worker must have exactly one paired sidecar URL.",
+                    sidecar_urls.len(),
+                    worker_urls.len()
+                );
+            }
+
+            let mut map = self.sidecar_url_map.write().unwrap();
+            for (worker_url, sidecar_url) in worker_urls.iter().zip(sidecar_urls.iter()) {
+                info!(
+                    "  Sidecar mapping: {} → {}",
+                    worker_url, sidecar_url
+                );
+                map.insert(worker_url.clone(), sidecar_url.clone());
+            }
+
+            info!(
+                "Stats mode: {}, sidecar URL map built with {} entries",
+                self.stats_mode,
+                map.len()
+            );
+        } else if self.stats_mode != "internal" {
+            warn!(
+                "Stats mode is '{}' but no --sidecar-urls provided; \
+                 TPOT updates will only go to engines",
+                self.stats_mode
+            );
+        }
     }
 
     /// Update worker statistics for admission control
@@ -431,21 +486,48 @@ impl SloAwareScheduler {
         }
     }
 
-    /// Send TPOT update to a worker (fire-and-forget HTTP POST to /set_tpot)
-    /// Only sends if send_tpot_updates is true
+    /// Mode-aware TPOT update: routes to engine, sidecar, or both based on stats_mode.
+    /// All call sites use this method; mode logic is centralized here.
     fn send_tpot_update(&self, worker_url: &str, tpot_ms: f64) {
         if !self.send_tpot_updates {
             return;
         }
+        match self.stats_mode.as_str() {
+            "internal" => {
+                self.send_tpot_to_url(worker_url, tpot_ms);
+            }
+            "shadow" | "shadow-sidecar" => {
+                // Send to both engine and sidecar
+                self.send_tpot_to_url(worker_url, tpot_ms);
+                if let Ok(map) = self.sidecar_url_map.read() {
+                    if let Some(sc) = map.get(worker_url) {
+                        self.send_tpot_to_url(sc, tpot_ms);
+                    }
+                }
+            }
+            "sidecar" => {
+                // Send only to sidecar
+                if let Ok(map) = self.sidecar_url_map.read() {
+                    if let Some(sc) = map.get(worker_url) {
+                        self.send_tpot_to_url(sc, tpot_ms);
+                    }
+                }
+            }
+            _ => {
+                // Unknown mode, default to engine
+                self.send_tpot_to_url(worker_url, tpot_ms);
+            }
+        }
+    }
 
-        // Fire-and-forget HTTP POST to /set_tpot endpoint
-        let url = format!("{}/set_tpot", worker_url.trim_end_matches('/'));
-        let tpot_value = tpot_ms;
-        let client = self.tpot_client.clone(); // Cheap clone - just Arc increment
+    /// Fire-and-forget HTTP POST to /set_tpot (raw, no mode logic)
+    fn send_tpot_to_url(&self, url: &str, tpot_ms: f64) {
+        let url = format!("{}/set_tpot", url.trim_end_matches('/'));
+        let client = self.tpot_client.clone();
 
         tokio::spawn(async move {
             let payload = serde_json::json!({
-                "tpot": tpot_value
+                "tpot": tpot_ms
             });
 
             match client
@@ -457,17 +539,17 @@ impl SloAwareScheduler {
             {
                 Ok(response) => {
                     if response.status().is_success() {
-                        tracing::debug!("Successfully sent TPOT update to {}: {} ms", url, tpot_value);
+                        tracing::debug!("TPOT update sent to {}: {} ms", url, tpot_ms);
                     } else {
                         tracing::warn!(
-                            "Failed to send TPOT update to {}: HTTP {}",
+                            "TPOT update to {}: HTTP {}",
                             url,
                             response.status()
                         );
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Error sending TPOT update to {}: {}", url, e);
+                    tracing::warn!("TPOT update to {}: {}", url, e);
                 }
             }
         });

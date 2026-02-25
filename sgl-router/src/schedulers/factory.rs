@@ -14,12 +14,16 @@ impl SchedulerFactory {
     /// # Arguments
     /// * `config` - The scheduler configuration
     /// * `policy_registry` - The policy registry for worker selection
+    /// * `sidecar_urls` - Optional sidecar URLs from RouterConfig (1:1 with worker URLs)
+    /// * `stats_mode` - Stats/TPOT routing mode from RouterConfig
     ///
     /// # Returns
     /// Arc-wrapped scheduler instance implementing Scheduler
     pub fn create_from_config(
         config: &SchedulerConfig,
         policy_registry: Arc<PolicyRegistry>,
+        sidecar_urls: Option<Vec<String>>,
+        stats_mode: String,
     ) -> Arc<dyn Scheduler> {
         match config {
             SchedulerConfig::Eager => Arc::new(EagerScheduler::new()),
@@ -34,6 +38,8 @@ impl SchedulerFactory {
                     auto_scaling.clone(),
                     initial_tier_allocation.clone(),
                     *send_tpot_updates,
+                    sidecar_urls,
+                    stats_mode,
                 ))
             },
         }
@@ -57,6 +63,8 @@ impl SchedulerFactory {
                     None,
                     None,
                     false,
+                    None,
+                    "internal".to_string(),
                 ))
             }
             _ => {

@@ -109,6 +109,13 @@ path = "benches/tool_parser_benchmark.rs"
 
 [profile.release]
 lto = "thin"
+codegen-units = 16
+debug = true
+split-debuginfo = "unpacked"
+
+[profile.maxperf]
+inherits = "release"
+lto = true
 codegen-units = 1
 
 [profile.dev]
@@ -117,6 +124,8 @@ debug = true
 split-debuginfo = "unpacked"
 incremental = true
 
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.dev.build-override]
 opt-level = 3

@@ -110,6 +110,9 @@ struct Router {
     tokenizer_path: Option<String>,
     // Scheduler configuration (JSON string)
     scheduler_config: Option<String>,
+    // Sidecar configuration
+    sidecar_urls: Option<Vec<String>>,
+    stats_mode: Option<String>,
 }
 
 impl Router {
@@ -263,6 +266,8 @@ impl Router {
             model_path: self.model_path.clone(),
             tokenizer_path: self.tokenizer_path.clone(),
             history_backend: config::HistoryBackend::Memory,
+            sidecar_urls: self.sidecar_urls.clone(),
+            stats_mode: self.stats_mode.clone().unwrap_or_else(|| "internal".to_string()),
         })
     }
 }
@@ -334,6 +339,9 @@ impl Router {
         tokenizer_path = None,
         // Scheduler defaults
         scheduler_config = None,
+        // Sidecar defaults
+        sidecar_urls = None,
+        stats_mode = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -394,6 +402,8 @@ impl Router {
         model_path: Option<String>,
         tokenizer_path: Option<String>,
         scheduler_config: Option<String>,
+        sidecar_urls: Option<Vec<String>>,
+        stats_mode: Option<String>,
     ) -> PyResult<Self> {
         // Determine connection mode from worker URLs
         let mut all_urls = worker_urls.clone();
@@ -471,6 +481,8 @@ impl Router {
             model_path,
             tokenizer_path,
             scheduler_config,
+            sidecar_urls,
+            stats_mode,
         })
     }
 
