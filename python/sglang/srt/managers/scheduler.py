@@ -820,6 +820,14 @@ class Scheduler(
         if not self.server_args.enable_iteration_metrics:
             return
 
+        # Auto-include debug destination for completed iterations when flag is set
+        if (getattr(self.server_args, "enable_debug_metrics", False)
+                and iteration_time_ms is not None):
+            if destinations is None:
+                destinations = ["log", "ui", "router", "debug"]
+            elif "debug" not in destinations:
+                destinations = list(destinations) + ["debug"]
+
         num_batch_reqs = len(batch.reqs) if batch.reqs is not None else 0
         if num_batch_reqs > 0:
             # Activity observed; allow the next idle transition to report immediately
