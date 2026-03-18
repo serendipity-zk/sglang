@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -95,6 +96,10 @@ class SchedulerMetricsMixin:
         self.kv_transfer_total_mb: float = 0.0
 
         self.stats = SchedulerStats()
+
+        # Debug metrics state
+        self.last_iteration_time_ms: Optional[float] = None
+        self.iteration_time_history: deque = deque(maxlen=10)
 
         # Metrics
         self.current_scheduler_metrics_enabled = (
@@ -769,3 +774,148 @@ class SchedulerMetricsMixin:
             ),
         ):
             yield
+
+    def _snapshot_iteration_metrics(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> dict:
+        """Collect all debug metric fields into a dict snapshot.
+
+        Must be called while the batch object is still intact (before mutation).
+        GPU timing is NOT included — it is added later by _log_debug_metrics.
+        """
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        num_batch_reqs = len(batch.reqs) if batch.reqs is not None else 0
+        num_used, token_usage, available_size, evictable_size = self._get_token_info()
+
+        # Determine prefill/decode token counts
+        prefill_tokens = 0
+        decode_tokens = 0
+        decoding_reqs = (
+            set(batch.decoding_reqs)
+            if getattr(batch, "decoding_reqs", None)
+            else None
+        )
+        if batch.forward_mode == ForwardMode.EXTEND:
+            prefill_tokens = batch.extend_num_tokens if batch.extend_num_tokens else 0
+        elif batch.forward_mode == ForwardMode.DECODE:
+            decode_tokens = len(batch.reqs)
+        elif batch.forward_mode == ForwardMode.MIXED:
+            prefill_tokens = (
+                batch.extend_num_tokens - len(batch.decoding_reqs)
+                if batch.extend_num_tokens
+                else 0
+            )
+            decode_tokens = len(batch.decoding_reqs) if batch.decoding_reqs else 0
+
+        total_tokens = prefill_tokens + decode_tokens
+
+        # Prefill chunk pairs
+        prefill_chunk_pairs = []
+        if batch.forward_mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+            prefix_lens = getattr(batch, "prefix_lens", None)
+            extend_lens = getattr(batch, "extend_lens", None)
+            if (
+                prefix_lens is not None
+                and extend_lens is not None
+                and batch.reqs is not None
+            ):
+                for i, req in enumerate(batch.reqs):
+                    if (
+                        batch.forward_mode == ForwardMode.MIXED
+                        and decoding_reqs
+                        and req in decoding_reqs
+                    ):
+                        continue
+                    current_chunk = extend_lens[i] if i < len(extend_lens) else 0
+                    if current_chunk and current_chunk > 0:
+                        cumulative_prefill = (
+                            prefix_lens[i] if i < len(prefix_lens) else 0
+                        ) + current_chunk
+                        prefill_chunk_pairs.append(
+                            [int(current_chunk), int(cumulative_prefill)]
+                        )
+            else:
+                for req in batch.reqs or []:
+                    if (
+                        batch.forward_mode == ForwardMode.MIXED
+                        and decoding_reqs
+                        and req in decoding_reqs
+                    ):
+                        continue
+                    current_chunk = getattr(req, "extend_input_len", 0)
+                    if current_chunk and current_chunk > 0:
+                        prefix_len = len(getattr(req, "prefix_indices", []))
+                        cumulative_prefill = prefix_len + current_chunk
+                        prefill_chunk_pairs.append(
+                            [current_chunk, cumulative_prefill]
+                        )
+
+        # Waiting queue info
+        waiting_queue_requests = []
+        total_extend_len = 0
+        for i, req in enumerate(self.waiting_queue):
+            extend_len = getattr(req, "extend_input_len", 0)
+            if i < 10:
+                prefix_len = len(getattr(req, "prefix_indices", []))
+                waiting_queue_requests.append(
+                    {
+                        "id": req.rid,
+                        "prefix_len": prefix_len,
+                        "extend_len": extend_len,
+                    }
+                )
+            total_extend_len += extend_len
+
+        metrics = {
+            "running_batch_size": num_batch_reqs,
+            "queue_reqs": len(self.waiting_queue),
+            "waiting_queue_size": len(self.waiting_queue),
+            "kv_tokens_used": num_used,
+            "token_capacity": self.max_total_num_tokens,
+            "kv_usage_pct": round(token_usage * 100, 2),
+            "kv_cache_usage_pct": round(token_usage, 4),
+            "prefill_tokens": prefill_tokens,
+            "decode_tokens": decode_tokens,
+            "token_batch_size": total_tokens,
+            "forward_mode": batch.forward_mode.name if batch.forward_mode else "UNKNOWN",
+            "kv_forecast_peak": None,
+            "kv_forecast_slack_ms": None,
+            "kv_forecast_peak_gt": None,
+            "kv_forecast_slack_ms_gt": None,
+            "kv_forecast_time_ms": None,
+            "prefill_sim_time_ms": None,
+            "prefill_chunk_pairs": prefill_chunk_pairs,
+            "prefill_sim_results": None,
+            "batch_size_tokens": total_tokens,
+            "num_requests": num_batch_reqs,
+            "input_id_len": batch.input_ids.shape[0] if batch.input_ids is not None else 0,
+            "batch_size_by_tpot_tier": {},
+            "waiting_queue_info": {
+                "pending_req_num": len(self.waiting_queue),
+                "total_extend_len": total_extend_len,
+                "requests": waiting_queue_requests,
+            },
+            "stats_source": "engine",
+            "worker_id": f"tp{self.tp_rank}",
+            "timestamp": time.time(),
+            "iteration_num": self.forward_ct,
+        }
+        return metrics
+
+    def _log_debug_metrics(
+        self: Scheduler, metrics: dict, gpu_time_ms: float
+    ):
+        """Add GPU timing fields to the snapshot and emit DEBUG_METRICS log line."""
+        metrics["iteration_time_ms"] = round(gpu_time_ms, 2)
+        self.last_iteration_time_ms = float(gpu_time_ms)
+        self.iteration_time_history.append(gpu_time_ms)
+
+        if self.last_iteration_time_ms is not None:
+            metrics["last_iteration_time_ms"] = round(self.last_iteration_time_ms, 2)
+
+        if self.iteration_time_history:
+            avg = sum(self.iteration_time_history) / len(self.iteration_time_history)
+            metrics["iteration_time_avg_ms"] = round(avg, 2)
+
+        logger.info(f"DEBUG_METRICS: {json.dumps(metrics, separators=(',', ':'))}")

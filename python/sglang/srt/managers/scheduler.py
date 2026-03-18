@@ -1115,7 +1115,24 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                if self.server_args.enable_debug_metrics and hasattr(
+                    self.device_module, "Event"
+                ):
+                    _start_evt = self.device_module.Event(enable_timing=True)
+                    _end_evt = self.device_module.Event(enable_timing=True)
+                    _start_evt.record()
+
                 result = self.run_batch(batch)
+
+                if self.server_args.enable_debug_metrics and hasattr(
+                    self.device_module, "Event"
+                ):
+                    _end_evt.record()
+                    _end_evt.synchronize()
+                    gpu_time_ms = _start_evt.elapsed_time(_end_evt)
+                    snapshot = self._snapshot_iteration_metrics(batch)
+                    self._log_debug_metrics(snapshot, gpu_time_ms)
+
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
@@ -1132,11 +1149,20 @@ class Scheduler(
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
+        self._debug_metrics_queue: deque = deque()
+
+        _has_device_event = hasattr(self.device_module, "Event")
+        _debug_enabled = self.server_args.enable_debug_metrics and _has_device_event
 
         def pop_and_process():
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+            # Deferred GPU time sync and logging
+            if _debug_enabled and self._debug_metrics_queue:
+                s_evt, e_evt, snapshot = self._debug_metrics_queue.popleft()
+                e_evt.synchronize()
+                self._log_debug_metrics(snapshot, s_evt.elapsed_time(e_evt))
 
         while True:
             # Receive requests
@@ -1157,7 +1183,20 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                if _debug_enabled:
+                    _start_evt = self.device_module.Event(enable_timing=True)
+                    _end_evt = self.device_module.Event(enable_timing=True)
+                    _start_evt.record()
+
                 batch_result = self.run_batch(batch)
+
+                if _debug_enabled:
+                    _end_evt.record(self.forward_stream)
+                    snapshot = self._snapshot_iteration_metrics(batch)
+                    self._debug_metrics_queue.append(
+                        (_start_evt, _end_evt, snapshot)
+                    )
+
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None

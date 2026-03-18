@@ -393,6 +393,9 @@ class ServerArgs:
     gc_warning_threshold_secs: float = 0.0
     decode_log_interval: int = 40
     enable_request_time_stats_logging: bool = False
+    enable_iteration_metrics: bool = False
+    enable_debug_metrics: bool = False
+    iteration_metrics_interval: int = 1
     kv_events_config: Optional[str] = None
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
@@ -3620,6 +3623,24 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_request_time_stats_logging,
             help="Enable per request time stats logging",
+        )
+        parser.add_argument(
+            "--enable-iteration-metrics",
+            action="store_true",
+            default=ServerArgs.enable_iteration_metrics,
+            help="Enable per-iteration metrics collection.",
+        )
+        parser.add_argument(
+            "--enable-debug-metrics",
+            action="store_true",
+            default=ServerArgs.enable_debug_metrics,
+            help="Enable DEBUG_METRICS JSON logging per iteration.",
+        )
+        parser.add_argument(
+            "--iteration-metrics-interval",
+            type=int,
+            default=ServerArgs.iteration_metrics_interval,
+            help="Iteration metrics logging interval (accepted for compatibility).",
         )
         parser.add_argument(
             "--kv-events-config",
