@@ -203,6 +203,11 @@ class GenerateReqInput(BaseReq):
     # Priority for the request
     priority: Optional[int] = None
 
+    # Sidecar scheduling metadata
+    target_ttft_ms: Optional[float] = None
+    target_tpot_ms: Optional[float] = None
+    arrival_time_ms: Optional[float] = None
+
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
 
@@ -644,6 +649,9 @@ class GenerateReqInput(BaseReq):
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
             conversation_id=self.conversation_id,
             priority=self.priority,
+            target_ttft_ms=self.target_ttft_ms,
+            target_tpot_ms=self.target_tpot_ms,
+            arrival_time_ms=self.arrival_time_ms,
             extra_key=self.extra_key,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
@@ -716,6 +724,11 @@ class TokenizedGenerateReqInput(BaseReq):
     # Priority for the request
     priority: Optional[int] = None
 
+    # Sidecar scheduling metadata
+    target_ttft_ms: Optional[float] = None
+    target_tpot_ms: Optional[float] = None
+    arrival_time_ms: Optional[float] = None
+
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
 
@@ -736,6 +749,61 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
+
+
+def apply_slo_target_margin(obj: GenerateReqInput, margin: float) -> None:
+    if margin <= 0:
+        return
+
+    if obj.target_ttft_ms is not None:
+        obj.target_ttft_ms *= 1 - margin
+    if obj.target_tpot_ms is not None:
+        obj.target_tpot_ms *= 1 - margin
+
+
+def build_tokenized_generate_req_input(
+    obj: GenerateReqInput,
+    input_text: str,
+    input_ids: List[int],
+    mm_inputs: dict,
+    sampling_params: SamplingParams,
+    input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None,
+) -> TokenizedGenerateReqInput:
+    session_params = SessionParams(**obj.session_params) if obj.session_params else None
+
+    return TokenizedGenerateReqInput(
+        input_text,
+        input_ids,
+        mm_inputs,
+        sampling_params,
+        obj.return_logprob,
+        obj.logprob_start_len,
+        obj.top_logprobs_num,
+        obj.token_ids_logprob,
+        obj.stream,
+        rid=obj.rid,
+        http_worker_ipc=obj.http_worker_ipc,
+        bootstrap_host=obj.bootstrap_host,
+        bootstrap_port=obj.bootstrap_port,
+        bootstrap_room=obj.bootstrap_room,
+        lora_id=obj.lora_id,
+        input_embeds=input_embeds,
+        session_params=session_params,
+        custom_logit_processor=obj.custom_logit_processor,
+        require_reasoning=obj.require_reasoning,
+        return_hidden_states=obj.return_hidden_states,
+        return_routed_experts=obj.return_routed_experts,
+        routed_dp_rank=obj.routed_dp_rank,
+        disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
+        priority=obj.priority,
+        target_ttft_ms=obj.target_ttft_ms,
+        target_tpot_ms=obj.target_tpot_ms,
+        arrival_time_ms=obj.arrival_time_ms,
+        extra_key=obj.extra_key,
+        routing_key=obj.routing_key,
+        need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
+        num_items_assigned=obj.num_items_assigned,
+    )
 
 
 @dataclass

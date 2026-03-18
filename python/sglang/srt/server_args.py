@@ -340,6 +340,7 @@ class ServerArgs:
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
     max_prefill_tokens: int = 16384
+    slo_target_margin: float = 0.03
     prefill_max_requests: Optional[int] = None
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
@@ -3705,6 +3706,12 @@ class ServerArgs:
             default=ServerArgs.max_prefill_tokens,
             help="The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length."
             + f"\n\n{human_readable_int.__doc__}",
+        )
+        parser.add_argument(
+            "--slo-target-margin",
+            type=float,
+            default=ServerArgs.slo_target_margin,
+            help="Margin subtracted from request TTFT/TPOT targets before they enter the engine-side request pipeline.",
         )
         parser.add_argument(
             "--schedule-policy",

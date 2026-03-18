@@ -1,7 +1,11 @@
 import copy
 import unittest
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import (
+    GenerateReqInput,
+    apply_slo_target_margin,
+    build_tokenized_generate_req_input,
+)
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -257,6 +261,23 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         # Modalities should be set for all 3 examples
         self.assertEqual(req.modalities, ["image", "image", "image"])
+
+    def test_getitem_preserves_sidecar_fields(self):
+        req = GenerateReqInput(
+            text=["Prompt 1", "Prompt 2"],
+            sampling_params=[{}, {}],
+            rid=["id1", "id2"],
+            target_ttft_ms=120.0,
+            target_tpot_ms=45.0,
+            arrival_time_ms=123456.0,
+        )
+
+        req.normalize_batch_and_arguments()
+        item = req[1]
+
+        self.assertEqual(item.target_ttft_ms, 120.0)
+        self.assertEqual(item.target_tpot_ms, 45.0)
+        self.assertEqual(item.arrival_time_ms, 123456.0)
 
     def test_audio_data_handling(self):
         """Test handling of audio_data."""
@@ -575,6 +596,43 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         req = GenerateReqInput(input_embeds=[[0.1, 0.2]])
         req.normalize_batch_and_arguments()
         self.assertTrue(req.is_single)
+
+
+class TestSidecarRequestHelpers(unittest.TestCase):
+    def test_apply_slo_target_margin(self):
+        req = GenerateReqInput(
+            text="Hello",
+            sampling_params={},
+            target_ttft_ms=100.0,
+            target_tpot_ms=50.0,
+        )
+
+        apply_slo_target_margin(req, 0.1)
+
+        self.assertEqual(req.target_ttft_ms, 90.0)
+        self.assertEqual(req.target_tpot_ms, 45.0)
+
+    def test_build_tokenized_generate_req_input_preserves_sidecar_fields(self):
+        req = GenerateReqInput(
+            text="Hello",
+            sampling_params={},
+            rid="rid-1",
+            target_ttft_ms=90.0,
+            target_tpot_ms=45.0,
+            arrival_time_ms=1234.5,
+        )
+
+        tokenized = build_tokenized_generate_req_input(
+            req,
+            "Hello",
+            [1, 2, 3],
+            {},
+            object(),
+        )
+
+        self.assertEqual(tokenized.target_ttft_ms, 90.0)
+        self.assertEqual(tokenized.target_tpot_ms, 45.0)
+        self.assertEqual(tokenized.arrival_time_ms, 1234.5)
 
 
 if __name__ == "__main__":

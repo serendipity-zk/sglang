@@ -54,6 +54,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
+    build_tokenized_generate_req_input,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     EmbeddingReqInput,
@@ -63,12 +64,12 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
-    SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
+    apply_slo_target_margin,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -487,6 +488,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        if isinstance(obj, GenerateReqInput):
+            apply_slo_target_margin(obj, self.server_args.slo_target_margin)
         self._set_default_priority(obj)
         self._validate_rid(obj)
 
@@ -951,39 +954,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
-            session_params = (
-                SessionParams(**obj.session_params) if obj.session_params else None
-            )
-
-            tokenized_obj = TokenizedGenerateReqInput(
+            tokenized_obj = build_tokenized_generate_req_input(
+                obj,
                 input_text,
                 input_ids,
                 mm_inputs,
                 sampling_params,
-                obj.return_logprob,
-                obj.logprob_start_len,
-                obj.top_logprobs_num,
-                obj.token_ids_logprob,
-                obj.stream,
-                rid=obj.rid,
-                http_worker_ipc=obj.http_worker_ipc,
-                bootstrap_host=obj.bootstrap_host,
-                bootstrap_port=obj.bootstrap_port,
-                bootstrap_room=obj.bootstrap_room,
-                lora_id=obj.lora_id,
                 input_embeds=input_embeds,
-                session_params=session_params,
-                custom_logit_processor=obj.custom_logit_processor,
-                require_reasoning=obj.require_reasoning,
-                return_hidden_states=obj.return_hidden_states,
-                return_routed_experts=obj.return_routed_experts,
-                routed_dp_rank=obj.routed_dp_rank,
-                disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
-                priority=obj.priority,
-                extra_key=obj.extra_key,
-                routing_key=obj.routing_key,
-                need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
-                num_items_assigned=obj.num_items_assigned,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
