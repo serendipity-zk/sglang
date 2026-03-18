@@ -147,13 +147,23 @@ Phase 3 status:
 
 ### Phase 4: Scheduler Snapshot Logic
 
-- [ ] Add `scheduler_sidecar_mixin.py`
-- [ ] Port request-to-sidecar conversion selectively from old `sidecar`
-- [ ] Port the three drain points:
+- [x] Add `scheduler_sidecar_mixin.py`
+- [x] Port request-to-sidecar conversion selectively from old `sidecar`
+- [x] Port the three drain points:
   `finished`, `current`, `scheduling`
-- [ ] Verify each drain point against fresh overlap and non-overlap execution paths
+- [x] Verify each drain point against fresh overlap and non-overlap execution paths
 - Testability target:
   each drain path should be exercisable independently with focused scheduler or snapshot-construction tests.
+
+Phase 4 status:
+- Added `python/sglang/srt/managers/scheduler_sidecar_mixin.py` as a strict snapshot-only mixin layer.
+- Ported fresh-compatible `Req` → `RequestInfo` conversion using current upstream state:
+  `swa_evicted_seqlen` is used for eviction tracking and router request fields remain optional/unset when absent.
+- Implemented the three temporal drains:
+  `current`, `finished`, and `scheduling`.
+- Kept tree-cache refresh behavior in scheduling snapshots so waiting/chunked requests expose current `extend_input_len` values before Phase 5 integration.
+- Deliberately did not wire the mixin into `Scheduler` inheritance or event-loop call sites yet; that remains Phase 5 work.
+- Added focused unit coverage for request conversion and each drain path using an isolated fake scheduler instead of the live event loop.
 
 ### Phase 5: Scheduler Integration
 
