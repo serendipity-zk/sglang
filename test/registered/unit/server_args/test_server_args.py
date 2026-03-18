@@ -44,6 +44,20 @@ class TestPrepareServerArgs(CustomTestCase):
         )
         self.assertEqual(server_args.slo_target_margin, 0.15)
 
+    def test_prepare_server_args_with_sidecar_transport_args(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                "--slo-scheduler-addr",
+                "ipc:///tmp/sidecar.sock",
+                "--slo-scheduler-timeout-ms",
+                "75",
+            ]
+        )
+        self.assertEqual(server_args.slo_scheduler_addr, "ipc:///tmp/sidecar.sock")
+        self.assertEqual(server_args.slo_scheduler_timeout_ms, 75)
+
 
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):

@@ -130,12 +130,20 @@ Phase 2 status:
 
 ### Phase 3: Sidecar Transport
 
-- [ ] Add a simplified `slo_scheduler_client.py`
-- [ ] Keep timeout fallback to plain budget scheduling
-- [ ] Keep stale response rejection via `iteration_count`
-- [ ] Drop old fallback probe state machine unless current behavior proves it is needed
+- [x] Add a simplified `slo_scheduler_client.py`
+- [x] Keep timeout fallback to plain budget scheduling
+- [x] Keep stale response rejection via `iteration_count`
+- [x] Drop old fallback probe state machine unless current behavior proves it is needed
 - Testability target:
   add a transport-level roundtrip or mocked client test before integrating it into the live scheduler.
+
+Phase 3 status:
+- Added `python/sglang/srt/managers/slo_scheduler_client.py` as a minimal DEALER transport client that imports sidecar serialization lazily at call time.
+- Added `--slo-scheduler-addr` and `--slo-scheduler-timeout-ms` back to `server_args.py` so the transport can be configured before scheduler integration lands.
+- Timeout/error behavior currently falls back by returning `None`, which preserves the intended "plain upstream budget scheduling" fallback once the scheduler starts calling the client.
+- Stale responses are drained and rejected by comparing `decision.iteration_count` against the expected iteration.
+- The old consecutive-failure fallback probe state machine was intentionally not ported.
+- Focused unit coverage now exists for exact-match roundtrip, stale-decision rejection, timeout fallback, close behavior, and server-args parsing.
 
 ### Phase 4: Scheduler Snapshot Logic
 

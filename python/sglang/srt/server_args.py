@@ -341,6 +341,8 @@ class ServerArgs:
     enable_dynamic_chunking: bool = False
     max_prefill_tokens: int = 16384
     slo_target_margin: float = 0.03
+    slo_scheduler_addr: Optional[str] = None
+    slo_scheduler_timeout_ms: int = 50
     prefill_max_requests: Optional[int] = None
     schedule_policy: str = "fcfs"
     enable_priority_scheduling: bool = False
@@ -3712,6 +3714,18 @@ class ServerArgs:
             type=float,
             default=ServerArgs.slo_target_margin,
             help="Margin subtracted from request TTFT/TPOT targets before they enter the engine-side request pipeline.",
+        )
+        parser.add_argument(
+            "--slo-scheduler-addr",
+            type=str,
+            default=ServerArgs.slo_scheduler_addr,
+            help="ZMQ address for the external sidecar scheduler DEALER client, for example ipc:///tmp/sglang_slo_scheduler_0.sock.",
+        )
+        parser.add_argument(
+            "--slo-scheduler-timeout-ms",
+            type=int,
+            default=ServerArgs.slo_scheduler_timeout_ms,
+            help="Timeout for sidecar scheduler responses. On timeout the engine falls back to its normal internal prefill budgeting path.",
         )
         parser.add_argument(
             "--schedule-policy",
