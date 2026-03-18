@@ -17,6 +17,12 @@ logger = logging.getLogger(__name__)
 class SchedulerSidecarMixin:
     """Build sidecar snapshot state without wiring it into the live loop yet."""
 
+    def _get_router_ack_state(self: "Scheduler"):
+        tracker = getattr(self, "router_ack_tracker", None)
+        if tracker is None:
+            return None, None
+        return tracker.get_state()
+
     def init_sidecar(self: "Scheduler", _server_args) -> None:
         if getattr(_server_args, "slo_scheduler_addr", None):
             from sglang.srt.managers.slo_scheduler_client import SLOSchedulerClient
@@ -45,15 +51,6 @@ class SchedulerSidecarMixin:
         if self.slo_client is None or self._pending_scheduling is None:
             return
 
-        if (
-            self._pending_finished is None
-            and self._pending_current is None
-            and self.chunked_req is None
-            and len(self.waiting_queue) == 0
-            and (self.running_batch is None or self.running_batch.is_empty())
-        ):
-            return
-
         finished = self._pending_finished or FinishedIterationData(
             iteration_count=self.iteration_count,
             batch_size_tokens=0,
@@ -62,6 +59,7 @@ class SchedulerSidecarMixin:
             forward_mode="DECODE",
             actual_time_ms=0.0,
         )
+        ack_gen, ack_last_id = self._get_router_ack_state()
         current = self._pending_current or CurrentSnapshot(
             iteration_count=self.iteration_count,
             timestamp_ms=time.time() * 1000,
@@ -74,8 +72,8 @@ class SchedulerSidecarMixin:
             kv_tokens_used=self._get_token_info()[0],
             kv_capacity=self.max_total_num_tokens,
             running_requests=[],
-            router_generation=None,
-            router_last_ack_id=None,
+            router_generation=ack_gen,
+            router_last_ack_id=ack_last_id,
         )
 
         state = EngineState(
@@ -164,6 +162,7 @@ class SchedulerSidecarMixin:
 
         num_used = self._get_token_info()[0]
         pairs = self._build_prefill_chunk_pairs(batch)
+        ack_gen, ack_last_id = self._get_router_ack_state()
 
         self._pending_current = CurrentSnapshot(
             iteration_count=iteration_count,
@@ -176,8 +175,8 @@ class SchedulerSidecarMixin:
             forward_mode=batch.forward_mode.name,
             batch_size_tokens=self._compute_batch_size_tokens(batch),
             prefill_chunk_pairs=[[chunk, cumulative] for _, chunk, cumulative in pairs],
-            router_generation=None,
-            router_last_ack_id=None,
+            router_generation=ack_gen,
+            router_last_ack_id=ack_last_id,
         )
 
     def _drain_finished_iteration(

@@ -207,6 +207,8 @@ class GenerateReqInput(BaseReq):
     target_ttft_ms: Optional[float] = None
     target_tpot_ms: Optional[float] = None
     arrival_time_ms: Optional[float] = None
+    router_generation: Optional[int] = None
+    router_message_id: Optional[int] = None
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
@@ -728,6 +730,8 @@ class TokenizedGenerateReqInput(BaseReq):
     target_ttft_ms: Optional[float] = None
     target_tpot_ms: Optional[float] = None
     arrival_time_ms: Optional[float] = None
+    router_generation: Optional[int] = None
+    router_message_id: Optional[int] = None
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
@@ -799,6 +803,8 @@ def build_tokenized_generate_req_input(
         target_ttft_ms=obj.target_ttft_ms,
         target_tpot_ms=obj.target_tpot_ms,
         arrival_time_ms=obj.arrival_time_ms,
+        router_generation=obj.router_generation,
+        router_message_id=obj.router_message_id,
         extra_key=obj.extra_key,
         routing_key=obj.routing_key,
         need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,

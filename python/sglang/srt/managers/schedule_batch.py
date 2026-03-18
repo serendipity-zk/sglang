@@ -522,6 +522,8 @@ class Req(ReqDllmMixin):
         target_ttft_ms: Optional[float] = None,
         target_tpot_ms: Optional[float] = None,
         arrival_time_ms: Optional[float] = None,
+        router_generation: Optional[int] = None,
+        router_message_id: Optional[int] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
         time_stats: Optional[
@@ -620,6 +622,8 @@ class Req(ReqDllmMixin):
         self.target_ttft_ms = target_ttft_ms
         self.target_tpot_ms = target_tpot_ms
         self.arrival_time_ms = arrival_time_ms
+        self.router_generation = router_generation
+        self.router_message_id = router_message_id
         self.slo_violated: bool = False
 
         # For incremental decoding

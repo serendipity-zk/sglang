@@ -171,6 +171,26 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
         self.assertIsNone(scheduler._pending_current)
         self.assertEqual(scheduler._last_sidecar_decision.max_prefill_tokens, 77)
 
+    def test_assemble_and_send_engine_state_reports_idle_state(self):
+        scheduler = FakeScheduler()
+        scheduler.slo_client = FakeClient(
+            decision=SimpleNamespace(iteration_count=5, max_prefill_tokens=64)
+        )
+        scheduler._pending_scheduling = SchedulingContext(
+            iteration_count=5,
+            scheduling_time_ms=1.0,
+        )
+
+        scheduler._assemble_and_send_engine_state()
+
+        self.assertEqual(len(scheduler.slo_client.calls), 1)
+        state, current_iteration = scheduler.slo_client.calls[0]
+        self.assertEqual(current_iteration, 5)
+        self.assertEqual(state.finished.actual_time_ms, 0.0)
+        self.assertEqual(state.current.num_running_requests, 0)
+        self.assertEqual(state.current.num_waiting_requests, 0)
+        self.assertEqual(state.current.kv_tokens_used, 33)
+
     def test_get_effective_max_prefill_tokens_prefers_matching_sidecar_decision(self):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_prefill_tokens = 16384
@@ -180,6 +200,55 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
 
         self.assertEqual(scheduler._get_effective_max_prefill_tokens(9), 512)
         self.assertEqual(scheduler._get_effective_max_prefill_tokens(10), 16384)
+
+    def test_should_skip_prefill_for_sidecar_decision_abandons_chunked_request(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler._last_sidecar_decision = SimpleNamespace(
+            iteration_count=9,
+            max_prefill_tokens=0,
+            decode_only_iteration=True,
+        )
+        scheduler.tree_cache = SimpleNamespace(dec_lock_ref=lambda node, params=None: None)
+        requeued = []
+        scheduler._add_request_to_queue = (
+            lambda req, is_retracted=False: requeued.append((req, is_retracted))
+        )
+
+        req = Req(
+            rid="chunked",
+            origin_input_text="hello",
+            origin_input_ids=[1, 2],
+            sampling_params=SamplingParams(max_new_tokens=4),
+            time_stats=SchedulerReqTimeStats(),
+        )
+        req.last_node = object()
+        req.is_chunked = 1
+        scheduler.chunked_req = req
+
+        skipped = Scheduler._should_skip_prefill_for_sidecar_decision(scheduler, 9)
+
+        self.assertTrue(skipped)
+        self.assertIsNone(scheduler.chunked_req)
+        self.assertTrue(req.is_retracted)
+        self.assertEqual(requeued, [(req, True)])
+
+    def test_normalize_sidecar_arrival_time_fills_missing_value(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        recv_req = SimpleNamespace(arrival_time_ms=None)
+
+        with patch("sglang.srt.managers.scheduler.time.time", return_value=12.5):
+            Scheduler._normalize_sidecar_arrival_time(scheduler, recv_req)
+
+        self.assertEqual(recv_req.arrival_time_ms, 12500.0)
+
+    def test_normalize_sidecar_arrival_time_keeps_existing_value(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        recv_req = SimpleNamespace(arrival_time_ms=321.0)
+
+        with patch("sglang.srt.managers.scheduler.time.time", return_value=12.5):
+            Scheduler._normalize_sidecar_arrival_time(scheduler, recv_req)
+
+        self.assertEqual(recv_req.arrival_time_ms, 321.0)
 
     def test_add_request_to_queue_counts_marked_generate_request(self):
         scheduler = Scheduler.__new__(Scheduler)

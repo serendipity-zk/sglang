@@ -170,6 +170,7 @@ from sglang.srt.managers.scheduler_sidecar_mixin import SchedulerSidecarMixin
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
+from sglang.srt.managers.router_message_tracker import RouterMessageAckTracker
 from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -332,6 +333,7 @@ class Scheduler(
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
+        self.router_ack_tracker = RouterMessageAckTracker()
 
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -1653,6 +1655,19 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        if not self.router_ack_tracker.record(
+            recv_req.router_generation, recv_req.router_message_id
+        ):
+            logger.info(
+                "Dropping duplicate request: rid=%s, generation=%s, message_id=%s",
+                recv_req.rid,
+                recv_req.router_generation,
+                recv_req.router_message_id,
+            )
+            return
+
+        self._normalize_sidecar_arrival_time(recv_req)
+
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -1701,6 +1716,8 @@ class Scheduler(
                 target_ttft_ms=recv_req.target_ttft_ms,
                 target_tpot_ms=recv_req.target_tpot_ms,
                 arrival_time_ms=recv_req.arrival_time_ms,
+                router_generation=recv_req.router_generation,
+                router_message_id=recv_req.router_message_id,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
@@ -2085,6 +2102,51 @@ class Scheduler(
     def stash_chunked_request(self, req: Req):
         self.tree_cache.cache_unfinished_req(req, chunked=True)
 
+    def _normalize_sidecar_arrival_time(
+        self, recv_req: TokenizedGenerateReqInput
+    ) -> None:
+        if getattr(recv_req, "arrival_time_ms", None) is None:
+            recv_req.arrival_time_ms = time.time() * 1000.0
+
+    def _get_matching_sidecar_decision(self, scheduling_iteration: int):
+        decision = getattr(self, "_last_sidecar_decision", None)
+        if decision is None:
+            return None
+        if decision.iteration_count != scheduling_iteration:
+            return None
+        return decision
+
+    def _abandon_chunked_prefill(self, requeue: bool = True) -> None:
+        if self.chunked_req is None:
+            return
+
+        from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
+
+        req = self.chunked_req
+        if req.last_node is not None:
+            params = None
+            if req.swa_uuid_for_lock is not None:
+                params = DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
+            self.tree_cache.dec_lock_ref(req.last_node, params)
+
+        req.reset_for_retract()
+        if requeue:
+            self._add_request_to_queue(req, is_retracted=True)
+
+        self.chunked_req = None
+
+    def _should_skip_prefill_for_sidecar_decision(
+        self, scheduling_iteration: int
+    ) -> bool:
+        decision = self._get_matching_sidecar_decision(scheduling_iteration)
+        if decision is None:
+            return False
+        if not decision.decode_only_iteration and decision.max_prefill_tokens > 0:
+            return False
+
+        self._abandon_chunked_prefill()
+        return True
+
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
@@ -2205,9 +2267,9 @@ class Scheduler(
         return ret
 
     def _get_effective_max_prefill_tokens(self, scheduling_iteration: int) -> int:
-        if self._last_sidecar_decision is not None:
-            if self._last_sidecar_decision.iteration_count == scheduling_iteration:
-                return self._last_sidecar_decision.max_prefill_tokens
+        decision = self._get_matching_sidecar_decision(scheduling_iteration)
+        if decision is not None:
+            return decision.max_prefill_tokens
         return self.max_prefill_tokens
 
     def _get_new_batch_prefill_raw(
@@ -2225,6 +2287,10 @@ class Scheduler(
         if self.enable_priority_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
+
+        scheduling_iteration = self.iteration_count + 1
+        if self._should_skip_prefill_for_sidecar_decision(scheduling_iteration):
+            return None
 
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
