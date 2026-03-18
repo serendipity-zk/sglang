@@ -28,8 +28,15 @@ impl SchedulerFactory {
         match config {
             SchedulerConfig::Eager => Arc::new(EagerScheduler::new()),
             SchedulerConfig::Gated => Arc::new(GatedScheduler::new()),
-            SchedulerConfig::SloAware { tpot_buckets, worker_selection_policy, auto_scaling, initial_tier_allocation, send_tpot_updates } => {
-                let policy = worker_selection_policy.clone()
+            SchedulerConfig::SloAware {
+                tpot_buckets,
+                worker_selection_policy,
+                auto_scaling,
+                initial_tier_allocation,
+                send_tpot_updates,
+            } => {
+                let policy = worker_selection_policy
+                    .clone()
                     .unwrap_or(WorkerSelectionPolicy::FirstAvailable);
                 Arc::new(SloAwareScheduler::new(
                     policy_registry,
@@ -41,7 +48,7 @@ impl SchedulerFactory {
                     sidecar_urls,
                     stats_mode,
                 ))
-            },
+            }
         }
     }
 

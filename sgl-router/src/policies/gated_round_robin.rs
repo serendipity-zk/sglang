@@ -33,6 +33,10 @@ impl GatedRoundRobinPolicy {
 
     /// Check if worker has pending work (queued + pending dispatches)
     fn has_pending_work(&self, worker: &dyn Worker) -> bool {
+        if worker.has_send_gap() {
+            return true;
+        }
+
         // Check worker-reported queue size
         let queue_size = if let Ok(stats) = self.worker_stats.read() {
             if let Some(worker_stats) = stats.get(worker.url()) {
@@ -47,7 +51,12 @@ impl GatedRoundRobinPolicy {
         // Check router-tracked pending messages
         let pending_messages = worker.pending_message_count();
 
-        tracing::warn!("worker {} has pending work: queue_size={}, pending_messages={}", worker.url(), queue_size, pending_messages);
+        tracing::warn!(
+            "worker {} has pending work: queue_size={}, pending_messages={}",
+            worker.url(),
+            queue_size,
+            pending_messages
+        );
         // Worker is busy if either queue has work or pending messages exist
         (queue_size + pending_messages as i64) > 0
     }
@@ -315,7 +324,11 @@ mod tests {
 
         // Second selection should return worker2 (index 1) because worker1 is busy
         let result2 = policy.select_worker(&workers, None);
-        assert_eq!(result2, Some(1), "Second selection should return worker2, not worker1");
+        assert_eq!(
+            result2,
+            Some(1),
+            "Second selection should return worker2, not worker1"
+        );
 
         // Add pending message to worker2 as well
         let msg_id = worker2.next_message_id();
@@ -331,6 +344,9 @@ mod tests {
 
         // Now both workers are busy, should defer
         let result3 = policy.select_worker(&workers, None);
-        assert_eq!(result3, None, "Should defer when all workers have pending work");
+        assert_eq!(
+            result3, None,
+            "Should defer when all workers have pending work"
+        );
     }
 }

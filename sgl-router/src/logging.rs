@@ -138,7 +138,12 @@ pub fn init_logging(config: LoggingConfig) -> LogGuard {
             }
         }
 
-        match OpenOptions::new().create(true).write(true).truncate(true).open(&path_buf) {
+        match OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path_buf)
+        {
             Ok(file) => {
                 let (non_blocking, guard) = tracing_appender::non_blocking(file);
                 file_guard = Some(guard);

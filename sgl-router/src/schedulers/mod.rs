@@ -66,6 +66,7 @@ pub trait SchedulerBase: Send + Sync + Debug + 'static {
             let input_token_count = request
                 .input_token_count
                 .unwrap_or_else(|| (request.text.len() / 4) as i64);
+            let pending_before = worker.pending_message_count();
             let add_pending_start = std::time::Instant::now();
             worker.add_pending_message(PendingMessage::new(
                 msg_id,
@@ -75,10 +76,21 @@ pub trait SchedulerBase: Send + Sync + Debug + 'static {
                 request.body_json.clone(),
                 input_token_count,
             ));
+            let pending_after = worker.pending_message_count();
             let add_pending_us = add_pending_start.elapsed().as_micros() as u64;
             if add_pending_us > 500 {
                 tracing::warn!("add_pending_message took {}us", add_pending_us);
             }
+            tracing::info!(
+                "[ROUTER_MSG_ENQUEUE] worker={} route={} gen={} msg_id={} pending_before={} pending_after={} input_tokens={}",
+                worker.url(),
+                request.route,
+                gen,
+                msg_id,
+                pending_before,
+                pending_after,
+                input_token_count,
+            );
 
             (Some(msg_id), Some(gen))
         } else {
@@ -93,7 +105,11 @@ pub trait SchedulerBase: Send + Sync + Debug + 'static {
 
         let total_us = dispatch_fn_start.elapsed().as_micros() as u64;
         if total_us > 500 {
-            tracing::warn!("dispatch_to_worker total={}us (spawn={}us)", total_us, spawn_us);
+            tracing::warn!(
+                "dispatch_to_worker total={}us (spawn={}us)",
+                total_us,
+                spawn_us
+            );
         }
     }
 
@@ -106,6 +122,9 @@ pub trait SchedulerBase: Send + Sync + Debug + 'static {
         worker_url: &str,
         is_stream: bool,
         load_incremented: bool,
+        request_id: Option<&str>,
+        message_id: Option<i64>,
+        generation: Option<i64>,
     ) -> Response {
         send_http_request_impl(
             config,
@@ -115,6 +134,9 @@ pub trait SchedulerBase: Send + Sync + Debug + 'static {
             worker_url,
             is_stream,
             load_incremented,
+            request_id,
+            message_id,
+            generation,
         )
         .await
     }
@@ -207,13 +229,13 @@ async fn process_pending<S: SchedulerBase + ?Sized>(
         model_id,
         is_stream,
         text: _,
-        request_id: _,
+        request_id,
         enqueue_started: _,
         arrival_time_ms,
         response_tx,
         target_ttft_ms: _,
         target_tpot_ms: _,
-        input_token_count: _,
+        input_token_count,
     } = pending;
 
     let start = Instant::now();
@@ -229,6 +251,8 @@ async fn process_pending<S: SchedulerBase + ?Sized>(
         worker,
         message_id,
         generation,
+        request_id.as_str(),
+        input_token_count,
         arrival_time_ms,
     )
     .await;
@@ -309,12 +333,17 @@ async fn dispatch_request<S: SchedulerBase + ?Sized>(
     worker: Arc<dyn Worker>,
     message_id: Option<i64>,
     generation: Option<i64>,
+    request_id: &str,
+    input_token_count: Option<i64>,
     arrival_time_ms: f64,
 ) -> Response {
     tracing::debug!(
-        "Selected worker for model: {} worker_url={}",
+        "Selected worker for model: {} worker_url={} req_id={} gen={:?} msg_id={:?}",
         model_id.unwrap_or("default"),
-        worker.url()
+        worker.url(),
+        request_id,
+        generation,
+        message_id
     );
 
     // Increment pending dispatch counter - will be reset when worker stats arrive
@@ -337,6 +366,26 @@ async fn dispatch_request<S: SchedulerBase + ?Sized>(
     let request_payload =
         prepare_request_payload(route, body_json, message_id, generation, arrival_time_ms);
 
+    if route == "/generate" {
+        tracing::info!(
+            "[ROUTER_MSG_DISPATCH] worker={} route={} req_id={} gen={:?} msg_id={:?} stream={} pending_before_send={} input_tokens={:?}",
+            worker.url(),
+            route,
+            request_id,
+            generation,
+            message_id,
+            is_stream,
+            worker.pending_message_count(),
+            input_token_count,
+        );
+    }
+
+    let request_id = if request_id.is_empty() {
+        None
+    } else {
+        Some(request_id)
+    };
+
     let response = scheduler
         .send_http_request(
             config,
@@ -346,6 +395,9 @@ async fn dispatch_request<S: SchedulerBase + ?Sized>(
             worker.url(),
             is_stream,
             load_incremented,
+            request_id,
+            message_id,
+            generation,
         )
         .await;
 
@@ -362,7 +414,11 @@ async fn send_http_request_impl(
     worker_url: &str,
     is_stream: bool,
     load_incremented: bool,
+    request_id: Option<&str>,
+    message_id: Option<i64>,
+    generation: Option<i64>,
 ) -> Response {
+    let is_generate = route == "/generate";
     let mut request_builder = if config.dp_aware {
         let (worker_url_prefix, dp_rank) =
             match crate::routers::http::router::Router::extract_dp_rank(worker_url) {
@@ -417,13 +473,72 @@ async fn send_http_request_impl(
     let res = match request_builder.send().await {
         Ok(res) => res,
         Err(e) => {
+            let worker = config.worker_registry.get_by_url(worker_url);
+            let pending_after_error = worker.as_ref().map(|w| w.pending_message_count());
             error!(
-                "Failed to send typed request worker_url={} route={} error={}",
-                worker_url, route, e
+                "[ROUTER_MSG_SEND_ERROR] worker={} route={} req_id={:?} gen={:?} msg_id={:?} pending_after_error={:?} error={}",
+                worker_url,
+                route,
+                request_id,
+                generation,
+                message_id,
+                pending_after_error,
+                e
             );
 
+            if is_generate {
+                if let (Some(worker), Some(gen), Some(msg_id)) =
+                    (worker.clone(), generation, message_id)
+                {
+                    match worker.remove_pending_message(gen, msg_id) {
+                        Some(failed_message) => {
+                            let opened = worker.open_send_gap(failed_message.clone());
+                            if opened {
+                                let pending_after_gap = worker.pending_message_count();
+                                RouterMetrics::set_pending_messages(worker_url, pending_after_gap);
+                                RouterMetrics::record_gap_open(worker_url);
+                                RouterMetrics::set_gap_active(worker_url, true);
+                                tracing::info!(
+                                    "[ROUTER_GAP_OPEN] worker={} route={} req_id={:?} gen={} msg_id={} pending_after_gap={}",
+                                    worker_url,
+                                    route,
+                                    request_id,
+                                    gen,
+                                    msg_id,
+                                    pending_after_gap,
+                                );
+                            } else {
+                                worker.add_pending_message(failed_message);
+                                RouterMetrics::set_pending_messages(
+                                    worker_url,
+                                    worker.pending_message_count(),
+                                );
+                                warn!(
+                                    "[ROUTER_GAP_OPEN_SKIPPED] worker={} route={} req_id={:?} gen={} msg_id={} reason=gap_already_active",
+                                    worker_url,
+                                    route,
+                                    request_id,
+                                    gen,
+                                    msg_id,
+                                );
+                            }
+                        }
+                        None => {
+                            warn!(
+                                "[ROUTER_GAP_OPEN_SKIPPED] worker={} route={} req_id={:?} gen={} msg_id={} reason=pending_not_found",
+                                worker_url,
+                                route,
+                                request_id,
+                                gen,
+                                msg_id,
+                            );
+                        }
+                    }
+                }
+            }
+
             if load_incremented {
-                if let Some(worker) = config.worker_registry.get_by_url(worker_url) {
+                if let Some(worker) = worker {
                     worker.decrement_load();
                     RouterMetrics::set_running_requests(worker_url, worker.load());
                 }
@@ -439,6 +554,32 @@ async fn send_http_request_impl(
 
     let status =
         StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+    if is_generate {
+        if status.is_success() {
+            tracing::info!(
+                "[ROUTER_MSG_HTTP_STATUS] worker={} route={} req_id={:?} gen={:?} msg_id={:?} stream={} status={}",
+                worker_url,
+                route,
+                request_id,
+                generation,
+                message_id,
+                is_stream,
+                status
+            );
+        } else {
+            warn!(
+                "[ROUTER_MSG_HTTP_STATUS] worker={} route={} req_id={:?} gen={:?} msg_id={:?} stream={} status={}",
+                worker_url,
+                route,
+                request_id,
+                generation,
+                message_id,
+                is_stream,
+                status
+            );
+        }
+    }
 
     if !is_stream {
         let response_headers = header_utils::preserve_response_headers(res.headers());
@@ -607,7 +748,8 @@ mod tests {
             512, // default token count for tests
         ));
 
-        let payload = prepare_request_payload("/generate", &body, Some(message_id), Some(generation), 0.0);
+        let payload =
+            prepare_request_payload("/generate", &body, Some(message_id), Some(generation), 0.0);
         let value = payload.as_ref();
 
         // First message from this worker should have ID 0
@@ -616,7 +758,10 @@ mod tests {
             Some(0)
         );
         // Should have a valid generation (ROUTER_GENERATION)
-        assert!(value.get("router_generation").and_then(|v| v.as_i64()).is_some());
+        assert!(value
+            .get("router_generation")
+            .and_then(|v| v.as_i64())
+            .is_some());
         assert_eq!(worker.pending_message_count(), 1);
     }
 
@@ -647,7 +792,8 @@ mod tests {
         // Even with message_id/generation, non-object bodies should be rejected
         let message_id = worker.next_message_id();
         let generation = worker.generation();
-        let payload = prepare_request_payload("/generate", &body, Some(message_id), Some(generation), 0.0);
+        let payload =
+            prepare_request_payload("/generate", &body, Some(message_id), Some(generation), 0.0);
         let value = payload.as_ref();
 
         assert!(value.get("router_message_id").is_none());

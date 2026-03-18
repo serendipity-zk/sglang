@@ -2,7 +2,7 @@
 //!
 //! Provides centralized registry for workers with model-based indexing
 
-use crate::core::{resend_message, ConnectionMode, Worker, WorkerStats, WorkerType};
+use crate::core::{resend_message, send_gap_message_once, ConnectionMode, Worker, WorkerStats, WorkerType};
 use crate::metrics::RouterMetrics;
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -14,6 +14,8 @@ use uuid::Uuid;
 const PENDING_MESSAGE_TTL: Duration = Duration::from_secs(60);
 /// Interval for checking and resending unacknowledged messages (50ms)
 const RESEND_CHECK_INTERVAL_MS: u64 = 50;
+/// Interval for checking active send-gap recovery retries.
+const GAP_RECOVERY_CHECK_INTERVAL_MS: u64 = 50;
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -338,7 +340,7 @@ impl WorkerRegistry {
                 }
 
                 // Check health if required
-                if healthy_only && !w.is_healthy() {
+                if healthy_only && (!w.is_healthy() || w.has_send_gap()) {
                     return false;
                 }
 
@@ -446,11 +448,12 @@ impl WorkerRegistry {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
         let workers_ref = self.workers.clone();
+        let worker_stats_ref = self.worker_stats.clone();
 
         let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(
-                RESEND_CHECK_INTERVAL_MS,
-            ));
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_millis(RESEND_CHECK_INTERVAL_MS));
+            let mut last_pending_summary_log = Instant::now();
 
             loop {
                 interval.tick().await;
@@ -477,6 +480,127 @@ impl WorkerRegistry {
                         worker.mark_resent(message.message_id);
                     }
                 }
+
+                if last_pending_summary_log.elapsed() >= Duration::from_secs(1) {
+                    Self::log_pending_summary(&workers, &worker_stats_ref);
+                    last_pending_summary_log = Instant::now();
+                }
+            }
+        });
+
+        crate::core::HealthChecker::new(handle, shutdown)
+    }
+
+    fn next_generation_id() -> i64 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        i64::try_from(now_ms).unwrap_or(i64::MAX)
+    }
+
+    /// Start targeted recovery for workers that hit send-gaps.
+    /// This retries only the specific missing message ID and resets worker generation
+    /// if retries are exhausted.
+    pub fn start_gap_recovery_checker(&self) -> crate::core::HealthChecker {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let workers_ref = self.workers.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(
+                GAP_RECOVERY_CHECK_INTERVAL_MS,
+            ));
+
+            loop {
+                interval.tick().await;
+
+                if shutdown_clone.load(Ordering::Acquire) {
+                    tracing::debug!("Registry gap recovery checker shutting down");
+                    break;
+                }
+
+                let workers: Vec<Arc<dyn crate::core::Worker>> = workers_ref
+                    .iter()
+                    .map(|entry| entry.value().clone())
+                    .collect();
+
+                for worker in &workers {
+                    let Some(gap) = worker.send_gap_status() else {
+                        RouterMetrics::set_gap_active(worker.url(), false);
+                        continue;
+                    };
+
+                    RouterMetrics::set_gap_active(worker.url(), true);
+
+                    if gap.message.resend_count >= crate::core::MAX_RESEND_ATTEMPTS {
+                        let old_generation = worker.generation();
+                        let new_generation = Self::next_generation_id();
+                        let gap_age = gap.message.timestamp.elapsed();
+                        let (pending_removed, had_gap) = worker.reset_generation(new_generation);
+                        RouterMetrics::set_gap_active(worker.url(), false);
+                        RouterMetrics::record_gap_reset(worker.url());
+                        RouterMetrics::record_gap_blocked_duration(worker.url(), gap_age);
+                        tracing::warn!(
+                            "[ROUTER_GAP_RESET] worker={} old_gen={} new_gen={} gap_msg_id={} attempts={} pending_removed={} had_gap={} blocked_ms={}",
+                            worker.url(),
+                            old_generation,
+                            new_generation,
+                            gap.message.message_id,
+                            gap.message.resend_count,
+                            pending_removed,
+                            had_gap,
+                            gap_age.as_millis(),
+                        );
+                        continue;
+                    }
+
+                    if !gap.message.should_resend() {
+                        continue;
+                    }
+
+                    let status = send_gap_message_once(worker.url(), &gap.message).await;
+                    worker.mark_send_gap_resent();
+                    match status {
+                        Ok(code) => {
+                            if code.is_success() {
+                                RouterMetrics::record_gap_retry(worker.url(), "success");
+                                tracing::info!(
+                                    "[ROUTER_GAP_RETRY] worker={} gen={} msg_id={} attempt={} status={}",
+                                    worker.url(),
+                                    gap.message.generation,
+                                    gap.message.message_id,
+                                    gap.message.resend_count + 1,
+                                    code,
+                                );
+                            } else {
+                                RouterMetrics::record_gap_retry(worker.url(), "http_error");
+                                tracing::warn!(
+                                    "[ROUTER_GAP_RETRY] worker={} gen={} msg_id={} attempt={} status={}",
+                                    worker.url(),
+                                    gap.message.generation,
+                                    gap.message.message_id,
+                                    gap.message.resend_count + 1,
+                                    code,
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            RouterMetrics::record_gap_retry(worker.url(), "transport_error");
+                            tracing::warn!(
+                                "[ROUTER_GAP_RETRY] worker={} gen={} msg_id={} attempt={} error={}",
+                                worker.url(),
+                                gap.message.generation,
+                                gap.message.message_id,
+                                gap.message.resend_count + 1,
+                                error,
+                            );
+                        }
+                    }
+                }
             }
         });
 
@@ -486,15 +610,125 @@ impl WorkerRegistry {
     /// Update worker stats for a given worker URL
     pub fn update_stats(&self, worker_url: &str, stats: WorkerStats) {
         if let Some(worker) = self.get_by_url(worker_url) {
-            if let (Some(generation), Some(last_id)) =
-                (stats.router_generation, stats.last_received_message_id)
-            {
+            let pending_before = worker.pending_message_count();
+            let worker_generation = worker.generation();
+            let ack_generation = stats.router_generation;
+            let ack_last_id = stats.last_received_message_id;
+            let mut removed_count = 0usize;
+            let mut gap_cleared = false;
+
+            if let Some(gap) = worker.send_gap_status() {
+                if let (Some(ack_gen), Some(ack_last)) = (ack_generation, ack_last_id) {
+                    if (ack_gen == gap.message.generation && ack_last >= gap.message.message_id)
+                        || ack_gen > gap.message.generation
+                    {
+                        let gap_age = gap.message.timestamp.elapsed();
+                        worker.clear_send_gap();
+                        RouterMetrics::set_gap_active(worker.url(), false);
+                        RouterMetrics::record_gap_recovered(worker.url());
+                        RouterMetrics::record_gap_blocked_duration(worker.url(), gap_age);
+                        tracing::info!(
+                            "[ROUTER_GAP_RECOVERED] worker={} gen={} msg_id={} ack_gen={} ack_last_id={} blocked_ms={}",
+                            worker.url(),
+                            gap.message.generation,
+                            gap.message.message_id,
+                            ack_gen,
+                            ack_last,
+                            gap_age.as_millis(),
+                        );
+                        gap_cleared = true;
+                    }
+                }
+            }
+
+            if let (Some(generation), Some(last_id)) = (ack_generation, ack_last_id) {
                 let now = Instant::now();
                 let removed = worker.remove_messages_up_to(generation, last_id);
+                removed_count = removed.len();
                 for message in removed.iter() {
                     let latency = now.saturating_duration_since(message.timestamp);
                     RouterMetrics::record_message_ack(worker.url(), latency);
                 }
+            }
+
+            let pending_after = worker.pending_message_count();
+            if pending_before > 0 || removed_count > 0 {
+                tracing::info!(
+                    "[WORKER_ACK_APPLY] worker={} iter={} ack_gen={:?} ack_last_id={:?} pending_before={} removed={} pending_after={} num_reqs={} queue={}",
+                    worker.url(),
+                    stats.iteration_num,
+                    ack_generation,
+                    ack_last_id,
+                    pending_before,
+                    removed_count,
+                    pending_after,
+                    stats.num_requests,
+                    stats.waiting_queue_size,
+                );
+            }
+            if gap_cleared {
+                tracing::info!(
+                    "[WORKER_GAP_CLEAR_APPLY] worker={} iter={} pending_after={} ack_gen={:?} ack_last_id={:?}",
+                    worker.url(),
+                    stats.iteration_num,
+                    pending_after,
+                    ack_generation,
+                    ack_last_id,
+                );
+            }
+
+            if pending_before > 0 {
+                if ack_generation.is_none() || ack_last_id.is_none() {
+                    tracing::info!(
+                        "[WORKER_ACK_MISSING_WITH_PENDING] worker={} iter={} pending_before={} worker_gen={} ack_gen={:?} ack_last_id={:?}",
+                        worker.url(),
+                        stats.iteration_num,
+                        pending_before,
+                        worker_generation,
+                        ack_generation,
+                        ack_last_id,
+                    );
+                }
+
+                if let Some(ack_gen) = ack_generation {
+                    if ack_gen != worker_generation {
+                        tracing::info!(
+                            "[WORKER_ACK_GENERATION_MISMATCH] worker={} iter={} pending_before={} worker_gen={} ack_gen={} ack_last_id={:?}",
+                            worker.url(),
+                            stats.iteration_num,
+                            pending_before,
+                            worker_generation,
+                            ack_gen,
+                            ack_last_id,
+                        );
+                    }
+                }
+
+                if ack_generation.is_some() && ack_last_id.is_some() && removed_count == 0 {
+                    tracing::info!(
+                        "[WORKER_ACK_NO_PROGRESS] worker={} iter={} pending_before={} pending_after={} worker_gen={} ack_gen={:?} ack_last_id={:?} num_reqs={} queue={}",
+                        worker.url(),
+                        stats.iteration_num,
+                        pending_before,
+                        pending_after,
+                        worker_generation,
+                        ack_generation,
+                        ack_last_id,
+                        stats.num_requests,
+                        stats.waiting_queue_size,
+                    );
+                }
+            }
+
+            if stats.num_requests == 0 && stats.waiting_queue_size == 0 && pending_after > 0 {
+                tracing::debug!(
+                    "[WORKER_IDLE_BLOCKED_PENDING] worker={} iter={} pending={} ack_gen={:?} ack_last_id={:?}",
+                    worker.url(),
+                    stats.iteration_num,
+                    pending_after,
+                    ack_generation,
+                    ack_last_id,
+                );
             }
 
             RouterMetrics::set_pending_messages(worker.url(), worker.pending_message_count());
@@ -506,6 +740,67 @@ impl WorkerRegistry {
     fn cleanup_pending_for_workers(workers: &[Arc<dyn Worker>], ttl: Duration) {
         for worker in workers {
             worker.cleanup_pending_messages(ttl);
+        }
+    }
+
+    fn log_pending_summary(
+        workers: &[Arc<dyn Worker>],
+        worker_stats_ref: &Arc<DashMap<String, WorkerStats>>,
+    ) {
+        let mut lines = Vec::new();
+        for worker in workers {
+            let pending = worker.pending_message_count();
+            let gap = worker.send_gap_status();
+            if pending == 0 && gap.is_none() {
+                continue;
+            }
+
+            let stats = worker_stats_ref.get(worker.url()).map(|s| s.clone());
+            let (iter, num_reqs, queue, ack_gen, ack_last_id) = if let Some(s) = stats {
+                (
+                    s.iteration_num,
+                    s.num_requests,
+                    s.waiting_queue_size,
+                    s.router_generation,
+                    s.last_received_message_id,
+                )
+            } else {
+                (0, -1, -1, None, None)
+            };
+
+            if let Some(gap_state) = gap {
+                lines.push(format!(
+                    "{}:p={} gen={} ack={:?}/{:?} iter={} reqs={} q={} gap=({}:{},attempt={},age={}ms)",
+                    worker.url(),
+                    pending,
+                    worker.generation(),
+                    ack_gen,
+                    ack_last_id,
+                    iter,
+                    num_reqs,
+                    queue,
+                    gap_state.message.generation,
+                    gap_state.message.message_id,
+                    gap_state.message.resend_count,
+                    gap_state.message.timestamp.elapsed().as_millis(),
+                ));
+            } else {
+                lines.push(format!(
+                    "{}:p={} gen={} ack={:?}/{:?} iter={} reqs={} q={}",
+                    worker.url(),
+                    pending,
+                    worker.generation(),
+                    ack_gen,
+                    ack_last_id,
+                    iter,
+                    num_reqs,
+                    queue
+                ));
+            }
+        }
+
+        if !lines.is_empty() {
+            tracing::info!("[WORKER_PENDING_SUMMARY] {}", lines.join(" | "));
         }
     }
 
@@ -789,8 +1084,15 @@ mod tests {
     #[test]
     fn test_resolve_worker_url_dp_identifier() {
         let registry = WorkerRegistry::new();
-        let worker: Arc<dyn Worker> =
-            Arc::new(DPAwareWorkerBuilder::new_with_generation("http://worker-dp:9090", TEST_GENERATION, 1, 2).build());
+        let worker: Arc<dyn Worker> = Arc::new(
+            DPAwareWorkerBuilder::new_with_generation(
+                "http://worker-dp:9090",
+                TEST_GENERATION,
+                1,
+                2,
+            )
+            .build(),
+        );
         registry.register(worker);
 
         let resolved = registry
@@ -869,5 +1171,91 @@ mod tests {
 
         worker.cleanup_pending_messages(Duration::from_secs(60));
         assert_eq!(worker.pending_message_count(), 0);
+    }
+
+    #[test]
+    fn test_update_stats_clears_send_gap_when_ack_catches_up() {
+        let registry = WorkerRegistry::new();
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new_with_generation("http://worker-gap:8080", TEST_GENERATION)
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        registry.register(worker.clone());
+
+        for message_id in 1..=3 {
+            worker.add_pending_message(PendingMessage::new(
+                message_id,
+                99,
+                "/generate",
+                Some(format!("req-{message_id}")),
+                serde_json::json!({"test": true}),
+                16,
+            ));
+        }
+
+        let failed = worker
+            .remove_pending_message(99, 2)
+            .expect("message 2 must exist");
+        assert!(worker.open_send_gap(failed));
+        assert!(worker.has_send_gap());
+
+        let stats = WorkerStats {
+            worker_id: worker.url().to_string(),
+            batch_size_tokens: 0,
+            kv_tokens_used: Some(0),
+            num_requests: 0,
+            waiting_queue_size: 0,
+            waiting_queue_info: None,
+            forward_mode: "UNKNOWN".to_string(),
+            iteration_num: 0,
+            last_iteration_time_ms: None,
+            prefill_chunk_pairs: None,
+            prefill_sim_metrics: None,
+            router_generation: Some(99),
+            last_received_message_id: Some(2),
+            batch_size_by_tpot_tier: None,
+            timestamp: Instant::now(),
+        };
+
+        registry.update_stats(worker.url(), stats);
+
+        assert!(!worker.has_send_gap());
+        assert_eq!(worker.pending_message_count(), 1);
+    }
+
+    #[test]
+    fn test_get_workers_filtered_excludes_send_gap_when_healthy_only() {
+        let registry = WorkerRegistry::new();
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new_with_generation(
+                "http://worker-gap-filter:8080",
+                TEST_GENERATION,
+            )
+            .worker_type(WorkerType::Regular)
+            .build(),
+        );
+        registry.register(worker.clone());
+
+        worker.add_pending_message(PendingMessage::new(
+            5,
+            TEST_GENERATION,
+            "/generate",
+            Some("req-gap".into()),
+            serde_json::json!({"prompt":"hi"}),
+            8,
+        ));
+        let failed = worker
+            .remove_pending_message(TEST_GENERATION, 5)
+            .expect("message 5 must exist");
+        assert!(worker.open_send_gap(failed));
+
+        let filtered = registry.get_workers_filtered(
+            None,
+            Some(WorkerType::Regular),
+            Some(ConnectionMode::Http),
+            true,
+        );
+        assert!(filtered.is_empty());
     }
 }

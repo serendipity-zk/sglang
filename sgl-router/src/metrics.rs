@@ -252,6 +252,30 @@ pub fn init_metrics() {
         "sgl_router_message_ack_latency_seconds",
         "Time between dispatch and worker acknowledgment of router-tracked messages"
     );
+    describe_counter!(
+        "sgl_router_gap_open_total",
+        "Total number of send-gaps opened per worker"
+    );
+    describe_counter!(
+        "sgl_router_gap_retry_total",
+        "Total number of send-gap retries per worker and result"
+    );
+    describe_counter!(
+        "sgl_router_gap_recovered_total",
+        "Total number of send-gaps recovered via ACK progression per worker"
+    );
+    describe_counter!(
+        "sgl_router_gap_reset_total",
+        "Total number of send-gap forced resets per worker"
+    );
+    describe_histogram!(
+        "sgl_router_gap_blocked_seconds",
+        "Duration a worker remained blocked by send-gap before recovery/reset"
+    );
+    describe_gauge!(
+        "sgl_router_gap_active",
+        "Whether a worker currently has an active send-gap (1/0)"
+    );
 
     // Factory metrics
     describe_counter!(
@@ -443,6 +467,55 @@ impl RouterMetrics {
             "worker" => worker_url.to_string()
         )
         .increment(count as u64);
+    }
+
+    pub fn record_gap_open(worker_url: &str) {
+        counter!(
+            "sgl_router_gap_open_total",
+            "worker" => worker_url.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_gap_retry(worker_url: &str, result: &str) {
+        counter!(
+            "sgl_router_gap_retry_total",
+            "worker" => worker_url.to_string(),
+            "result" => result.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_gap_recovered(worker_url: &str) {
+        counter!(
+            "sgl_router_gap_recovered_total",
+            "worker" => worker_url.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_gap_reset(worker_url: &str) {
+        counter!(
+            "sgl_router_gap_reset_total",
+            "worker" => worker_url.to_string()
+        )
+        .increment(1);
+    }
+
+    pub fn record_gap_blocked_duration(worker_url: &str, duration: Duration) {
+        histogram!(
+            "sgl_router_gap_blocked_seconds",
+            "worker" => worker_url.to_string()
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    pub fn set_gap_active(worker_url: &str, active: bool) {
+        gauge!(
+            "sgl_router_gap_active",
+            "worker" => worker_url.to_string()
+        )
+        .set(if active { 1.0 } else { 0.0 });
     }
 
     pub fn record_pd_prefill_request(worker: &str) {

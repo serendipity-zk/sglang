@@ -144,9 +144,7 @@ impl WorkerStats {
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
 
-        let last_iteration_time_ms = stats
-            .get("last_iteration_time_ms")
-            .and_then(|v| v.as_f64());
+        let last_iteration_time_ms = stats.get("last_iteration_time_ms").and_then(|v| v.as_f64());
 
         let prefill_chunk_pairs = stats
             .get("prefill_chunk_pairs")

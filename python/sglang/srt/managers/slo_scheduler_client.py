@@ -33,6 +33,12 @@ class SLOSchedulerClient:
         self.consecutive_failures = 0
         self.fallback_mode = False
         self.last_probe_time = 0.0
+        # Cache only for identical scheduler state. The engine can invoke sidecar
+        # multiple times with the same iteration_count while queue/KV state is
+        # changing; those calls must still be sent.
+        self._last_iteration_attempted = -1
+        self._last_state_signature = None
+        self._last_iteration_result = None
 
         logger.info(f"SLOSchedulerClient connected to {addr} (timeout={timeout_ms}ms)")
 
@@ -46,6 +52,28 @@ class SLOSchedulerClient:
         Returns:
             SchedulingDecision if successful, None on timeout/error/stale.
         """
+        state_signature = self._compute_state_signature(engine_state)
+
+        # Return cached answer only when both iteration and sidecar-relevant
+        # state are unchanged.
+        if (
+            current_iteration == self._last_iteration_attempted
+            and state_signature == self._last_state_signature
+        ):
+            return self._last_iteration_result
+
+        if current_iteration < self._last_iteration_attempted:
+            # Defensive logging for unexpected iteration regressions.
+            logger.warning(
+                "SLOSchedulerClient: iteration regressed from %d to %d; resetting per-iteration cache",
+                self._last_iteration_attempted,
+                current_iteration,
+            )
+
+        self._last_iteration_attempted = current_iteration
+        self._last_state_signature = state_signature
+        self._last_iteration_result = None
+
         # In fallback mode, only probe periodically
         if self.fallback_mode:
             now = time.monotonic()
@@ -119,8 +147,39 @@ class SLOSchedulerClient:
             return None
 
         # Success — reset failure tracking
+        self._last_iteration_result = best
         self._record_success()
         return best
+
+    def _compute_state_signature(self, engine_state):
+        """Compute a compact signature for sidecar-relevant scheduler state."""
+        current = engine_state.current
+        scheduling = engine_state.scheduling
+        waiting = scheduling.waiting_requests
+        decode = scheduling.decode_requests
+        chunked = scheduling.chunked_requests
+
+        # Include queue/KV/ack context and lightweight request identity hints.
+        waiting_head = waiting[0].request_id if waiting else None
+        waiting_tail = waiting[-1].request_id if waiting else None
+        decode_head = decode[0].request_id if decode else None
+        chunked_head = chunked[0].request_id if chunked else None
+
+        return (
+            current.num_running_requests,
+            current.num_waiting_requests,
+            current.kv_tokens_used,
+            current.router_generation,
+            current.router_last_ack_id,
+            len(waiting),
+            len(decode),
+            len(chunked),
+            waiting_head,
+            waiting_tail,
+            decode_head,
+            chunked_head,
+            engine_state.accepted_requests_count,
+        )
 
     def _record_failure(self):
         self.consecutive_failures += 1

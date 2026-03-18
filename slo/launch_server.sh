@@ -1,3 +1,7 @@
+export HF_HOME=/sgl-workspace/model
+# tvm_ffi iterates PATH to find DLLs; /root/.cargo/bin is inaccessible as devuser → PermissionError
+export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v '/root/.cargo' | tr '\n' ':' | sed 's/:$//')
+
 python launch_server.py \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
   --host 0.0.0.0 \

@@ -155,7 +155,10 @@ impl AppContext {
         let shadow_stats_logger = if stats_mode == "shadow" || stats_mode == "shadow-sidecar" {
             let log_dir = router_config.log_dir.as_deref().unwrap_or(".");
             let path = format!("{}/shadow_stats.jsonl", log_dir);
-            info!("Shadow mode: logging engine/sidecar stats comparison to {}", path);
+            info!(
+                "Shadow mode: logging engine/sidecar stats comparison to {}",
+                path
+            );
             Some(Arc::new(ShadowStatsLogger::new(&path)?))
         } else {
             None
@@ -245,7 +248,10 @@ async fn v1_chat_completions(
     headers: http::HeaderMap,
     Json(body): Json<ChatCompletionRequest>,
 ) -> Response {
-    state.router.route_chat(Some(&headers), &body, None, &request_id.0).await
+    state
+        .router
+        .route_chat(Some(&headers), &body, None, &request_id.0)
+        .await
 }
 
 async fn v1_completions(
@@ -266,7 +272,10 @@ async fn rerank(
     headers: http::HeaderMap,
     Json(body): Json<RerankRequest>,
 ) -> Response {
-    state.router.route_rerank(Some(&headers), &body, None, &request_id.0).await
+    state
+        .router
+        .route_rerank(Some(&headers), &body, None, &request_id.0)
+        .await
 }
 
 async fn v1_rerank(
@@ -417,9 +426,7 @@ fn shadow_log_stats(
     let registry_stats = state.context.worker_registry.get_stats(&worker_url);
 
     // Serialize full WorkerStats (timestamp field is #[serde(skip)], all others included)
-    let stats_to_json = |s: &crate::core::WorkerStats| {
-        serde_json::to_value(s).unwrap_or_default()
-    };
+    let stats_to_json = |s: &crate::core::WorkerStats| serde_json::to_value(s).unwrap_or_default();
 
     let (engine_json, sidecar_json) = if logged_source == "sidecar" {
         // shadow mode: logged=sidecar (param), authoritative=engine (registry)
@@ -454,7 +461,8 @@ async fn worker_stats(
     Json(stats): Json<serde_json::Value>,
 ) -> Response {
     // Parse stats_source BEFORE constructing WorkerStats (not stored in WorkerStats struct)
-    let stats_source = stats.get("stats_source")
+    let stats_source = stats
+        .get("stats_source")
         .and_then(|v| v.as_str())
         .unwrap_or("engine");
 
@@ -497,6 +505,59 @@ async fn worker_stats(
             return (StatusCode::BAD_REQUEST, format!("Invalid stats: {}", e)).into_response();
         }
     };
+    let raw_ack_gen = stats
+        .get("router_generation")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let raw_ack_last_id = stats
+        .get("last_received_message_id")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
+
+    tracing::debug!(
+        "[WORKER_STATS_META] source={} mode={} worker={} iter={} num_reqs={} queue={} ack_gen={:?} ack_last_id={:?}",
+        stats_source,
+        mode.as_str(),
+        worker_stats.worker_id,
+        worker_stats.iteration_num,
+        worker_stats.num_requests,
+        worker_stats.waiting_queue_size,
+        worker_stats.router_generation,
+        worker_stats.last_received_message_id,
+    );
+    tracing::debug!(
+        "[WORKER_STATS_ACK_RAW] source={} mode={} worker={} iter={} raw_ack_gen={} raw_ack_last_id={}",
+        stats_source,
+        mode.as_str(),
+        worker_stats.worker_id,
+        worker_stats.iteration_num,
+        raw_ack_gen,
+        raw_ack_last_id,
+    );
+
+    if stats_source == "sidecar"
+        && (worker_stats.router_generation.is_none()
+            || worker_stats.last_received_message_id.is_none())
+    {
+        tracing::debug!(
+            "[WORKER_STATS_ACK_MISSING] source=sidecar worker={} iter={} ack_gen={:?} ack_last_id={:?}",
+            worker_stats.worker_id,
+            worker_stats.iteration_num,
+            worker_stats.router_generation,
+            worker_stats.last_received_message_id,
+        );
+    }
+
+    if worker_stats.last_received_message_id.is_some_and(|id| id < 0) {
+        tracing::debug!(
+            "[WORKER_STATS_ACK_NEGATIVE] source={} worker={} iter={} ack_gen={:?} ack_last_id={:?}",
+            stats_source,
+            worker_stats.worker_id,
+            worker_stats.iteration_num,
+            worker_stats.router_generation,
+            worker_stats.last_received_message_id,
+        );
+    }
 
     // Detailed debug logging
     let queue_info_str = worker_stats.waiting_queue_info.as_ref().map(|info| {
@@ -600,8 +661,12 @@ async fn worker_stats(
         .resolve_worker_url(&worker_stats.worker_id)
         .or_else(|| {
             tracing::debug!(
-                "Worker stats identifier {} does not match a registered worker yet",
-                worker_stats.worker_id
+                "[WORKER_STATS_UNRESOLVED] source={} worker={} iter={} ack_gen={:?} ack_last_id={:?}",
+                stats_source,
+                worker_stats.worker_id,
+                worker_stats.iteration_num,
+                worker_stats.router_generation,
+                worker_stats.last_received_message_id,
             );
             None
         })
@@ -1008,6 +1073,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // Disabled as part of commit 80ef7a8c4 - resend logic was causing issues
     // let _resend_checker = app_context.worker_registry.start_resend_checker();
     // info!("Started resend checker for unacknowledged messages (50ms interval)");
+
+    let _gap_recovery_checker = app_context.worker_registry.start_gap_recovery_checker();
+    info!("Started gap recovery checker for failed /generate sends");
 
     // Set up concurrency limiter with queue if configured
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(

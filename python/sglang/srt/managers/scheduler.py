@@ -1059,11 +1059,21 @@ class Scheduler(
         if queue_slack_stats:
             metrics["waiting_queue_info"]["slack_ms"] = queue_slack_stats
 
+        metrics["stats_source"] = "engine"
         ack_generation, ack_last_id = self.router_ack_tracker.get_state()
         if ack_generation is not None:
             metrics["router_generation"] = ack_generation
             metrics["last_received_message_id"] = (
                 ack_last_id if ack_last_id is not None else -1
+            )
+            logger.debug(
+                "[ROUTER_ACK_EXPORT] worker=%s iter=%s mode=%s ack_gen=%s ack_last_id=%s destinations=%s",
+                self.worker_id,
+                self.iteration_count,
+                self.slo_scheduler_mode,
+                ack_generation,
+                ack_last_id,
+                destinations,
             )
 
         # Report (non-blocking)

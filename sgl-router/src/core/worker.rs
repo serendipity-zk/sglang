@@ -50,6 +50,12 @@ pub struct PendingMessage {
     pub input_token_count: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct SendGapStatus {
+    /// The missing message that created a contiguous-ACK gap.
+    pub message: PendingMessage,
+}
+
 impl PendingMessage {
     /// Convenience constructor for creating pending messages.
     pub fn new(
@@ -104,19 +110,13 @@ pub async fn resend_message(worker_url: &str, message: &PendingMessage) {
     // Fire and forget - spawn to avoid blocking the resend checker
     let url_clone = url.clone();
     tokio::spawn(async move {
-        match WORKER_CLIENT
-            .post(&url_clone)
-            .json(&body)
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-        {
+        match resend_message_once(&url_clone, &body).await {
             Ok(resp) => {
-                if !resp.status().is_success() {
+                if !resp.is_success() {
                     warn!(
                         "[RESEND] Failed to resend to {}: status={}",
                         url_clone,
-                        resp.status()
+                        resp
                     );
                 }
             }
@@ -125,6 +125,33 @@ pub async fn resend_message(worker_url: &str, message: &PendingMessage) {
             }
         }
     });
+}
+
+async fn resend_message_once(
+    url: &str,
+    body: &serde_json::Value,
+) -> Result<reqwest::StatusCode, reqwest::Error> {
+    let response = WORKER_CLIENT
+        .post(url)
+        .json(body)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await?;
+    Ok(response.status())
+}
+
+/// Send a specific gap message once and return transport status.
+pub async fn send_gap_message_once(
+    worker_url: &str,
+    message: &PendingMessage,
+) -> Result<reqwest::StatusCode, reqwest::Error> {
+    let mut body = message.body_json.clone();
+    if let Some(map) = body.as_object_mut() {
+        map.insert("router_generation".to_string(), json!(message.generation));
+        map.insert("router_message_id".to_string(), json!(message.message_id));
+    }
+    let url = format!("{}{}", worker_url, message.route);
+    resend_message_once(&url, &body).await
 }
 
 /// Core worker abstraction that represents a backend service
@@ -186,6 +213,9 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Track a dispatched message until it is acknowledged.
     fn add_pending_message(&self, message: PendingMessage);
 
+    /// Remove one specific pending message by generation + message_id.
+    fn remove_pending_message(&self, generation: i64, message_id: i64) -> Option<PendingMessage>;
+
     /// Remove acknowledged messages up to and including the provided ID for a generation.
     /// Returns removed messages so callers can emit metrics.
     fn remove_messages_up_to(&self, generation: i64, last_message_id: i64) -> Vec<PendingMessage>;
@@ -209,6 +239,25 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Mark a message as resent (increment resend count and update last_send_time)
     fn mark_resent(&self, message_id: i64);
 
+    /// Open a send-gap for a failed send. Returns false if a gap is already active.
+    fn open_send_gap(&self, message: PendingMessage) -> bool;
+
+    /// Get current send-gap status for this worker.
+    fn send_gap_status(&self) -> Option<SendGapStatus>;
+
+    /// Mark send-gap message as retried.
+    fn mark_send_gap_resent(&self);
+
+    /// Clear send-gap status, returning removed status if present.
+    fn clear_send_gap(&self) -> Option<SendGapStatus>;
+
+    /// Whether this worker is currently quarantined by a send-gap.
+    fn has_send_gap(&self) -> bool;
+
+    /// Reset per-worker router generation and clear pending/gap state.
+    /// Returns (pending_removed, had_gap).
+    fn reset_generation(&self, new_generation: i64) -> (usize, bool);
+
     /// Get the number of processed requests
     fn processed_requests(&self) -> usize;
 
@@ -223,7 +272,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Check if the worker is available (healthy + circuit closed/half-open)
     fn is_available(&self) -> bool {
-        self.is_healthy() && self.circuit_breaker().can_execute()
+        self.is_healthy() && self.circuit_breaker().can_execute() && !self.has_send_gap()
     }
 
     /// Record the outcome of a request to this worker
@@ -483,8 +532,10 @@ pub struct BasicWorker {
     pub grpc_client: Option<Arc<Mutex<SglangSchedulerClient>>>,
     /// Per-worker message ID counter
     pub message_counter: Arc<AtomicI64>,
-    /// Router generation (startup timestamp)
-    pub generation: i64,
+    /// Router generation for this worker.
+    pub generation: Arc<AtomicI64>,
+    /// Active send-gap (if a /generate send failed and introduced a missing message_id).
+    pub send_gap: Arc<RwLock<Option<SendGapStatus>>>,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -493,6 +544,7 @@ impl fmt::Debug for BasicWorker {
             .field("metadata", &self.metadata)
             .field("healthy", &self.healthy.load(Ordering::Relaxed))
             .field("pending_messages", &self.pending_messages.read().len())
+            .field("has_send_gap", &self.send_gap.read().is_some())
             .field("circuit_breaker", &self.circuit_breaker)
             .field("has_grpc_client", &self.grpc_client.is_some())
             .finish()
@@ -664,6 +716,14 @@ impl Worker for BasicWorker {
         pending.push(message);
     }
 
+    fn remove_pending_message(&self, generation: i64, message_id: i64) -> Option<PendingMessage> {
+        let mut pending = self.pending_messages.write();
+        let index = pending
+            .iter()
+            .position(|m| m.generation == generation && m.message_id == message_id)?;
+        Some(pending.remove(index))
+    }
+
     fn remove_messages_up_to(&self, generation: i64, last_message_id: i64) -> Vec<PendingMessage> {
         let mut removed = Vec::new();
         let mut pending = self.pending_messages.write();
@@ -696,7 +756,7 @@ impl Worker for BasicWorker {
     }
 
     fn generation(&self) -> i64 {
-        self.generation
+        self.generation.load(Ordering::Relaxed)
     }
 
     fn cleanup_pending_messages(&self, ttl: Duration) {
@@ -728,6 +788,49 @@ impl Worker for BasicWorker {
             msg.resend_count += 1;
             msg.last_send_time = Instant::now();
         }
+    }
+
+    fn open_send_gap(&self, message: PendingMessage) -> bool {
+        let mut gap = self.send_gap.write();
+        if gap.is_some() {
+            return false;
+        }
+        *gap = Some(SendGapStatus { message });
+        true
+    }
+
+    fn send_gap_status(&self) -> Option<SendGapStatus> {
+        self.send_gap.read().clone()
+    }
+
+    fn mark_send_gap_resent(&self) {
+        let mut gap = self.send_gap.write();
+        if let Some(state) = gap.as_mut() {
+            state.message.resend_count += 1;
+            state.message.last_send_time = Instant::now();
+        }
+    }
+
+    fn clear_send_gap(&self) -> Option<SendGapStatus> {
+        self.send_gap.write().take()
+    }
+
+    fn has_send_gap(&self) -> bool {
+        self.send_gap.read().is_some()
+    }
+
+    fn reset_generation(&self, new_generation: i64) -> (usize, bool) {
+        let pending_removed = {
+            let mut pending = self.pending_messages.write();
+            let removed = pending.len();
+            pending.clear();
+            removed
+        };
+        let had_gap = self.send_gap.write().take().is_some();
+        self.generation.store(new_generation, Ordering::Relaxed);
+        self.message_counter.store(0, Ordering::Relaxed);
+        RouterMetrics::set_pending_messages(self.url(), 0);
+        (pending_removed, had_gap)
     }
 
     fn processed_requests(&self) -> usize {
@@ -837,6 +940,11 @@ impl Worker for DPAwareWorker {
         self.base_worker.add_pending_message(message);
     }
 
+    fn remove_pending_message(&self, generation: i64, message_id: i64) -> Option<PendingMessage> {
+        self.base_worker
+            .remove_pending_message(generation, message_id)
+    }
+
     fn remove_messages_up_to(&self, generation: i64, last_message_id: i64) -> Vec<PendingMessage> {
         self.base_worker
             .remove_messages_up_to(generation, last_message_id)
@@ -864,6 +972,30 @@ impl Worker for DPAwareWorker {
 
     fn mark_resent(&self, message_id: i64) {
         self.base_worker.mark_resent(message_id)
+    }
+
+    fn open_send_gap(&self, message: PendingMessage) -> bool {
+        self.base_worker.open_send_gap(message)
+    }
+
+    fn send_gap_status(&self) -> Option<SendGapStatus> {
+        self.base_worker.send_gap_status()
+    }
+
+    fn mark_send_gap_resent(&self) {
+        self.base_worker.mark_send_gap_resent()
+    }
+
+    fn clear_send_gap(&self) -> Option<SendGapStatus> {
+        self.base_worker.clear_send_gap()
+    }
+
+    fn has_send_gap(&self) -> bool {
+        self.base_worker.has_send_gap()
+    }
+
+    fn reset_generation(&self, new_generation: i64) -> (usize, bool) {
+        self.base_worker.reset_generation(new_generation)
     }
 
     fn processed_requests(&self) -> usize {
@@ -2112,6 +2244,42 @@ mod tests {
     }
 
     #[test]
+    fn send_gap_state_blocks_availability_and_reset_recovers() {
+        let worker = ledger_worker();
+
+        // Message counter should be reset on generation recovery.
+        assert_eq!(worker.next_message_id(), 0);
+        assert_eq!(worker.next_message_id(), 1);
+
+        let pending_gap = make_pending(1);
+        let pending_other = make_pending(2);
+        worker.add_pending_message(pending_gap.clone());
+        worker.add_pending_message(pending_other.clone());
+
+        let removed = worker
+            .remove_pending_message(777, 1)
+            .expect("pending message must exist");
+        assert!(worker.open_send_gap(removed));
+        assert!(worker.has_send_gap());
+        assert!(!worker.is_available());
+
+        let gap_before = worker.send_gap_status().expect("gap must be present");
+        assert_eq!(gap_before.message.message_id, 1);
+        assert_eq!(gap_before.message.resend_count, 0);
+        worker.mark_send_gap_resent();
+        let gap_after = worker.send_gap_status().expect("gap must remain present");
+        assert_eq!(gap_after.message.resend_count, 1);
+
+        let (pending_removed, had_gap) = worker.reset_generation(1234);
+        assert_eq!(pending_removed, 1);
+        assert!(had_gap);
+        assert_eq!(worker.pending_message_count(), 0);
+        assert!(!worker.has_send_gap());
+        assert_eq!(worker.generation(), 1234);
+        assert_eq!(worker.next_message_id(), 0);
+    }
+
+    #[test]
     fn test_per_worker_message_id_counter() {
         const TEST_GEN: i64 = 12345;
         let worker = BasicWorkerBuilder::new_with_generation("http://test:8080", TEST_GEN).build();
@@ -2156,8 +2324,8 @@ mod tests {
     #[test]
     fn test_dp_aware_worker_message_ids() {
         const TEST_GEN: i64 = 111222;
-        let dp_worker = DPAwareWorkerBuilder::new_with_generation("http://worker:8080", TEST_GEN, 0, 4)
-            .build();
+        let dp_worker =
+            DPAwareWorkerBuilder::new_with_generation("http://worker:8080", TEST_GEN, 0, 4).build();
 
         // DP-aware workers should also have independent per-worker counters
         assert_eq!(dp_worker.next_message_id(), 0);

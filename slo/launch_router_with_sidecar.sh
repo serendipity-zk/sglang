@@ -14,8 +14,12 @@ if [[ "$MODE" != "shadow" && "$MODE" != "shadow-sidecar" && "$MODE" != "sidecar"
   exit 1
 fi
 echo "Starting router with stats mode: $MODE"
-
+cd /sgl-workspace/sglang/sgl-router
+pip install .
 cd /sgl-workspace/sglang/slo
+
+export HF_HOME=/sgl-workspace/model
+export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v '/root/.cargo' | tr '\n' ':' | sed 's/:$//')
 
 PYTHONPATH=/sgl-workspace/sglang/sgl-router/py_src \
 TOKIO_WORKER_THREADS=64 \

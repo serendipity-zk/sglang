@@ -158,7 +158,8 @@ impl BasicWorkerBuilder {
             circuit_breaker: CircuitBreaker::with_config(self.circuit_breaker_config),
             grpc_client: self.grpc_client.map(|client| Arc::new(Mutex::new(client))),
             message_counter: Arc::new(AtomicI64::new(0)),
-            generation: self.generation,
+            generation: Arc::new(AtomicI64::new(self.generation)),
+            send_gap: Arc::new(RwLock::new(None)),
         }
     }
 }

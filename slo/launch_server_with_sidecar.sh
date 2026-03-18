@@ -32,6 +32,9 @@ rm -f shadow_decisions_0.0.0.0:31001.jsonl shadow_decisions_0.0.0.0:31002.jsonl 
 #   --stats-mode $MODE
 # The launch_server.py script will print the exact args to use.
 
+export HF_HOME=/sgl-workspace/model
+export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v '/root/.cargo' | tr '\n' ':' | sed 's/:$//')
+
 python launch_server.py \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
   --host 0.0.0.0 \

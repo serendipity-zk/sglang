@@ -646,7 +646,9 @@ impl RouterTrait for RouterManager {
 
         if let Some(router) = router {
             // In multi-model mode, pass the model_id to the router
-            router.route_chat(headers, body, Some(&body.model), request_id).await
+            router
+                .route_chat(headers, body, Some(&body.model), request_id)
+                .await
         } else {
             // Return 404 when the specified model is not found
             (
@@ -780,7 +782,9 @@ impl RouterTrait for RouterManager {
         let router = self.select_router_for_request(headers, None);
 
         if let Some(router) = router {
-            router.route_rerank(headers, body, model_id, request_id).await
+            router
+                .route_rerank(headers, body, model_id, request_id)
+                .await
         } else {
             (
                 StatusCode::NOT_FOUND,

@@ -405,6 +405,15 @@ class SchedulerSidecarMixin:
             scheduling=scheduling,
             accepted_requests_count=self._accepted_since_last_send,
         )
+        logger.debug(
+            "[ENGINE_SIDECAR_ACK_STATE] worker=%s iter=%s ack_gen=%s ack_last_id=%s running=%s waiting=%s",
+            self.worker_id,
+            scheduling.iteration_count,
+            current.router_generation,
+            current.router_last_ack_id,
+            current.num_running_requests,
+            current.num_waiting_requests,
+        )
 
         # # Debug: log every message sent to sidecar
         # logger.warning(

@@ -178,6 +178,64 @@ class TestNormalRoundtrip:
         finally:
             _stop_server(server, t)
 
+    def test_duplicate_iteration_uses_cached_result(self):
+        """Repeated calls with same iteration should not re-send to sidecar."""
+        server, t = _start_server()
+        try:
+            client = SLOSchedulerClient(IPC_ADDR, timeout_ms=5000)
+            try:
+                state = _make_state(iteration=7)
+                decision1 = client.send_and_recv(state, current_iteration=8)
+                assert decision1 is not None
+                recv_after_first = server.messages_received
+
+                decision2 = client.send_and_recv(state, current_iteration=8)
+                decision3 = client.send_and_recv(state, current_iteration=8)
+
+                assert decision2 is decision1
+                assert decision3 is decision1
+                assert server.messages_received == recv_after_first
+                assert not client.fallback_mode
+            finally:
+                client.close()
+        finally:
+            _stop_server(server, t)
+
+    def test_same_iteration_state_change_resends(self):
+        """Same iteration with changed state should be sent again."""
+        server, t = _start_server()
+        try:
+            client = SLOSchedulerClient(IPC_ADDR, timeout_ms=5000)
+            try:
+                state1 = _make_state(iteration=7)
+                decision1 = client.send_and_recv(state1, current_iteration=8)
+                assert decision1 is not None
+                recv_after_first = server.messages_received
+
+                state2 = _make_state(iteration=7)
+                state2.current.num_waiting_requests = 1
+                state2.scheduling.waiting_requests = [
+                    RequestInfo(
+                        request_id="w-x",
+                        target_tpot_ms=50.0,
+                        target_ttft_ms=800.0,
+                        arrival_time_ms=time.time() * 1000 - 10,
+                        tokens_generated=0,
+                        prompt_tokens=256,
+                        remaining_prefill=256,
+                        max_new_tokens=128,
+                    )
+                ]
+                decision2 = client.send_and_recv(state2, current_iteration=8)
+
+                assert decision2 is not None
+                assert server.messages_received == recv_after_first + 1
+                assert not client.fallback_mode
+            finally:
+                client.close()
+        finally:
+            _stop_server(server, t)
+
 
 class TestStalenessRejection:
 
@@ -216,6 +274,24 @@ class TestFallbackMode:
             # Now should be in fallback
             assert client.fallback_mode
             assert client.consecutive_failures == MAX_CONSECUTIVE_FAILURES
+        finally:
+            client.close()
+
+    def test_duplicate_iteration_timeout_only_counts_once(self):
+        """Repeated same-iteration timeouts should not escalate to fallback."""
+        bogus_addr = "ipc:///tmp/sglang_slo_client_test_bogus_same_iter.sock"
+        client = SLOSchedulerClient(bogus_addr, timeout_ms=50)
+        try:
+            state = _make_state(iteration=1)
+            assert client.send_and_recv(state, current_iteration=2) is None
+            assert client.consecutive_failures == 1
+            assert not client.fallback_mode
+
+            for _ in range(10):
+                assert client.send_and_recv(state, current_iteration=2) is None
+
+            assert client.consecutive_failures == 1
+            assert not client.fallback_mode
         finally:
             client.close()
 

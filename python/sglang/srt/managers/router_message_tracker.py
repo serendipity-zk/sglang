@@ -24,6 +24,7 @@ class RouterMessageAckTracker:
         self._last_contiguous_id: int = -1
         self._pending_ids: Set[int] = set()
         self._seen_ids: Set[int] = set()  # Track all seen message IDs for deduplication
+        self._last_gap_log_size: int = -1
 
     def record(self, generation: Optional[int], message_id: Optional[int]) -> bool:
         """Record that a request with (generation, message_id) was received.
@@ -36,12 +37,19 @@ class RouterMessageAckTracker:
             return True  # Not tracked, allow through
 
         with self._lock:
+            prev_generation = self._current_generation
             if self._current_generation is None or generation > self._current_generation:
                 # Router restarted or first observation; reset state for new generation.
                 self._current_generation = generation
                 self._last_contiguous_id = -1
                 self._pending_ids.clear()
                 self._seen_ids.clear()
+                self._last_gap_log_size = -1
+                logger.info(
+                    "[ACK_TRACKER_GEN_RESET] prev_gen=%s new_gen=%s",
+                    prev_generation,
+                    generation,
+                )
             elif generation < self._current_generation:
                 # Ignore stale generations.
                 logger.info(f"Dropping stale generation message: generation={generation}, current_generation={self._current_generation}")
@@ -63,11 +71,38 @@ class RouterMessageAckTracker:
             # Track for contiguous acknowledgment
             self._pending_ids.add(message_id)
 
+            prev_last_contiguous = self._last_contiguous_id
             next_expected = self._last_contiguous_id + 1
             while next_expected in self._pending_ids:
                 self._pending_ids.remove(next_expected)
                 self._last_contiguous_id = next_expected
                 next_expected += 1
+
+            advanced = self._last_contiguous_id - prev_last_contiguous
+            pending_gaps = len(self._pending_ids)
+            if advanced > 0:
+                logger.debug(
+                    "[ACK_TRACKER_PROGRESS] gen=%s msg=%s advanced=%s last_contiguous=%s pending_gaps=%s seen=%s",
+                    generation,
+                    message_id,
+                    advanced,
+                    self._last_contiguous_id,
+                    pending_gaps,
+                    len(self._seen_ids),
+                )
+                self._last_gap_log_size = pending_gaps
+            elif pending_gaps != self._last_gap_log_size and (
+                pending_gaps <= 8 or pending_gaps % 16 == 0
+            ):
+                logger.debug(
+                    "[ACK_TRACKER_GAP] gen=%s msg=%s last_contiguous=%s pending_gaps=%s seen=%s",
+                    generation,
+                    message_id,
+                    self._last_contiguous_id,
+                    pending_gaps,
+                    len(self._seen_ids),
+                )
+                self._last_gap_log_size = pending_gaps
 
             return True
 

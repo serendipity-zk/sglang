@@ -22,9 +22,9 @@ pub use circuit_breaker::{
 pub use error::{WorkerError, WorkerResult};
 pub use retry::{is_retryable_status, BackoffCalculator, RetryError, RetryExecutor};
 pub use worker::{
-    resend_message, start_health_checker, BasicWorker, ConnectionMode, DPAwareWorker,
-    HealthChecker, HealthConfig, PendingMessage, Worker, WorkerFactory, WorkerLoadGuard,
-    WorkerType, MAX_RESEND_ATTEMPTS, RESEND_TIMEOUT_MS,
+    resend_message, send_gap_message_once, start_health_checker, BasicWorker, ConnectionMode,
+    DPAwareWorker, HealthChecker, HealthConfig, PendingMessage, SendGapStatus, Worker,
+    WorkerFactory, WorkerLoadGuard, WorkerType, MAX_RESEND_ATTEMPTS, RESEND_TIMEOUT_MS,
 };
 pub use worker_builder::{BasicWorkerBuilder, DPAwareWorkerBuilder};
 pub use worker_registry::{WorkerId, WorkerRegistry, WorkerRegistryStats};
