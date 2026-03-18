@@ -75,6 +75,11 @@ class SchedulerSidecarMixin:
             router_generation=ack_gen,
             router_last_ack_id=ack_last_id,
         )
+        # Router ack state is control-plane metadata, not GPU snapshot state.
+        # Refresh it at send time so worker_stats clears pending router messages
+        # using the latest contiguous ack, matching the old engine metrics path.
+        current.router_generation = ack_gen
+        current.router_last_ack_id = ack_last_id
 
         state = EngineState(
             protocol_version=1,

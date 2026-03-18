@@ -2131,6 +2131,13 @@ class Scheduler(
                 params = DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock)
             self.tree_cache.dec_lock_ref(req.last_node, params)
 
+        # cache_unfinished_req() preserves the request slot so the next chunk can
+        # reuse it. If we abandon the chunk and requeue from scratch, release the
+        # slot first; otherwise the request is requeued with req_pool_idx set but
+        # not marked chunked, which trips fresh req-pool reuse assertions.
+        if req.req_pool_idx is not None:
+            self.req_to_token_pool.free(req)
+
         req.reset_for_retract()
         if requeue:
             self._add_request_to_queue(req, is_retracted=True)

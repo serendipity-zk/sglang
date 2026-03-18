@@ -654,6 +654,8 @@ class GenerateReqInput(BaseReq):
             target_ttft_ms=self.target_ttft_ms,
             target_tpot_ms=self.target_tpot_ms,
             arrival_time_ms=self.arrival_time_ms,
+            router_generation=self.router_generation,
+            router_message_id=self.router_message_id,
             extra_key=self.extra_key,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
