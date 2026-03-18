@@ -186,10 +186,17 @@ Phase 5 status:
 
 ### Phase 6: Validation
 
-- [ ] Add at least one sidecar roundtrip test
-- [ ] Add stale-decision rejection coverage
-- [ ] Add timeout fallback coverage
-- [ ] Validate overlap and non-overlap drain timing assumptions
+- [x] Add at least one sidecar roundtrip test
+- [x] Add stale-decision rejection coverage
+- [x] Add timeout fallback coverage
+- [x] Validate overlap and non-overlap drain timing assumptions
+
+Phase 6 status:
+- Added a real ZMQ roundtrip test for `SLOSchedulerClient` in addition to the existing mocked coverage.
+- Validation coverage now explicitly exercises timeout fallback and stale-decision rejection on the transport layer.
+- Added focused scheduler-loop timing tests that verify the intended temporal ordering for non-overlap and overlap loops:
+  `current` is drained immediately after launch, and `finished` uses the correct pre-batch KV snapshot after result processing.
+- The sidecar-only path now has focused coverage for transport, snapshot construction, live scheduler integration, fallback behavior, and loop timing assumptions.
 
 ## Immediate Next Steps
 

@@ -1,4 +1,5 @@
 import unittest
+from threading import Thread
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -121,6 +122,41 @@ class TestSLOSchedulerClient(unittest.TestCase):
 
         self.assertTrue(socket.closed)
         self.assertTrue(context.terminated)
+
+    def test_send_and_recv_real_zmq_roundtrip(self):
+        context = zmq.Context()
+        router = context.socket(zmq.ROUTER)
+        port = router.bind_to_random_port("tcp://127.0.0.1")
+        addr = f"tcp://127.0.0.1:{port}"
+
+        def serve_once():
+            frames = router.recv_multipart()
+            self.assertEqual(frames[-1], b"payload")
+            router.send_multipart(
+                [frames[0], b"", b"decision"]
+            )
+
+        thread = Thread(target=serve_once, daemon=True)
+        thread.start()
+        client = SLOSchedulerClient(addr, timeout_ms=200)
+        try:
+            with (
+                patch.object(client, "_serialize_engine_state", return_value=b"payload"),
+                patch.object(
+                    client,
+                    "_deserialize_decision",
+                    return_value=SimpleNamespace(iteration_count=5),
+                ),
+            ):
+                decision = client.send_and_recv(object(), current_iteration=5)
+        finally:
+            thread.join(timeout=1)
+            client.close()
+            router.close()
+            context.term()
+
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.iteration_count, 5)
 
 
 if __name__ == "__main__":
