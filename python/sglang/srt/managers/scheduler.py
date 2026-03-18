@@ -166,6 +166,7 @@ from sglang.srt.managers.scheduler_runtime_checker_mixin import (
     SchedulerRuntimeCheckerMixin,
     create_scheduler_watchdog,
 )
+from sglang.srt.managers.scheduler_sidecar_mixin import SchedulerSidecarMixin
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
@@ -260,6 +261,7 @@ class EmbeddingBatchResult:
 
 
 class Scheduler(
+    SchedulerSidecarMixin,
     SchedulerOutputProcessorMixin,
     SchedulerUpdateWeightsMixin,
     SchedulerProfilerMixin,
@@ -379,6 +381,8 @@ class Scheduler(
 
         # Init running status
         self.init_running_status()
+        self.init_sidecar(server_args)
+        self.worker_id = self._build_worker_id()
 
         # Init chunked prefill
         self.init_chunked_prefill()
@@ -792,12 +796,21 @@ class Scheduler(
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
+        self.iteration_count = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
         self.num_retracted_reqs: int = 0
         self.num_paused_reqs: int = 0
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+
+    def _build_worker_id(self) -> str:
+        worker_id = f"{self.server_args.host}:{self.server_args.port}"
+        if self.tp_size > 1:
+            worker_id += f":tp{self.tp_rank}"
+        if self.dp_size > 1 and self.dp_rank is not None:
+            worker_id += f":dp{self.dp_rank}"
+        return worker_id
 
     def init_chunked_prefill(self):
         # Init chunked prefill
@@ -1257,8 +1270,19 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                if self.slo_client is not None:
+                    self._pre_batch_kv_used = self._get_token_info()[0]
+                batch_start = time.perf_counter()
                 result = self.run_batch(batch)
+                iteration_time_ms = (time.perf_counter() - batch_start) * 1000
+                self.iteration_count += 1
+                if self.slo_client is not None:
+                    self._drain_current_snapshot(batch, self.iteration_count)
                 self.process_batch_result(batch, result)
+                if self.slo_client is not None:
+                    self._drain_finished_iteration(
+                        batch, iteration_time_ms, self._pre_batch_kv_used
+                    )
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.self_check_during_idle()
@@ -1272,13 +1296,22 @@ class Scheduler(
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue: Deque[
-            Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
+            Tuple[
+                ScheduleBatch,
+                Union[GenerationBatchResult, EmbeddingBatchResult],
+                float,
+            ]
         ] = deque()
 
         def pop_and_process():
             # Process the results of the last batch
-            tmp_batch, tmp_result = self.result_queue.popleft()
+            tmp_batch, tmp_result, tmp_elapsed_ms = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
+            self.iteration_count += 1
+            if self.slo_client is not None:
+                self._drain_finished_iteration(
+                    tmp_batch, tmp_elapsed_ms, self._prev_pre_batch_kv_used
+                )
 
         while True:
             # Receive requests
@@ -1298,9 +1331,17 @@ class Scheduler(
                 pop_and_process()
 
             # Launch the current batch
+            if self.slo_client is not None:
+                self._prev_pre_batch_kv_used = self._pre_batch_kv_used
             if batch:
+                if self.slo_client is not None:
+                    self._pre_batch_kv_used = self._get_token_info()[0]
+                batch_start = time.perf_counter()
                 batch_result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), batch_result))
+                batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000
+                self.result_queue.append((batch.copy(), batch_result, batch_elapsed_ms))
+                if self.slo_client is not None:
+                    self._drain_current_snapshot(batch, self.iteration_count + 1)
             else:
                 batch_result = None
                 self.cancel_bubble_timer()
@@ -1784,6 +1825,7 @@ class Scheduler(
 
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
+            req._sidecar_count_as_accepted = not req.finished()
             self._add_request_to_queue(req)
 
     def handle_batch_generate_request(
@@ -1832,18 +1874,36 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
+            if (
+                not is_retracted
+                and getattr(req, "_sidecar_count_as_accepted", False)
+                and self.slo_client is not None
+            ):
+                self._accepted_since_last_send += 1
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
+            if (
+                not is_retracted
+                and getattr(req, "_sidecar_count_as_accepted", False)
+                and self.slo_client is not None
+            ):
+                self._accepted_since_last_send += 1
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
             else:
                 req.time_stats.set_retract_time()
+            if (
+                not is_retracted
+                and getattr(req, "_sidecar_count_as_accepted", False)
+                and self.slo_client is not None
+            ):
+                self._accepted_since_last_send += 1
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
@@ -2006,6 +2066,7 @@ class Scheduler(
 
         # Copy more attributes
         req.logprob_start_len = -1
+        req._sidecar_count_as_accepted = False
         self._add_request_to_queue(req)
 
     def handle_batch_embedding_request(
@@ -2077,6 +2138,10 @@ class Scheduler(
         if self.running_batch.is_prefill_only:
             self.running_batch.filter_batch()
 
+        if self.slo_client is not None:
+            self._drain_scheduling_context()
+            self._assemble_and_send_engine_state()
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
         else:
@@ -2139,6 +2204,12 @@ class Scheduler(
 
         return ret
 
+    def _get_effective_max_prefill_tokens(self, scheduling_iteration: int) -> int:
+        if self._last_sidecar_decision is not None:
+            if self._last_sidecar_decision.iteration_count == scheduling_iteration:
+                return self._last_sidecar_decision.max_prefill_tokens
+        return self.max_prefill_tokens
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -2193,13 +2264,16 @@ class Scheduler(
                 chunked_prefill_size = dynamic_size
 
         # Prefill policy
+        effective_max_prefill_tokens = self._get_effective_max_prefill_tokens(
+            self.iteration_count + 1
+        )
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             self.running_batch,
             self.new_token_ratio,
-            self.max_prefill_tokens,
+            effective_max_prefill_tokens,
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,

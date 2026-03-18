@@ -167,14 +167,22 @@ Phase 4 status:
 
 ### Phase 5: Scheduler Integration
 
-- [ ] Initialize sidecar client in fresh `Scheduler.__init__`
-- [ ] Capture pre-run KV and current snapshot after launch
-- [ ] Drain finished iteration after result processing
-- [ ] Drain scheduling context before prefill admission
-- [ ] Apply sidecar `max_prefill_tokens` inside the existing prefill path
-- [ ] Keep scheduler fallback behavior as plain upstream budget scheduling
+- [x] Initialize sidecar client in fresh `Scheduler.__init__`
+- [x] Capture pre-run KV and current snapshot after launch
+- [x] Drain finished iteration after result processing
+- [x] Drain scheduling context before prefill admission
+- [x] Apply sidecar `max_prefill_tokens` inside the existing prefill path
+- [x] Keep scheduler fallback behavior as plain upstream budget scheduling
 - Testability target:
   integration should land incrementally, with timeout fallback and external-budget application verified before adding more scheduler hooks.
+
+Phase 5 status:
+- `Scheduler` now includes `SchedulerSidecarMixin`, initializes sidecar state during startup, and derives `worker_id` using the old `host:port[:tpN][:dpN]` pattern.
+- The normal and overlap loops now capture pre-run KV state, drain `current` immediately after launch, and drain `finished` after result processing using the correct pre-batch KV snapshot for each loop style.
+- Scheduling snapshots are now drained before prefill admission, assembled into `EngineState`, and sent through the Phase 3 transport client when sidecar scheduling is configured.
+- Prefill admission now applies sidecar `max_prefill_tokens` only when a matching decision exists for the current scheduling iteration; otherwise it falls back to the fresh upstream budget.
+- Generate-request acceptance is counted for sidecar observability only when a real generation request is successfully queued; embedding requests remain excluded.
+- Router acknowledgment fields remain intentionally unset because fresh upstream does not currently expose the old sidecar router tracker state.
 
 ### Phase 6: Validation
 

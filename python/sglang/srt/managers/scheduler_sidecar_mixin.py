@@ -18,7 +18,15 @@ class SchedulerSidecarMixin:
     """Build sidecar snapshot state without wiring it into the live loop yet."""
 
     def init_sidecar(self: "Scheduler", _server_args) -> None:
-        self.slo_client = None
+        if getattr(_server_args, "slo_scheduler_addr", None):
+            from sglang.srt.managers.slo_scheduler_client import SLOSchedulerClient
+
+            self.slo_client = SLOSchedulerClient(
+                _server_args.slo_scheduler_addr,
+                _server_args.slo_scheduler_timeout_ms,
+            )
+        else:
+            self.slo_client = None
         self._pending_finished = None
         self._pending_current = None
         self._pending_scheduling = None
@@ -26,6 +34,66 @@ class SchedulerSidecarMixin:
         self._pre_batch_kv_used = 0
         self._prev_pre_batch_kv_used = 0
         self._accepted_since_last_send = 0
+
+    def _assemble_and_send_engine_state(self: "Scheduler") -> None:
+        from slo_scheduler.messages.engine_state import (
+            CurrentSnapshot,
+            EngineState,
+            FinishedIterationData,
+        )
+
+        if self.slo_client is None or self._pending_scheduling is None:
+            return
+
+        if (
+            self._pending_finished is None
+            and self._pending_current is None
+            and self.chunked_req is None
+            and len(self.waiting_queue) == 0
+            and (self.running_batch is None or self.running_batch.is_empty())
+        ):
+            return
+
+        finished = self._pending_finished or FinishedIterationData(
+            iteration_count=self.iteration_count,
+            batch_size_tokens=0,
+            prefill_chunk_pairs=[],
+            kv_tokens_used=0,
+            forward_mode="DECODE",
+            actual_time_ms=0.0,
+        )
+        current = self._pending_current or CurrentSnapshot(
+            iteration_count=self.iteration_count,
+            timestamp_ms=time.time() * 1000,
+            num_running_requests=(
+                len(self.running_batch.reqs)
+                if self.running_batch is not None and self.running_batch.reqs is not None
+                else 0
+            ),
+            num_waiting_requests=len(self.waiting_queue),
+            kv_tokens_used=self._get_token_info()[0],
+            kv_capacity=self.max_total_num_tokens,
+            running_requests=[],
+            router_generation=None,
+            router_last_ack_id=None,
+        )
+
+        state = EngineState(
+            protocol_version=1,
+            min_sidecar_version=1,
+            worker_id=self.worker_id,
+            finished=finished,
+            current=current,
+            scheduling=self._pending_scheduling,
+            accepted_requests_count=self._accepted_since_last_send,
+        )
+
+        self._last_sidecar_decision = self.slo_client.send_and_recv(
+            state, current_iteration=self._pending_scheduling.iteration_count
+        )
+        self._accepted_since_last_send = 0
+        self._pending_finished = None
+        self._pending_current = None
 
     def _req_to_request_info(self: "Scheduler", req):
         from slo_scheduler.messages.engine_state import RequestInfo
