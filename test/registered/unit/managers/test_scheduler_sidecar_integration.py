@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_sidecar_mixin import SchedulerSidecarMixin
 from sglang.srt.managers.schedule_batch import Req
@@ -297,6 +298,53 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
 
         self.assertEqual(len(scheduler.waiting_queue), 1)
         self.assertEqual(scheduler._accepted_since_last_send, 0)
+
+    def test_handle_generate_request_marks_grammar_deferred_req_for_sidecar_counting(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        captured = {}
+        scheduler.router_ack_tracker = SimpleNamespace(record=lambda *_args: True)
+        scheduler.server_args = SimpleNamespace(
+            disaggregation_bootstrap_port=31000,
+            allow_auto_truncate=False,
+        )
+        scheduler.session_controller = {}
+        scheduler.model_config = SimpleNamespace(
+            hf_eos_token_id={2},
+            vocab_size=32000,
+        )
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.metrics_collector = None
+        scheduler.enable_metrics = False
+        scheduler.tokenizer = None
+        scheduler.dllm_config = None
+        scheduler.max_req_input_len = 4096
+        scheduler.grammar_manager = SimpleNamespace(
+            process_req_with_grammar=lambda req: captured.setdefault("req", req) or True
+        )
+        scheduler.init_req_max_new_tokens = lambda req: None
+        scheduler._add_request_to_queue = lambda req, is_retracted=False: None
+
+        recv_req = TokenizedGenerateReqInput(
+            rid="grammar-1",
+            input_text="hello",
+            input_ids=[1, 2, 3],
+            mm_inputs=None,
+            sampling_params=SamplingParams(max_new_tokens=4),
+            return_logprob=False,
+            logprob_start_len=-1,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+        )
+
+        with patch(
+            "sglang.srt.managers.schedule_batch.get_global_server_args",
+            return_value=SimpleNamespace(speculative_algorithm=None),
+        ):
+            Scheduler.handle_generate_request(scheduler, recv_req)
+
+        self.assertIn("req", captured)
+        self.assertTrue(captured["req"]._sidecar_count_as_accepted)
 
     def test_event_loop_normal_drains_current_then_finished(self):
         batch = SimpleNamespace(reqs=[object()])

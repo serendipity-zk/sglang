@@ -1723,6 +1723,7 @@ class Scheduler(
                 time_stats=recv_req.time_stats,
             )
             req.tokenizer = self.tokenizer
+            req._sidecar_count_as_accepted = True
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -1752,6 +1753,7 @@ class Scheduler(
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
             # TODO: set trace context
+            req._sidecar_count_as_accepted = True
             if self.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
             if isinstance(req.finished_reason, FINISH_ABORT):
@@ -1769,6 +1771,7 @@ class Scheduler(
                 vocab_size=self.model_config.vocab_size,
             )
             req.tokenizer = self.tokenizer
+            req._sidecar_count_as_accepted = True
             req.set_finish_with_abort(
                 f"Invalid request: session id {session_id} does not exist"
             )
@@ -1842,7 +1845,6 @@ class Scheduler(
 
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
-            req._sidecar_count_as_accepted = not req.finished()
             self._add_request_to_queue(req)
 
     def handle_batch_generate_request(
