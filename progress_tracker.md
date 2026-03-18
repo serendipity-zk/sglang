@@ -114,11 +114,19 @@ Phase 1 status:
 
 ### Phase 2: Request Runtime State
 
-- [ ] Add minimal SLO fields to `Req`
-- [ ] Re-add `start_iteration` only if the sidecar message contract still needs it
-- [ ] Re-add router metadata only if the actual sidecar still depends on it
+- [x] Add minimal SLO fields to `Req`
+- [x] Re-add `start_iteration` only if the sidecar message contract still needs it
+- [x] Re-add router metadata only if the actual sidecar still depends on it
 - Testability target:
   scheduler-side request objects should expose the new metadata without breaking normal request creation paths.
+
+Phase 2 status:
+- Fresh `Req` now carries the minimal runtime/request SLO state needed for the sidecar path:
+  `target_ttft_ms`, `target_tpot_ms`, `arrival_time_ms`, and `slo_violated`.
+- Fresh scheduler request creation and session-based request creation both preserve those fields.
+- Focused unit coverage now exercises direct `Req` construction and `Session.create_req()` propagation.
+- Re-checking `/sgl-workspace/data/PolyserveSidecar` showed no current need for `start_iteration` in the live sidecar contract, so it remains excluded from fresh upstream for now.
+- Re-checking `/sgl-workspace/data/PolyserveSidecar` also showed router generation/message-id fields exist only as optional observability fields in sidecar messages. They are not needed for minimal Phase 2 request runtime state, so they remain excluded until Phase 4/5 proves they are required.
 
 ### Phase 3: Sidecar Transport
 

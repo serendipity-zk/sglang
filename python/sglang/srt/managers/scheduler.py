@@ -1657,6 +1657,9 @@ class Scheduler(
                     self.metrics_collector if self.enable_metrics else None
                 ),
                 routing_key=recv_req.routing_key,
+                target_ttft_ms=recv_req.target_ttft_ms,
+                target_tpot_ms=recv_req.target_tpot_ms,
+                arrival_time_ms=recv_req.arrival_time_ms,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,

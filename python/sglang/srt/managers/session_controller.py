@@ -215,6 +215,9 @@ class Session:
             return_routed_experts=req.return_routed_experts,
             priority=req.priority,
             routing_key=req.routing_key,
+            target_ttft_ms=req.target_ttft_ms,
+            target_tpot_ms=req.target_tpot_ms,
+            arrival_time_ms=req.arrival_time_ms,
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
         )
