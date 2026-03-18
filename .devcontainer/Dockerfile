@@ -16,14 +16,21 @@ RUN apt-get update && apt-get install -y sudo && \
 # Set up oh-my-zsh for devuser
 RUN cp -r /root/.oh-my-zsh /home/devuser/.oh-my-zsh && \
     cp /root/.zshrc /home/devuser/.zshrc && \
-    cp /root/.vimrc /home/devuser/.vimrc && \
-    cp /root/.tmux.conf /home/devuser/.tmux.conf && \
+    cp /root/.vimrc /home/devuser/.vimrc 2>/dev/null || true && \
+    cp /root/.tmux.conf /home/devuser/.tmux.conf 2>/dev/null || true && \
     sed -i 's|/root/.oh-my-zsh|/home/devuser/.oh-my-zsh|g' /home/devuser/.zshrc && \
     chown -R devuser:devuser /home/devuser/
 
 # Set workspace directory and ownership
 WORKDIR /sgl-workspace/sglang
 RUN chown -R devuser:devuser /sgl-workspace
+
+# Install Node.js and Claude Code + Codex CLIs
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y nodejs && \
+    npm install -g @anthropic-ai/claude-code @openai/codex && \
+    rm -rf /var/lib/apt/lists/* && \
+    apt-get clean
 
 # Switch to devuser
 USER devuser
