@@ -8,9 +8,9 @@ use futures;
 use parking_lot::RwLock;
 use serde_json::{self, json};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -48,6 +48,136 @@ pub struct PendingMessage {
     pub body_json: serde_json::Value,
     /// Number of input tokens for this request (for TTFT estimation)
     pub input_token_count: i64,
+}
+
+/// Compact snapshot of router-tracked pending messages for diagnostics.
+#[derive(Debug, Clone, Default)]
+pub struct PendingMessageDebugInfo {
+    pub count: usize,
+    pub min_message_id: Option<i64>,
+    pub max_message_id: Option<i64>,
+    pub generation: Option<i64>,
+    pub sample_message_ids: Vec<i64>,
+    pub sample_request_ids: Vec<String>,
+    pub oldest_age_ms: Option<u64>,
+    pub newest_age_ms: Option<u64>,
+    pub max_resend_count: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct RouterEpochResetInfo {
+    pub failed_generation: i64,
+    pub failed_message_id: i64,
+    pub new_generation: i64,
+    pub cleared_count: usize,
+    pub cleared_min_message_id: Option<i64>,
+    pub cleared_max_message_id: Option<i64>,
+    pub cleared_message_ids: Vec<i64>,
+    pub cleared_request_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RouterMessageState {
+    pub generation: i64,
+    pub next_message_id: i64,
+    pub pending_messages: Vec<PendingMessage>,
+}
+
+impl PendingMessageDebugInfo {
+    pub fn compact_string(&self) -> String {
+        if self.count == 0 {
+            return "count=0".to_string();
+        }
+
+        let ids = if self.sample_message_ids.is_empty() {
+            "[]".to_string()
+        } else {
+            format!(
+                "[{}]",
+                self.sample_message_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
+        let reqs = if self.sample_request_ids.is_empty() {
+            "[]".to_string()
+        } else {
+            format!("[{}]", self.sample_request_ids.join(","))
+        };
+
+        format!(
+            "count={} gen={:?} min_id={:?} max_id={:?} oldest_ms={:?} newest_ms={:?} max_resend={} ids={} reqs={}",
+            self.count,
+            self.generation,
+            self.min_message_id,
+            self.max_message_id,
+            self.oldest_age_ms,
+            self.newest_age_ms,
+            self.max_resend_count,
+            ids,
+            reqs
+        )
+    }
+}
+
+fn build_pending_message_debug_info(pending: &[PendingMessage]) -> PendingMessageDebugInfo {
+    if pending.is_empty() {
+        return PendingMessageDebugInfo::default();
+    }
+
+    let now = Instant::now();
+    let mut min_message_id = None;
+    let mut max_message_id = None;
+    let mut oldest_age_ms = None;
+    let mut newest_age_ms = None;
+    let mut max_resend_count = 0;
+    let mut sample_message_ids = Vec::new();
+    let mut sample_request_ids = Vec::new();
+
+    for msg in pending.iter() {
+        min_message_id = Some(min_message_id.map_or(msg.message_id, |v: i64| v.min(msg.message_id)));
+        max_message_id = Some(max_message_id.map_or(msg.message_id, |v: i64| v.max(msg.message_id)));
+
+        let age_ms = now.saturating_duration_since(msg.timestamp).as_millis() as u64;
+        oldest_age_ms = Some(oldest_age_ms.map_or(age_ms, |v: u64| v.max(age_ms)));
+        newest_age_ms = Some(newest_age_ms.map_or(age_ms, |v: u64| v.min(age_ms)));
+        max_resend_count = max_resend_count.max(msg.resend_count);
+
+        if sample_message_ids.len() < 5 {
+            sample_message_ids.push(msg.message_id);
+        }
+        if sample_request_ids.len() < 3 {
+            if let Some(request_id) = &msg.request_id {
+                sample_request_ids.push(request_id.clone());
+            }
+        }
+    }
+
+    PendingMessageDebugInfo {
+        count: pending.len(),
+        min_message_id,
+        max_message_id,
+        generation: pending.first().map(|msg| msg.generation),
+        sample_message_ids,
+        sample_request_ids,
+        oldest_age_ms,
+        newest_age_ms,
+        max_resend_count,
+    }
+}
+
+fn next_router_generation(current_generation: i64) -> i64 {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("System time before Unix epoch")
+        .as_millis() as i64;
+    if now_ms > current_generation {
+        now_ms
+    } else {
+        current_generation + 1
+    }
 }
 
 impl PendingMessage {
@@ -94,11 +224,16 @@ pub async fn resend_message(worker_url: &str, message: &PendingMessage) {
 
     let url = format!("{}{}", worker_url, message.route);
     info!(
-        "[RESEND] worker={} message_id={} attempt={} route={}",
-        worker_url,
-        message.message_id,
-        message.resend_count + 1,
-        message.route
+        worker = worker_url,
+        generation = message.generation,
+        message_id = message.message_id,
+        request_id = message.request_id.as_deref().unwrap_or("-"),
+        route = message.route.as_str(),
+        resend_attempt = message.resend_count + 1,
+        age_ms = message.timestamp.elapsed().as_millis() as u64,
+        since_last_send_ms = message.last_send_time.elapsed().as_millis() as u64,
+        input_tokens = message.input_token_count,
+        "[PENDING_TRACE] resending pending router message"
     );
 
     // Fire and forget - spawn to avoid blocking the resend checker
@@ -183,8 +318,30 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Get total input tokens for pending messages (for TTFT estimation)
     fn pending_message_tokens(&self) -> i64;
 
+    /// Get a compact diagnostic snapshot of pending router messages.
+    fn pending_message_debug_info(&self) -> PendingMessageDebugInfo;
+
     /// Track a dispatched message until it is acknowledged.
     fn add_pending_message(&self, message: PendingMessage);
+
+    /// Atomically allocate router message metadata and track the message as pending.
+    fn allocate_pending_message(
+        &self,
+        route: String,
+        request_id: Option<String>,
+        body_json: serde_json::Value,
+        input_token_count: i64,
+    ) -> PendingMessage;
+
+    /// Remove a specific pending message when the router knows dispatch failed.
+    fn remove_pending_message(&self, generation: i64, message_id: i64) -> Option<PendingMessage>;
+
+    /// Reset this worker's router epoch after an undelivered transport failure.
+    fn reset_router_epoch_after_transport_failure(
+        &self,
+        generation: i64,
+        message_id: i64,
+    ) -> Option<RouterEpochResetInfo>;
 
     /// Remove acknowledged messages up to and including the provided ID for a generation.
     /// Returns removed messages so callers can emit metrics.
@@ -474,17 +631,13 @@ pub struct BasicWorker {
     pub metadata: WorkerMetadata,
     pub load_counter: Arc<AtomicUsize>,
     pub processed_counter: Arc<AtomicUsize>,
-    pub pending_messages: Arc<RwLock<Vec<PendingMessage>>>,
+    pub router_state: Arc<RwLock<RouterMessageState>>,
     pub healthy: Arc<AtomicBool>,
     pub consecutive_failures: Arc<AtomicUsize>,
     pub consecutive_successes: Arc<AtomicUsize>,
     pub circuit_breaker: CircuitBreaker,
     /// Optional gRPC client for gRPC workers
     pub grpc_client: Option<Arc<Mutex<SglangSchedulerClient>>>,
-    /// Per-worker message ID counter
-    pub message_counter: Arc<AtomicI64>,
-    /// Router generation (startup timestamp)
-    pub generation: i64,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -492,7 +645,10 @@ impl fmt::Debug for BasicWorker {
         f.debug_struct("BasicWorker")
             .field("metadata", &self.metadata)
             .field("healthy", &self.healthy.load(Ordering::Relaxed))
-            .field("pending_messages", &self.pending_messages.read().len())
+            .field(
+                "pending_messages",
+                &self.router_state.read().pending_messages.len(),
+            )
             .field("circuit_breaker", &self.circuit_breaker)
             .field("has_grpc_client", &self.grpc_client.is_some())
             .finish()
@@ -648,26 +804,97 @@ impl Worker for BasicWorker {
     }
 
     fn pending_message_count(&self) -> usize {
-        self.pending_messages.read().len()
+        self.router_state.read().pending_messages.len()
     }
 
     fn pending_message_tokens(&self) -> i64 {
-        self.pending_messages
+        self.router_state
             .read()
+            .pending_messages
             .iter()
             .map(|msg| msg.input_token_count)
             .sum()
     }
 
+    fn pending_message_debug_info(&self) -> PendingMessageDebugInfo {
+        let state = self.router_state.read();
+        build_pending_message_debug_info(&state.pending_messages)
+    }
+
     fn add_pending_message(&self, message: PendingMessage) {
-        let mut pending = self.pending_messages.write();
-        pending.push(message);
+        let mut state = self.router_state.write();
+        state.pending_messages.push(message);
+    }
+
+    fn allocate_pending_message(
+        &self,
+        route: String,
+        request_id: Option<String>,
+        body_json: serde_json::Value,
+        input_token_count: i64,
+    ) -> PendingMessage {
+        let mut state = self.router_state.write();
+        let message = PendingMessage::new(
+            state.next_message_id,
+            state.generation,
+            route.clone(),
+            request_id.clone(),
+            body_json,
+            input_token_count,
+        );
+        state.next_message_id += 1;
+        state.pending_messages.push(message.clone());
+
+        message
+    }
+
+    fn remove_pending_message(&self, generation: i64, message_id: i64) -> Option<PendingMessage> {
+        let mut state = self.router_state.write();
+        let idx = state
+            .pending_messages
+            .iter()
+            .position(|msg| msg.generation == generation && msg.message_id == message_id)?;
+        Some(state.pending_messages.remove(idx))
+    }
+
+    fn reset_router_epoch_after_transport_failure(
+        &self,
+        generation: i64,
+        message_id: i64,
+    ) -> Option<RouterEpochResetInfo> {
+        let mut state = self.router_state.write();
+        if state.generation != generation {
+            return None;
+        }
+
+        let cleared_info = build_pending_message_debug_info(&state.pending_messages);
+        let new_generation = next_router_generation(state.generation);
+        let cleared_count = state.pending_messages.len();
+        let cleared_min_message_id = cleared_info.min_message_id;
+        let cleared_max_message_id = cleared_info.max_message_id;
+        let cleared_message_ids = cleared_info.sample_message_ids.clone();
+        let cleared_request_ids = cleared_info.sample_request_ids.clone();
+
+        state.pending_messages.clear();
+        state.generation = new_generation;
+        state.next_message_id = 0;
+
+        Some(RouterEpochResetInfo {
+            failed_generation: generation,
+            failed_message_id: message_id,
+            new_generation,
+            cleared_count,
+            cleared_min_message_id,
+            cleared_max_message_id,
+            cleared_message_ids,
+            cleared_request_ids,
+        })
     }
 
     fn remove_messages_up_to(&self, generation: i64, last_message_id: i64) -> Vec<PendingMessage> {
         let mut removed = Vec::new();
-        let mut pending = self.pending_messages.write();
-        pending.retain(|msg| {
+        let mut state = self.router_state.write();
+        state.pending_messages.retain(|msg| {
             let should_remove = msg.generation == generation && msg.message_id <= last_message_id;
             if should_remove {
                 removed.push(msg.clone());
@@ -679,9 +906,9 @@ impl Worker for BasicWorker {
 
     fn cleanup_stale_messages(&self, ttl: Duration) -> Vec<PendingMessage> {
         let mut removed = Vec::new();
-        let mut pending = self.pending_messages.write();
+        let mut state = self.router_state.write();
         let now = Instant::now();
-        pending.retain(|msg| {
+        state.pending_messages.retain(|msg| {
             let stale = now.duration_since(msg.timestamp) >= ttl;
             if stale {
                 removed.push(msg.clone());
@@ -692,30 +919,58 @@ impl Worker for BasicWorker {
     }
 
     fn next_message_id(&self) -> i64 {
-        self.message_counter.fetch_add(1, Ordering::Relaxed)
+        let mut state = self.router_state.write();
+        let next = state.next_message_id;
+        state.next_message_id += 1;
+        next
     }
 
     fn generation(&self) -> i64 {
-        self.generation
+        self.router_state.read().generation
     }
 
     fn cleanup_pending_messages(&self, ttl: Duration) {
+        let pending_before = self.pending_message_debug_info();
         let removed = self.cleanup_stale_messages(ttl);
         if !removed.is_empty() {
             RouterMetrics::record_message_timeout(self.url(), removed.len());
             RouterMetrics::set_pending_messages(self.url(), self.pending_message_count());
+            let pending_after = self.pending_message_debug_info();
+            let removed_min_id = removed.first().map(|msg| msg.message_id);
+            let removed_max_id = removed.last().map(|msg| msg.message_id);
+            let removed_generation = removed.first().map(|msg| msg.generation);
+            let removed_message_ids = removed
+                .iter()
+                .take(5)
+                .map(|msg| msg.message_id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let removed_request_ids = removed
+                .iter()
+                .filter_map(|msg| msg.request_id.as_deref())
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(",");
             warn!(
                 worker = self.url(),
                 removed = removed.len(),
+                removed_generation = removed_generation,
+                removed_min_id = removed_min_id,
+                removed_max_id = removed_max_id,
                 ttl_secs = ttl.as_secs(),
-                "Removed stale pending router messages due to TTL expiration"
+                removed_message_ids = removed_message_ids,
+                removed_request_ids = removed_request_ids,
+                pending_before = pending_before.compact_string(),
+                pending_after = pending_after.compact_string(),
+                "[PENDING_TRACE] Removed stale pending router messages due to TTL expiration"
             );
         }
     }
 
     fn get_messages_to_resend(&self) -> Vec<PendingMessage> {
-        let pending = self.pending_messages.read();
-        pending
+        let state = self.router_state.read();
+        state
+            .pending_messages
             .iter()
             .filter(|msg| msg.should_resend())
             .cloned()
@@ -723,8 +978,12 @@ impl Worker for BasicWorker {
     }
 
     fn mark_resent(&self, message_id: i64) {
-        let mut pending = self.pending_messages.write();
-        if let Some(msg) = pending.iter_mut().find(|m| m.message_id == message_id) {
+        let mut state = self.router_state.write();
+        if let Some(msg) = state
+            .pending_messages
+            .iter_mut()
+            .find(|m| m.message_id == message_id)
+        {
             msg.resend_count += 1;
             msg.last_send_time = Instant::now();
         }
@@ -833,8 +1092,41 @@ impl Worker for DPAwareWorker {
         self.base_worker.pending_message_tokens()
     }
 
+    fn pending_message_debug_info(&self) -> PendingMessageDebugInfo {
+        self.base_worker.pending_message_debug_info()
+    }
+
     fn add_pending_message(&self, message: PendingMessage) {
         self.base_worker.add_pending_message(message);
+    }
+
+    fn allocate_pending_message(
+        &self,
+        route: String,
+        request_id: Option<String>,
+        body_json: serde_json::Value,
+        input_token_count: i64,
+    ) -> PendingMessage {
+        self.base_worker.allocate_pending_message(
+            route,
+            request_id,
+            body_json,
+            input_token_count,
+        )
+    }
+
+    fn remove_pending_message(&self, generation: i64, message_id: i64) -> Option<PendingMessage> {
+        self.base_worker
+            .remove_pending_message(generation, message_id)
+    }
+
+    fn reset_router_epoch_after_transport_failure(
+        &self,
+        generation: i64,
+        message_id: i64,
+    ) -> Option<RouterEpochResetInfo> {
+        self.base_worker
+            .reset_router_epoch_after_transport_failure(generation, message_id)
     }
 
     fn remove_messages_up_to(&self, generation: i64, last_message_id: i64) -> Vec<PendingMessage> {
@@ -2087,6 +2379,27 @@ mod tests {
     }
 
     #[test]
+    fn remove_pending_message_removes_exact_entry_only() {
+        let worker = ledger_worker();
+        for id in 0..5 {
+            worker.add_pending_message(make_pending(id));
+        }
+
+        let removed = worker.remove_pending_message(777, 2).unwrap();
+        assert_eq!(removed.message_id, 2);
+        assert_eq!(worker.pending_message_count(), 4);
+
+        let remaining_ids: Vec<i64> = worker
+            .router_state
+            .read()
+            .pending_messages
+            .iter()
+            .map(|msg| msg.message_id)
+            .collect();
+        assert_eq!(remaining_ids, vec![0, 1, 3, 4]);
+    }
+
+    #[test]
     fn cleanup_stale_messages_removes_entries_past_ttl() {
         let worker = ledger_worker();
         let fresh = make_pending(10);
@@ -2103,12 +2416,36 @@ mod tests {
 
         // Force the remaining entry to be stale and clean again
         {
-            let mut guard = worker.pending_messages.write();
-            guard[0].timestamp = Instant::now() - Duration::from_secs(120);
+            let mut guard = worker.router_state.write();
+            guard.pending_messages[0].timestamp = Instant::now() - Duration::from_secs(120);
         }
         let removed_again = worker.cleanup_stale_messages(Duration::from_secs(60));
         assert_eq!(removed_again.len(), 1);
         assert_eq!(worker.pending_message_count(), 0);
+    }
+
+    #[test]
+    fn reset_router_epoch_after_transport_failure_clears_pending_and_resets_counter() {
+        let worker = ledger_worker();
+        for id in 0..3 {
+            worker.add_pending_message(make_pending(id));
+        }
+
+        let old_generation = worker.generation();
+        let reset = worker
+            .reset_router_epoch_after_transport_failure(old_generation, 1)
+            .unwrap();
+
+        assert_eq!(reset.failed_generation, old_generation);
+        assert_eq!(reset.failed_message_id, 1);
+        assert_eq!(reset.cleared_count, 3);
+        assert_eq!(reset.cleared_min_message_id, Some(0));
+        assert_eq!(reset.cleared_max_message_id, Some(2));
+        assert!(reset.new_generation > old_generation);
+        assert_eq!(worker.pending_message_count(), 0);
+        assert_eq!(worker.generation(), reset.new_generation);
+        assert_eq!(worker.next_message_id(), 0);
+        assert_eq!(worker.next_message_id(), 1);
     }
 
     #[test]
@@ -2156,8 +2493,8 @@ mod tests {
     #[test]
     fn test_dp_aware_worker_message_ids() {
         const TEST_GEN: i64 = 111222;
-        let dp_worker = DPAwareWorkerBuilder::new_with_generation("http://worker:8080", TEST_GEN, 0, 4)
-            .build();
+        let dp_worker =
+            DPAwareWorkerBuilder::new_with_generation("http://worker:8080", TEST_GEN, 0, 4).build();
 
         // DP-aware workers should also have independent per-worker counters
         assert_eq!(dp_worker.next_message_id(), 0);

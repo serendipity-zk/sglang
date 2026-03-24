@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use rand::seq::SliceRandom;
 use tokio::sync::mpsc;
 use tokio::time::{interval, MissedTickBehavior};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::types::{AutoScalingConfig, WorkerSelectionPolicy};
 use crate::core::{Worker, WorkerId, WorkerStats};
@@ -109,7 +109,8 @@ impl SloAwareScheduler {
 
     /// Record that a request was scheduled to this worker
     fn record_scheduled(&self, worker_url: &str) {
-        self.last_scheduled_time.insert(worker_url.to_string(), std::time::Instant::now());
+        self.last_scheduled_time
+            .insert(worker_url.to_string(), std::time::Instant::now());
     }
 
     /// Record a TTFT violation for a tier
@@ -156,11 +157,7 @@ impl SloAwareScheduler {
 
     /// Get batch size for a worker at a specific TPOT tier
     /// Uses nearest key matching if exact key not found
-    fn get_batch_size_for_tier(
-        &self,
-        worker_stats: &WorkerStats,
-        tier_tpot: f32,
-    ) -> i64 {
+    fn get_batch_size_for_tier(&self, worker_stats: &WorkerStats, tier_tpot: f32) -> i64 {
         let tier_map = match &worker_stats.batch_size_by_tpot_tier {
             Some(m) => m,
             None => return 0,
@@ -261,7 +258,8 @@ impl SloAwareScheduler {
         }
 
         // Check if auto-scaling is enabled
-        let auto_scaling_enabled = self.auto_scaling
+        let auto_scaling_enabled = self
+            .auto_scaling
             .as_ref()
             .map(|config| config.enabled)
             .unwrap_or(false);
@@ -365,7 +363,8 @@ impl SloAwareScheduler {
             // original --worker-urls CLI order (sorted ascending by URL).  We must
             // sort the collected worker URLs so the zip pairs each worker with its
             // correct sidecar.
-            let mut worker_urls: Vec<String> = all_workers.iter()
+            let mut worker_urls: Vec<String> = all_workers
+                .iter()
                 .map(|(_, worker)| worker.url().to_string())
                 .collect();
             worker_urls.sort();
@@ -382,10 +381,7 @@ impl SloAwareScheduler {
 
             let mut map = self.sidecar_url_map.write().unwrap();
             for (worker_url, sidecar_url) in worker_urls.iter().zip(sidecar_urls.iter()) {
-                info!(
-                    "  Sidecar mapping: {} → {}",
-                    worker_url, sidecar_url
-                );
+                info!("  Sidecar mapping: {} → {}", worker_url, sidecar_url);
                 map.insert(worker_url.clone(), sidecar_url.clone());
             }
 
@@ -541,11 +537,7 @@ impl SloAwareScheduler {
                     if response.status().is_success() {
                         tracing::debug!("TPOT update sent to {}: {} ms", url, tpot_ms);
                     } else {
-                        tracing::warn!(
-                            "TPOT update to {}: HTTP {}",
-                            url,
-                            response.status()
-                        );
+                        tracing::warn!("TPOT update to {}: HTTP {}", url, response.status());
                     }
                 }
                 Err(e) => {
@@ -560,7 +552,8 @@ impl SloAwareScheduler {
     /// - Assign idle workers to tiers with pending queues
     fn schedule_worker(&self, worker_registry: &Arc<crate::core::WorkerRegistry>) {
         // Check if auto-scaling is enabled
-        let auto_scaling_enabled = self.auto_scaling
+        let auto_scaling_enabled = self
+            .auto_scaling
             .as_ref()
             .map(|config| config.enabled)
             .unwrap_or(false);
@@ -615,9 +608,7 @@ impl SloAwareScheduler {
                 self.send_tpot_update(worker.url(), new_tpot);
                 info!(
                     "[IDLE] {} moved from tier {} to idle (TPOT {}ms)",
-                    letter,
-                    self.tpot_buckets[from_tier] as u32,
-                    new_tpot as u64
+                    letter, self.tpot_buckets[from_tier] as u32, new_tpot as u64
                 );
             }
         }
@@ -639,13 +630,15 @@ impl SloAwareScheduler {
         // Step 3: Assign idle workers to tiers with pending queues
         // Only assign workers that are truly idle (no pending work)
         if !tiers_with_queue.is_empty() {
-            let idle_worker_ids: Vec<WorkerId> = self.tier_workers
+            let idle_worker_ids: Vec<WorkerId> = self
+                .tier_workers
                 .get(&idle_tier_idx)
                 .map(|workers| workers.clone())
                 .unwrap_or_default();
 
             // Filter to only truly idle workers (num_requests=0, queue=0, pending=0)
-            let truly_idle: Vec<&WorkerId> = idle_worker_ids.iter()
+            let truly_idle: Vec<&WorkerId> = idle_worker_ids
+                .iter()
                 .filter(|worker_id| {
                     if let Some(worker) = worker_registry.get(worker_id) {
                         self.is_worker_truly_idle(worker.as_ref())
@@ -657,8 +650,8 @@ impl SloAwareScheduler {
 
             // Assign one idle worker to each tier with pending queue (round-robin)
             for (idle_worker_id, (target_tier_idx, _queue_size)) in
-                truly_idle.iter().zip(tiers_with_queue.iter().cycle()) {
-
+                truly_idle.iter().zip(tiers_with_queue.iter().cycle())
+            {
                 // Remove from idle tier
                 if let Some(mut worker_ids) = self.tier_workers.get_mut(&idle_tier_idx) {
                     worker_ids.retain(|id| id != *idle_worker_id);
@@ -677,31 +670,31 @@ impl SloAwareScheduler {
                     self.send_tpot_update(worker.url(), new_tpot);
                     info!(
                         "[ASSIGN] {} moved from idle to tier {} (TPOT {}ms)",
-                        letter,
-                        self.tpot_buckets[*target_tier_idx] as u32,
-                        new_tpot as u64
+                        letter, self.tpot_buckets[*target_tier_idx] as u32, new_tpot as u64
                     );
                 }
             }
         }
 
         // Step 4: Steal from lower tiers if enabled
-        let steal_enabled = self.auto_scaling
+        let steal_enabled = self
+            .auto_scaling
             .as_ref()
             .map(|config| config.steal_from_lower_tier)
             .unwrap_or(false);
 
-        let steal_idle_threshold_ms = self.auto_scaling
+        let steal_idle_threshold_ms = self
+            .auto_scaling
             .as_ref()
             .map(|config| config.steal_idle_threshold_ms)
             .unwrap_or(1000);
 
         if steal_enabled {
-
             // Re-check which tiers still have queues AND have violations
             let mut tiers_needing_workers: Vec<usize> = Vec::new();
             for tier_idx in 0..self.tpot_buckets.len() {
-                let has_queue = self.tier_queue_sizes
+                let has_queue = self
+                    .tier_queue_sizes
                     .get(&tier_idx)
                     .map(|q| q.load(Ordering::Relaxed) > 0)
                     .unwrap_or(false);
@@ -723,7 +716,8 @@ impl SloAwareScheduler {
                 // Look at lower tiers (tier_idx > target_tier_idx means higher TPOT)
                 for source_tier_idx in (target_tier_idx + 1)..self.tpot_buckets.len() {
                     // Check if source tier has no queue
-                    let source_has_queue = self.tier_queue_sizes
+                    let source_has_queue = self
+                        .tier_queue_sizes
                         .get(&source_tier_idx)
                         .map(|q| q.load(Ordering::Relaxed) > 0)
                         .unwrap_or(false);
@@ -733,7 +727,8 @@ impl SloAwareScheduler {
                     }
 
                     // Get workers in source tier
-                    let source_workers: Vec<WorkerId> = self.tier_workers
+                    let source_workers: Vec<WorkerId> = self
+                        .tier_workers
                         .get(&source_tier_idx)
                         .map(|w| w.clone())
                         .unwrap_or_default();
@@ -750,7 +745,8 @@ impl SloAwareScheduler {
                                 continue; // Worker recently had requests, don't steal
                             }
 
-                            let iter_time = stats.get(worker.url())
+                            let iter_time = stats
+                                .get(worker.url())
                                 .and_then(|ws| ws.last_iteration_time_ms)
                                 .unwrap_or(f64::MAX);
 
@@ -759,7 +755,9 @@ impl SloAwareScheduler {
                                 let letter = self.get_worker_letter(worker.url());
 
                                 // Remove from source tier
-                                if let Some(mut worker_ids) = self.tier_workers.get_mut(&source_tier_idx) {
+                                if let Some(mut worker_ids) =
+                                    self.tier_workers.get_mut(&source_tier_idx)
+                                {
                                     worker_ids.retain(|id| id != last_worker_id);
                                 }
 
@@ -852,11 +850,15 @@ impl SloAwareScheduler {
                     }
 
                     // Update health state
-                    self.worker_health_state.insert(worker_url.to_string(), true);
+                    self.worker_health_state
+                        .insert(worker_url.to_string(), true);
                 }
                 // Worker just became unhealthy (healthy -> unhealthy)
                 (Some(true), false) => {
-                    warn!("Worker {} is now UNHEALTHY - will be excluded from scheduling", worker_url);
+                    warn!(
+                        "Worker {} is now UNHEALTHY - will be excluded from scheduling",
+                        worker_url
+                    );
 
                     // Find which tier this worker belongs to for UI/logging
                     for tier_idx in 0..=self.tpot_buckets.len() {
@@ -872,7 +874,8 @@ impl SloAwareScheduler {
                     }
 
                     // Update health state
-                    self.worker_health_state.insert(worker_url.to_string(), false);
+                    self.worker_health_state
+                        .insert(worker_url.to_string(), false);
                 }
                 // Worker still healthy or still unhealthy - no change needed
                 (Some(true), true) | (Some(false), false) => {
@@ -881,7 +884,8 @@ impl SloAwareScheduler {
                 // First time seeing worker and it's unhealthy
                 (None, false) => {
                     // Initialize health state as unhealthy
-                    self.worker_health_state.insert(worker_url.to_string(), false);
+                    self.worker_health_state
+                        .insert(worker_url.to_string(), false);
                 }
             }
         }
@@ -911,7 +915,10 @@ impl SloAwareScheduler {
         }
     }
 
-    fn select_worker_first_available(&self, workers: &[Arc<dyn Worker>]) -> Option<Arc<dyn Worker>> {
+    fn select_worker_first_available(
+        &self,
+        workers: &[Arc<dyn Worker>],
+    ) -> Option<Arc<dyn Worker>> {
         if workers.is_empty() {
             return None;
         }
@@ -950,7 +957,8 @@ impl SloAwareScheduler {
                 for worker_id in worker_ids.iter() {
                     if let Some(worker) = worker_registry.get(worker_id) {
                         let letter = self.get_worker_letter(worker.url());
-                        let iter_time = stats.as_ref()
+                        let iter_time = stats
+                            .as_ref()
                             .and_then(|s| s.get(worker.url()))
                             .and_then(|ws| ws.last_iteration_time_ms)
                             .map(|t| t as u64)
@@ -1155,7 +1163,9 @@ impl SloAwareScheduler {
         // Phase 1: Find first worker that can meet remaining TTFT slack
         // This maintains a load gradient similar to first-available policy
         for worker in workers {
-            if let Some(estimated_ttft) = self.estimate_ttft(worker.as_ref(), request_tokens, margin_ms) {
+            if let Some(estimated_ttft) =
+                self.estimate_ttft(worker.as_ref(), request_tokens, margin_ms)
+            {
                 if estimated_ttft <= remaining_slack_ms {
                     // info!(
                     //     "[TTFT_SEL] worker={} ACCEPT est={:.1}ms <= slack={:.1}ms",
@@ -1216,7 +1226,9 @@ impl SloAwareScheduler {
         }
 
         // Normal case: try to meet remaining slack
-        if let Some(worker) = self.select_worker_ttft_aware(workers, request_tokens, remaining_slack_ms, margin_ms) {
+        if let Some(worker) =
+            self.select_worker_ttft_aware(workers, request_tokens, remaining_slack_ms, margin_ms)
+        {
             return Some(worker);
         }
 
@@ -1253,8 +1265,7 @@ impl SloAwareScheduler {
                 let violated = queue.remove(i).unwrap();
                 warn!(
                     "Rejecting request {}: TTFT target {:?} ms violated",
-                    violated.request_id,
-                    violated.target_ttft_ms
+                    violated.request_id, violated.target_ttft_ms
                 );
                 self.record_violation(queue_idx);
                 self.handle_timeout(violated);
@@ -1303,11 +1314,16 @@ impl SloAwareScheduler {
             let tier_filtered: Vec<Arc<dyn Worker>> = tier_worker_ids
                 .iter()
                 .filter_map(|worker_id| {
-                    available.iter().find(|w| {
-                        config.worker_registry.get_worker_id_by_url(w.url())
-                            .map(|id| &id == worker_id)
-                            .unwrap_or(false)
-                    }).cloned()
+                    available
+                        .iter()
+                        .find(|w| {
+                            config
+                                .worker_registry
+                                .get_worker_id_by_url(w.url())
+                                .map(|id| &id == worker_id)
+                                .unwrap_or(false)
+                        })
+                        .cloned()
                 })
                 .collect();
 
@@ -1351,7 +1367,9 @@ impl SloAwareScheduler {
         let schedule_map: HashMap<usize, Arc<dyn Worker>> = schedule_decisions
             .into_iter()
             .map(|(idx, worker)| {
-                *per_worker_count.entry(worker.url().to_string()).or_insert(0) += 1;
+                *per_worker_count
+                    .entry(worker.url().to_string())
+                    .or_insert(0) += 1;
                 (idx, worker)
             })
             .collect();
@@ -1368,7 +1386,9 @@ impl SloAwareScheduler {
                 self.record_scheduled(worker.url());
                 let dispatcher = Arc::clone(self);
                 let cfg = Arc::clone(config);
-                dispatcher.dispatch_to_worker(cfg, request, Arc::clone(worker)).await;
+                dispatcher
+                    .dispatch_to_worker(cfg, request, Arc::clone(worker))
+                    .await;
             } else {
                 queue.push_back(request);
             }
@@ -1376,7 +1396,11 @@ impl SloAwareScheduler {
 
         // Log scheduling stats if there was activity or pending requests
         if scheduled_count > 0 || remaining_count > 0 {
-            let tier_tpot = self.tpot_buckets.get(queue_idx).map(|b| *b as u32).unwrap_or(0);
+            let tier_tpot = self
+                .tpot_buckets
+                .get(queue_idx)
+                .map(|b| *b as u32)
+                .unwrap_or(0);
 
             // Build per-worker stats string
             let mut worker_stats_str = Vec::new();
@@ -1391,19 +1415,35 @@ impl SloAwareScheduler {
                         if let Ok(stats) = self.worker_stats.read() {
                             if let Some(ws) = stats.get(worker.url()) {
                                 let has_pending = self.has_pending_work(worker.as_ref());
-                                let prefill_map = ws.prefill_sim_metrics.as_ref()
+                                let pending_messages = worker.pending_message_count();
+                                let pending_tokens = worker.pending_message_tokens();
+                                let pending_debug = worker.pending_message_debug_info();
+                                let prefill_map = ws
+                                    .prefill_sim_metrics
+                                    .as_ref()
                                     .map(|m| {
                                         let mut entries: Vec<_> = m.iter().collect();
                                         entries.sort_by_key(|(k, _)| *k);
-                                        entries.iter()
+                                        entries
+                                            .iter()
                                             .map(|(k, v)| format!("{}:{:.0}", k, v))
                                             .collect::<Vec<_>>()
                                             .join(",")
                                     })
                                     .unwrap_or_else(|| "none".to_string());
-                                info!(
-                                    "[DIAG] tier={} worker={} pending_work={} prefill_map=[{}]",
-                                    tier_tpot, letter, has_pending, prefill_map
+                                debug!(
+                                    "[DIAG] tier={} worker={} pending_work={} num_reqs={} queue={} pending_msgs={} pending_tokens={} ack={:?}/{:?} pending_ledger={} prefill_map=[{}]",
+                                    tier_tpot,
+                                    letter,
+                                    has_pending,
+                                    ws.num_requests,
+                                    ws.waiting_queue_size,
+                                    pending_messages,
+                                    pending_tokens,
+                                    ws.router_generation,
+                                    ws.last_received_message_id,
+                                    pending_debug.compact_string(),
+                                    prefill_map
                                 );
                             }
                         }
@@ -1413,7 +1453,10 @@ impl SloAwareScheduler {
 
             info!(
                 "[SCHED] tier={}: scheduled={} remaining={} workers=[{}]",
-                tier_tpot, scheduled_count, remaining_count, worker_stats_str.join(" ")
+                tier_tpot,
+                scheduled_count,
+                remaining_count,
+                worker_stats_str.join(" ")
             );
         }
     }
@@ -1782,7 +1825,10 @@ impl Scheduler for SloAwareScheduler {
                     info!("  Queue {}: {}", i, range_desc);
                 }
                 if let Some(max_boundary) = self.tpot_buckets.last() {
-                    info!("  Requests with TPOT > {} ms will be rejected", max_boundary);
+                    info!(
+                        "  Requests with TPOT > {} ms will be rejected",
+                        max_boundary
+                    );
                 }
             }
 

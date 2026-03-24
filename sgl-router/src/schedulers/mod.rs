@@ -46,9 +46,6 @@ pub trait SchedulerBase: Send + Sync + Debug + 'static {
         // Generate message ID and add pending message BEFORE async spawn
         // This prevents race conditions where multiple requests select the same worker
         let (message_id, generation) = if request.route == "/generate" {
-            let msg_id = worker.next_message_id();
-            let gen = worker.generation();
-
             // Prefer middleware-provided request_id; fall back to payload if missing/empty
             let request_id = if !request.request_id.is_empty() {
                 Some(request.request_id.clone())
@@ -67,20 +64,21 @@ pub trait SchedulerBase: Send + Sync + Debug + 'static {
                 .input_token_count
                 .unwrap_or_else(|| (request.text.len() / 4) as i64);
             let add_pending_start = std::time::Instant::now();
-            worker.add_pending_message(PendingMessage::new(
-                msg_id,
-                gen,
+            let pending_message = worker.allocate_pending_message(
                 request.route.clone(),
                 request_id,
                 request.body_json.clone(),
                 input_token_count,
-            ));
+            );
             let add_pending_us = add_pending_start.elapsed().as_micros() as u64;
             if add_pending_us > 500 {
                 tracing::warn!("add_pending_message took {}us", add_pending_us);
             }
 
-            (Some(msg_id), Some(gen))
+            (
+                Some(pending_message.message_id),
+                Some(pending_message.generation),
+            )
         } else {
             (None, None)
         };
@@ -93,7 +91,11 @@ pub trait SchedulerBase: Send + Sync + Debug + 'static {
 
         let total_us = dispatch_fn_start.elapsed().as_micros() as u64;
         if total_us > 500 {
-            tracing::warn!("dispatch_to_worker total={}us (spawn={}us)", total_us, spawn_us);
+            tracing::warn!(
+                "dispatch_to_worker total={}us (spawn={}us)",
+                total_us,
+                spawn_us
+            );
         }
     }
 
@@ -106,7 +108,7 @@ pub trait SchedulerBase: Send + Sync + Debug + 'static {
         worker_url: &str,
         is_stream: bool,
         load_incremented: bool,
-    ) -> Response {
+    ) -> DispatchResult {
         send_http_request_impl(
             config,
             headers,
@@ -142,6 +144,11 @@ pub(crate) enum WorkerSelection {
     Selected(Arc<dyn Worker>),
     NoWorkers,
     PolicyDeferred,
+}
+
+pub struct DispatchResult {
+    response: Response,
+    delivered: bool,
 }
 
 pub(crate) fn available_workers_for_request(
@@ -218,7 +225,7 @@ async fn process_pending<S: SchedulerBase + ?Sized>(
 
     let start = Instant::now();
 
-    let response = dispatch_request(
+    let dispatch_result = dispatch_request(
         &scheduler,
         &config,
         headers.as_ref(),
@@ -233,14 +240,14 @@ async fn process_pending<S: SchedulerBase + ?Sized>(
     )
     .await;
 
-    if response.status().is_success() {
+    if dispatch_result.response.status().is_success() {
         RouterMetrics::record_request(&route);
         RouterMetrics::record_generate_duration(start.elapsed());
     } else {
         RouterMetrics::record_request_error(&route, "request_failed");
     }
 
-    if response_tx.send(response).is_err() {
+    if response_tx.send(dispatch_result.response).is_err() {
         warn!(
             route = route,
             "Response channel closed before scheduler could reply"
@@ -310,7 +317,7 @@ async fn dispatch_request<S: SchedulerBase + ?Sized>(
     message_id: Option<i64>,
     generation: Option<i64>,
     arrival_time_ms: f64,
-) -> Response {
+) -> DispatchResult {
     tracing::debug!(
         "Selected worker for model: {} worker_url={}",
         model_id.unwrap_or("default"),
@@ -337,7 +344,7 @@ async fn dispatch_request<S: SchedulerBase + ?Sized>(
     let request_payload =
         prepare_request_payload(route, body_json, message_id, generation, arrival_time_ms);
 
-    let response = scheduler
+    let dispatch_result = scheduler
         .send_http_request(
             config,
             headers,
@@ -349,9 +356,57 @@ async fn dispatch_request<S: SchedulerBase + ?Sized>(
         )
         .await;
 
-    worker.record_outcome(response.status().is_success());
+    let request_id = body_json
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
 
-    response
+    if let (Some(msg_id), Some(gen)) = (message_id, generation) {
+        if !dispatch_result.delivered {
+            warn!(
+                worker = worker.url(),
+                generation = gen,
+                message_id = msg_id,
+                request_id = request_id,
+                route = route,
+                status = %dispatch_result.response.status(),
+                pending_ledger = worker.pending_message_debug_info().compact_string(),
+                "[PENDING_TRACE] router transport failed after pending message creation"
+            );
+        }
+    }
+
+    if !dispatch_result.delivered {
+        if let (Some(msg_id), Some(gen)) = (message_id, generation) {
+            if let Some(reset) = worker.reset_router_epoch_after_transport_failure(gen, msg_id) {
+                RouterMetrics::set_pending_messages(worker.url(), worker.pending_message_count());
+                warn!(
+                    worker = worker.url(),
+                    failed_generation = reset.failed_generation,
+                    failed_message_id = reset.failed_message_id,
+                    new_generation = reset.new_generation,
+                    request_id = request_id,
+                    route = route,
+                    status = %dispatch_result.response.status(),
+                    cleared_pending_count = reset.cleared_count,
+                    cleared_min_id = reset.cleared_min_message_id,
+                    cleared_max_id = reset.cleared_max_message_id,
+                    cleared_message_ids = reset
+                        .cleared_message_ids
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    cleared_request_ids = reset.cleared_request_ids.join(","),
+                    "[PENDING_TRACE] reset worker router epoch after dispatch transport failure"
+                );
+            }
+        }
+    }
+
+    worker.record_outcome(dispatch_result.response.status().is_success());
+
+    dispatch_result
 }
 
 async fn send_http_request_impl(
@@ -362,18 +417,21 @@ async fn send_http_request_impl(
     worker_url: &str,
     is_stream: bool,
     load_incremented: bool,
-) -> Response {
+) -> DispatchResult {
     let mut request_builder = if config.dp_aware {
         let (worker_url_prefix, dp_rank) =
             match crate::routers::http::router::Router::extract_dp_rank(worker_url) {
                 Ok(parts) => parts,
                 Err(e) => {
                     error!("Failed to extract dp_rank: {}", e);
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to extract dp_rank: {}", e),
-                    )
-                        .into_response();
+                    return DispatchResult {
+                        response: (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to extract dp_rank: {}", e),
+                        )
+                            .into_response(),
+                        delivered: false,
+                    };
                 }
             };
 
@@ -388,11 +446,14 @@ async fn send_http_request_impl(
                 serde_json::to_string(&json_val).unwrap_or_else(|_| String::from("ERR"))
             );
         } else {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Failed to insert the data_parallel_rank field into the request body",
-            )
-                .into_response();
+            return DispatchResult {
+                response: (
+                    StatusCode::BAD_REQUEST,
+                    "Failed to insert the data_parallel_rank field into the request body",
+                )
+                    .into_response(),
+                delivered: false,
+            };
         }
 
         config
@@ -429,11 +490,14 @@ async fn send_http_request_impl(
                 }
             }
 
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Request failed: {}", e),
-            )
-                .into_response();
+            return DispatchResult {
+                response: (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Request failed: {}", e),
+                )
+                    .into_response(),
+                delivered: false,
+            };
         }
     };
 
@@ -470,7 +534,10 @@ async fn send_http_request_impl(
             }
         }
 
-        response
+        DispatchResult {
+            response,
+            delivered: true,
+        }
     } else if load_incremented {
         let registry = Arc::clone(&config.worker_registry);
         let worker_url = worker_url.to_string();
@@ -534,7 +601,10 @@ async fn send_http_request_impl(
         let mut response = Response::new(body);
         *response.status_mut() = status;
         *response.headers_mut() = response_headers;
-        response
+        DispatchResult {
+            response,
+            delivered: true,
+        }
     } else {
         let mut response_headers = header_utils::preserve_response_headers(res.headers());
         response_headers.insert(
@@ -577,14 +647,100 @@ async fn send_http_request_impl(
         let mut response = Response::new(body);
         *response.status_mut() = status;
         *response.headers_mut() = response_headers;
-        response
+        DispatchResult {
+            response,
+            delivered: true,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::types::PolicyConfig;
     use crate::core::BasicWorkerBuilder;
+    use crate::policies::PolicyRegistry;
+    use reqwest::Client;
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct TransportFailScheduler;
+
+    #[async_trait]
+    impl SchedulerBase for TransportFailScheduler {
+        async fn send_http_request(
+            &self,
+            _config: &Arc<SchedulerConfig>,
+            _headers: Option<&HeaderMap>,
+            _body_json: &serde_json::Value,
+            _route: &str,
+            _worker_url: &str,
+            _is_stream: bool,
+            _load_incremented: bool,
+        ) -> DispatchResult {
+            DispatchResult {
+                response: (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Request failed: synthetic transport error",
+                )
+                    .into_response(),
+                delivered: false,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_request_clears_pending_message_on_transport_failure() {
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("http://worker:8080").build());
+        let body = json!({
+            "prompt": "hello",
+            "request_id": "req-test"
+        });
+        let message_id = worker.next_message_id();
+        let generation = worker.generation();
+        worker.add_pending_message(PendingMessage::new(
+            message_id,
+            generation,
+            "/generate".to_string(),
+            Some("req-test".to_string()),
+            body.clone(),
+            512,
+        ));
+        assert_eq!(worker.pending_message_count(), 1);
+
+        let config = Arc::new(SchedulerConfig {
+            worker_registry: Arc::new(WorkerRegistry::new()),
+            policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            client: Client::builder().build().unwrap(),
+            dp_aware: false,
+            queue_timeout: Duration::from_secs(60),
+        });
+
+        let scheduler = Arc::new(TransportFailScheduler);
+        let dispatch_result = dispatch_request(
+            &scheduler,
+            &config,
+            None,
+            &body,
+            "/generate",
+            None,
+            false,
+            worker.clone(),
+            Some(message_id),
+            Some(generation),
+            0.0,
+        )
+        .await;
+
+        assert_eq!(
+            dispatch_result.response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(worker.pending_message_count(), 0);
+        assert!(worker.generation() > generation);
+        assert_eq!(worker.next_message_id(), 0);
+    }
 
     #[test]
     fn prepare_request_payload_injects_metadata_and_tracks_pending() {
@@ -607,7 +763,8 @@ mod tests {
             512, // default token count for tests
         ));
 
-        let payload = prepare_request_payload("/generate", &body, Some(message_id), Some(generation), 0.0);
+        let payload =
+            prepare_request_payload("/generate", &body, Some(message_id), Some(generation), 0.0);
         let value = payload.as_ref();
 
         // First message from this worker should have ID 0
@@ -616,7 +773,10 @@ mod tests {
             Some(0)
         );
         // Should have a valid generation (ROUTER_GENERATION)
-        assert!(value.get("router_generation").and_then(|v| v.as_i64()).is_some());
+        assert!(value
+            .get("router_generation")
+            .and_then(|v| v.as_i64())
+            .is_some());
         assert_eq!(worker.pending_message_count(), 1);
     }
 
@@ -647,7 +807,8 @@ mod tests {
         // Even with message_id/generation, non-object bodies should be rejected
         let message_id = worker.next_message_id();
         let generation = worker.generation();
-        let payload = prepare_request_payload("/generate", &body, Some(message_id), Some(generation), 0.0);
+        let payload =
+            prepare_request_payload("/generate", &body, Some(message_id), Some(generation), 0.0);
         let value = payload.as_ref();
 
         assert!(value.get("router_message_id").is_none());

@@ -12,6 +12,7 @@ use url::Url;
 use uuid::Uuid;
 
 const PENDING_MESSAGE_TTL: Duration = Duration::from_secs(60);
+const PENDING_DIAG_LOG_INTERVAL: Duration = Duration::from_secs(2);
 /// Interval for checking and resending unacknowledged messages (50ms)
 const RESEND_CHECK_INTERVAL_MS: u64 = 50;
 
@@ -68,6 +69,9 @@ pub struct WorkerRegistry {
 
     /// Real-time worker stats (worker_url -> stats)
     worker_stats: Arc<DashMap<String, WorkerStats>>,
+
+    /// Per-worker/category rate limiting for pending-message diagnostics
+    pending_diag_last_log: Arc<DashMap<String, Instant>>,
 }
 
 impl WorkerRegistry {
@@ -81,7 +85,24 @@ impl WorkerRegistry {
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
             worker_stats: Arc::new(DashMap::new()),
+            pending_diag_last_log: Arc::new(DashMap::new()),
         }
+    }
+
+    fn should_log_pending_diag(&self, worker_url: &str, category: &str) -> bool {
+        let key = format!("{worker_url}::{category}");
+        let now = Instant::now();
+
+        if let Some(mut last) = self.pending_diag_last_log.get_mut(&key) {
+            if now.saturating_duration_since(*last) < PENDING_DIAG_LOG_INTERVAL {
+                return false;
+            }
+            *last = now;
+            return true;
+        }
+
+        self.pending_diag_last_log.insert(key, now);
+        true
     }
 
     /// Register a new worker
@@ -448,9 +469,8 @@ impl WorkerRegistry {
         let workers_ref = self.workers.clone();
 
         let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(
-                RESEND_CHECK_INTERVAL_MS,
-            ));
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_millis(RESEND_CHECK_INTERVAL_MS));
 
             loop {
                 interval.tick().await;
@@ -486,18 +506,117 @@ impl WorkerRegistry {
     /// Update worker stats for a given worker URL
     pub fn update_stats(&self, worker_url: &str, stats: WorkerStats) {
         if let Some(worker) = self.get_by_url(worker_url) {
+            let pending_before = worker.pending_message_debug_info();
+            let ack_gen = stats.router_generation;
+            let ack_last_id = stats.last_received_message_id;
+            let mut removed_count = 0usize;
+            let mut removed_messages = Vec::new();
+
             if let (Some(generation), Some(last_id)) =
                 (stats.router_generation, stats.last_received_message_id)
             {
                 let now = Instant::now();
                 let removed = worker.remove_messages_up_to(generation, last_id);
+                removed_count = removed.len();
                 for message in removed.iter() {
                     let latency = now.saturating_duration_since(message.timestamp);
                     RouterMetrics::record_message_ack(worker.url(), latency);
                 }
+                removed_messages = removed;
             }
 
             RouterMetrics::set_pending_messages(worker.url(), worker.pending_message_count());
+
+            let pending_after = worker.pending_message_debug_info();
+            let is_idle_from_stats = stats.num_requests == 0 && stats.waiting_queue_size == 0;
+
+            if removed_count > 0 && pending_after.count == 0 {
+                let removed_min_id = removed_messages.first().map(|msg| msg.message_id);
+                let removed_max_id = removed_messages.last().map(|msg| msg.message_id);
+                let removed_message_ids = removed_messages
+                    .iter()
+                    .take(5)
+                    .map(|msg| msg.message_id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let removed_request_ids = removed_messages
+                    .iter()
+                    .filter_map(|msg| msg.request_id.as_deref())
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .join(",");
+
+                tracing::info!(
+                    worker = worker.url(),
+                    iter = stats.iteration_num,
+                    num_requests = stats.num_requests,
+                    waiting_queue = stats.waiting_queue_size,
+                    batch_tokens = stats.batch_size_tokens,
+                    ack_generation = ack_gen,
+                    ack_last_id = ack_last_id,
+                    removed = removed_count,
+                    removed_min_id = removed_min_id,
+                    removed_max_id = removed_max_id,
+                    removed_message_ids = removed_message_ids,
+                    removed_request_ids = removed_request_ids,
+                    pending_before = pending_before.compact_string(),
+                    pending_after = pending_after.compact_string(),
+                    "[PENDING_TRACE] worker ack advanced router pending ledger"
+                );
+            }
+
+            if pending_before.count > 0
+                && removed_count == 0
+                && ack_gen.is_some()
+                && ack_last_id.is_some()
+                && self.should_log_pending_diag(worker.url(), "ack_no_progress")
+            {
+                tracing::warn!(
+                    worker = worker.url(),
+                    iter = stats.iteration_num,
+                    num_requests = stats.num_requests,
+                    waiting_queue = stats.waiting_queue_size,
+                    batch_tokens = stats.batch_size_tokens,
+                    ack_generation = ack_gen,
+                    ack_last_id = ack_last_id,
+                    pending_before = pending_before.compact_string(),
+                    pending_after = pending_after.compact_string(),
+                    "[ACK_NO_PROGRESS] Worker stats carried an ack but router pending ledger did not advance"
+                );
+            }
+
+            if pending_after.count > 0
+                && (ack_gen.is_none() || ack_last_id.is_none())
+                && self.should_log_pending_diag(worker.url(), "ack_missing")
+            {
+                tracing::warn!(
+                    worker = worker.url(),
+                    iter = stats.iteration_num,
+                    num_requests = stats.num_requests,
+                    waiting_queue = stats.waiting_queue_size,
+                    batch_tokens = stats.batch_size_tokens,
+                    ack_generation = ack_gen,
+                    ack_last_id = ack_last_id,
+                    pending = pending_after.compact_string(),
+                    "[ACK_MISSING] Worker still has router pending messages but sidecar stats did not include a usable ack"
+                );
+            }
+
+            if pending_after.count > 0
+                && is_idle_from_stats
+                && self.should_log_pending_diag(worker.url(), "pending_stall")
+            {
+                tracing::warn!(
+                    worker = worker.url(),
+                    iter = stats.iteration_num,
+                    forward_mode = stats.forward_mode.as_str(),
+                    batch_tokens = stats.batch_size_tokens,
+                    ack_generation = ack_gen,
+                    ack_last_id = ack_last_id,
+                    pending = pending_after.compact_string(),
+                    "[PENDING_STALL] Worker stats are idle (num_requests=0, waiting_queue=0) but router pending ledger is still non-empty"
+                );
+            }
         }
 
         self.worker_stats.insert(worker_url.to_string(), stats);
@@ -789,8 +908,15 @@ mod tests {
     #[test]
     fn test_resolve_worker_url_dp_identifier() {
         let registry = WorkerRegistry::new();
-        let worker: Arc<dyn Worker> =
-            Arc::new(DPAwareWorkerBuilder::new_with_generation("http://worker-dp:9090", TEST_GENERATION, 1, 2).build());
+        let worker: Arc<dyn Worker> = Arc::new(
+            DPAwareWorkerBuilder::new_with_generation(
+                "http://worker-dp:9090",
+                TEST_GENERATION,
+                1,
+                2,
+            )
+            .build(),
+        );
         registry.register(worker);
 
         let resolved = registry

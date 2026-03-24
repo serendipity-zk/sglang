@@ -1,6 +1,7 @@
 use super::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use super::worker::{
-    BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, WorkerMetadata, WorkerType,
+    BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RouterMessageState,
+    WorkerMetadata, WorkerType,
 };
 use crate::grpc::client::SglangSchedulerClient;
 use parking_lot::RwLock;
@@ -133,7 +134,7 @@ impl BasicWorkerBuilder {
     /// Build the BasicWorker instance
     pub fn build(self) -> BasicWorker {
         use std::sync::{
-            atomic::{AtomicBool, AtomicI64, AtomicUsize},
+            atomic::{AtomicBool, AtomicUsize},
             Arc,
         };
         use tokio::sync::Mutex;
@@ -151,14 +152,16 @@ impl BasicWorkerBuilder {
             metadata,
             load_counter: Arc::new(AtomicUsize::new(0)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
-            pending_messages: Arc::new(RwLock::new(Vec::new())),
+            router_state: Arc::new(RwLock::new(RouterMessageState {
+                generation: self.generation,
+                next_message_id: 0,
+                pending_messages: Vec::new(),
+            })),
             healthy: Arc::new(AtomicBool::new(true)),
             consecutive_failures: Arc::new(AtomicUsize::new(0)),
             consecutive_successes: Arc::new(AtomicUsize::new(0)),
             circuit_breaker: CircuitBreaker::with_config(self.circuit_breaker_config),
             grpc_client: self.grpc_client.map(|client| Arc::new(Mutex::new(client))),
-            message_counter: Arc::new(AtomicI64::new(0)),
-            generation: self.generation,
         }
     }
 }
