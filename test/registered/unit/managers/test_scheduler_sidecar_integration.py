@@ -96,6 +96,10 @@ class FakeScheduler(SchedulerSidecarMixin):
         self.running_batch = FakeRunningBatch()
         self.max_total_num_tokens = 128
         self.iteration_count = 4
+        self.tp_size = 1
+        self.tp_rank = 0
+        self.dp_size = 1
+        self.dp_rank = None
         self.worker_id = "127.0.0.1:30000"
         self.init_sidecar(SimpleNamespace(slo_scheduler_addr=None))
 
@@ -144,6 +148,49 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
 
         self.assertEqual(worker_id, "127.0.0.1:30000:tp1:dp0")
 
+    def test_build_sidecar_worker_id_uses_tp_group_identity(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.tp_size = 2
+        scheduler.tp_rank = 1
+        scheduler.dp_size = 2
+        scheduler.dp_rank = 0
+        scheduler._sidecar_sync_across_tp = True
+
+        worker_id = SchedulerSidecarMixin._build_sidecar_worker_id(
+            scheduler, SimpleNamespace(host="127.0.0.1", port=30000)
+        )
+
+        self.assertEqual(worker_id, "127.0.0.1:30000:dp0")
+
+    def test_init_sidecar_non_owner_rank_skips_client(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.tp_size = 2
+        scheduler.tp_rank = 1
+        scheduler.dp_size = 1
+        scheduler.dp_rank = None
+        scheduler.worker_id = "127.0.0.1:30000:tp1"
+        scheduler.tp_group = SimpleNamespace(
+            world_size=2,
+            is_first_rank=False,
+        )
+        scheduler.tp_cpu_group = object()
+
+        SchedulerSidecarMixin.init_sidecar(
+            scheduler,
+            SimpleNamespace(
+                slo_scheduler_addr="ipc:///tmp/sidecar.sock",
+                slo_scheduler_timeout_ms=50,
+                host="127.0.0.1",
+                port=30000,
+            ),
+        )
+
+        self.assertTrue(scheduler._sidecar_enabled)
+        self.assertTrue(scheduler._sidecar_sync_across_tp)
+        self.assertFalse(scheduler._sidecar_is_owner)
+        self.assertIsNone(scheduler.slo_client)
+        self.assertEqual(scheduler.sidecar_worker_id, "127.0.0.1:30000")
+
     def test_assemble_and_send_engine_state_uses_defaults_and_resets_buffers(self):
         scheduler = FakeScheduler()
         scheduler.slo_client = FakeClient(
@@ -191,6 +238,26 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
         self.assertEqual(state.current.num_running_requests, 0)
         self.assertEqual(state.current.num_waiting_requests, 0)
         self.assertEqual(state.current.kv_tokens_used, 33)
+
+    def test_assemble_and_send_engine_state_syncs_decision_for_non_owner_rank(self):
+        scheduler = FakeScheduler()
+        scheduler._sidecar_enabled = True
+        scheduler._sidecar_is_owner = False
+        scheduler._sidecar_sync_across_tp = True
+        scheduler.tp_group = SimpleNamespace(rank=1, first_rank=0)
+        scheduler.tp_cpu_group = object()
+
+        synced_decision = SimpleNamespace(iteration_count=5, max_prefill_tokens=96)
+        with patch(
+            "sglang.srt.managers.scheduler_sidecar_mixin.broadcast_pyobj",
+            return_value=[synced_decision],
+        ) as mock_broadcast:
+            decision = scheduler._assemble_and_send_engine_state()
+
+        self.assertIs(decision, synced_decision)
+        self.assertIs(scheduler._last_sidecar_decision, synced_decision)
+        self.assertEqual(mock_broadcast.call_count, 1)
+        self.assertEqual(mock_broadcast.call_args.args[0], [])
 
     def test_get_effective_max_prefill_tokens_prefers_matching_sidecar_decision(self):
         scheduler = Scheduler.__new__(Scheduler)

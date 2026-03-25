@@ -19,7 +19,11 @@
     "forwardPorts": [],
     "runArgs": [
         "--gpus",
-        "all"
+        "all",
+        // NCCL multi-GPU init is sensitive to Docker IPC/SHM limits.
+        "--ipc=host",
+        "--ulimit=memlock=-1",
+        "--ulimit=stack=67108864"
     ],
     // The two lines below ensures that your local changes in the sglang
     // repo is automatically synced to the sglang pip package installed

@@ -1272,16 +1272,16 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                if self.slo_client is not None:
+                if SchedulerSidecarMixin._sidecar_owner_on_rank(self):
                     self._pre_batch_kv_used = self._get_token_info()[0]
                 batch_start = time.perf_counter()
                 result = self.run_batch(batch)
                 iteration_time_ms = (time.perf_counter() - batch_start) * 1000
                 self.iteration_count += 1
-                if self.slo_client is not None:
+                if SchedulerSidecarMixin._sidecar_owner_on_rank(self):
                     self._drain_current_snapshot(batch, self.iteration_count)
                 self.process_batch_result(batch, result)
-                if self.slo_client is not None:
+                if SchedulerSidecarMixin._sidecar_owner_on_rank(self):
                     self._drain_finished_iteration(
                         batch, iteration_time_ms, self._pre_batch_kv_used
                     )
@@ -1310,7 +1310,7 @@ class Scheduler(
             tmp_batch, tmp_result, tmp_elapsed_ms = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
             self.iteration_count += 1
-            if self.slo_client is not None:
+            if SchedulerSidecarMixin._sidecar_owner_on_rank(self):
                 self._drain_finished_iteration(
                     tmp_batch, tmp_elapsed_ms, self._prev_pre_batch_kv_used
                 )
@@ -1333,16 +1333,16 @@ class Scheduler(
                 pop_and_process()
 
             # Launch the current batch
-            if self.slo_client is not None:
+            if SchedulerSidecarMixin._sidecar_owner_on_rank(self):
                 self._prev_pre_batch_kv_used = self._pre_batch_kv_used
             if batch:
-                if self.slo_client is not None:
+                if SchedulerSidecarMixin._sidecar_owner_on_rank(self):
                     self._pre_batch_kv_used = self._get_token_info()[0]
                 batch_start = time.perf_counter()
                 batch_result = self.run_batch(batch)
                 batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000
                 self.result_queue.append((batch.copy(), batch_result, batch_elapsed_ms))
-                if self.slo_client is not None:
+                if SchedulerSidecarMixin._sidecar_owner_on_rank(self):
                     self._drain_current_snapshot(batch, self.iteration_count + 1)
             else:
                 batch_result = None
@@ -2209,8 +2209,9 @@ class Scheduler(
         if self.running_batch.is_prefill_only:
             self.running_batch.filter_batch()
 
-        if self.slo_client is not None:
-            self._drain_scheduling_context()
+        if SchedulerSidecarMixin._sidecar_enabled_for_scheduling(self):
+            if SchedulerSidecarMixin._sidecar_owner_on_rank(self):
+                self._drain_scheduling_context()
             self._assemble_and_send_engine_state()
 
         if self.dllm_config is not None:

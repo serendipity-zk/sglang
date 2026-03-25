@@ -7,8 +7,8 @@ ARG HOST_GID=1003
 RUN groupadd -g $HOST_GID devuser && \
     useradd -m -u $HOST_UID -g $HOST_GID -s /bin/zsh devuser
 
-# Give devuser sudo access
-RUN apt-get update && apt-get install -y sudo && \
+# Give devuser sudo access and install the mold linker used by Rust builds.
+RUN apt-get update && apt-get install -y sudo mold && \
     echo "devuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/devuser && \
     rm -rf /var/lib/apt/lists/* && \
     apt-get clean
@@ -34,6 +34,14 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
 
 # Switch to devuser
 USER devuser
+
+# Normalize runtime environment after inheriting the base image.
+# The upstream image can leave root-owned cargo paths in PATH, which later
+# causes PermissionError during import-time executable scanning.
+ENV HOME=/home/devuser \
+    CARGO_HOME=/home/devuser/.cargo \
+    RUSTUP_HOME=/home/devuser/.rustup \
+    PATH=/home/devuser/.cargo/bin:/home/devuser/.local/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/nvidia/bin
 
 # Install uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
