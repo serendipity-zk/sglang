@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -409,7 +409,23 @@ impl SloAwareScheduler {
     /// Check if worker has pending work (queued + pending dispatches)
     /// Returns true if worker is busy and should not receive new requests
     fn has_pending_work(&self, worker: &dyn Worker) -> bool {
-        // Check worker-reported queue size
+        self.has_pending_work_with_virtual(worker, 0)
+    }
+
+    /// Same as has_pending_work(), but also includes same-tick virtual admissions.
+    fn has_pending_work_with_virtual(
+        &self,
+        worker: &dyn Worker,
+        virtual_pending_messages: usize,
+    ) -> bool {
+        self.pending_message_depth_with_virtual(worker, virtual_pending_messages) > 0
+    }
+
+    fn pending_message_depth_with_virtual(
+        &self,
+        worker: &dyn Worker,
+        virtual_pending_messages: usize,
+    ) -> i64 {
         let queue_size = if let Ok(stats) = self.worker_stats.read() {
             if let Some(worker_stats) = stats.get(worker.url()) {
                 worker_stats.waiting_queue_size
@@ -420,11 +436,9 @@ impl SloAwareScheduler {
             0
         };
 
-        // Check router-tracked pending messages
-        let pending_messages = worker.pending_message_count();
+        let pending_messages = worker.pending_message_count() as i64;
 
-        // Worker is busy if either queue has work or pending messages exist
-        (queue_size + pending_messages as i64) > 0
+        queue_size + pending_messages + virtual_pending_messages as i64
     }
 
     /// Check if worker is truly idle (no running requests, no queued, no pending)
@@ -919,18 +933,32 @@ impl SloAwareScheduler {
         &self,
         workers: &[Arc<dyn Worker>],
     ) -> Option<Arc<dyn Worker>> {
+        self.select_worker_first_available_with_virtual(workers, &HashMap::new())
+    }
+
+    fn select_worker_first_available_with_virtual(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        virtual_pending_messages_by_worker: &HashMap<String, usize>,
+    ) -> Option<Arc<dyn Worker>> {
         if workers.is_empty() {
             return None;
         }
 
-        // Check servers from first to last, find the first one with no pending work
+        // Check servers from first to last, treating same-tick virtual
+        // admissions as pending work so one scheduling pass does not
+        // repeatedly pick the same worker before dispatch catches up.
         for worker in workers {
-            if !self.has_pending_work(worker.as_ref()) {
+            let virtual_pending_messages = virtual_pending_messages_by_worker
+                .get(worker.url())
+                .copied()
+                .unwrap_or(0);
+            if !self.has_pending_work_with_virtual(worker.as_ref(), virtual_pending_messages) {
                 return Some(Arc::clone(worker));
             }
         }
 
-        // All workers have pending work - defer scheduling
+        // All workers already have pending work in this pass - defer scheduling.
         None
     }
 
@@ -1057,6 +1085,16 @@ impl SloAwareScheduler {
 
     /// Calculate total pending tokens for a worker (queue + pending messages)
     fn calculate_pending_tokens(&self, worker: &dyn Worker, worker_stats: &WorkerStats) -> i64 {
+        self.calculate_pending_tokens_with_virtual(worker, worker_stats, 0)
+    }
+
+    /// Same as calculate_pending_tokens(), but also includes same-tick virtual admissions.
+    fn calculate_pending_tokens_with_virtual(
+        &self,
+        worker: &dyn Worker,
+        worker_stats: &WorkerStats,
+        virtual_pending_tokens: i64,
+    ) -> i64 {
         // Sum tokens from waiting queue (accurate from worker)
         let queue_tokens = worker_stats
             .waiting_queue_info
@@ -1067,7 +1105,200 @@ impl SloAwareScheduler {
         // Sum actual tokens from pending messages tracked by the worker
         let pending_msg_tokens = worker.pending_message_tokens();
 
-        queue_tokens + pending_msg_tokens
+        queue_tokens + pending_msg_tokens + virtual_pending_tokens
+    }
+
+    fn estimate_ttft_diagnostic(
+        &self,
+        worker: &dyn Worker,
+        new_request_tokens: i64,
+        margin_ms: f64,
+    ) -> Result<f64, &'static str> {
+        let stats = self.worker_stats.read().map_err(|_| "stats_lock")?;
+        let worker_stats = stats.get(worker.url()).ok_or("no_stats")?;
+        let sim_metrics = worker_stats
+            .prefill_sim_metrics
+            .as_ref()
+            .ok_or("no_prefill_sim")?;
+
+        let pending_tokens = self.calculate_pending_tokens(worker, worker_stats);
+        let total_tokens = pending_tokens + new_request_tokens;
+        let estimated_ms = self
+            .interpolate_prefill_time(sim_metrics, total_tokens, pending_tokens)
+            .ok_or("no_interp")?;
+
+        Ok(estimated_ms + margin_ms)
+    }
+
+    fn format_worker_belief(&self, worker: &dyn Worker) -> String {
+        let pending_messages = worker.pending_message_count();
+        let pending_tokens = worker.pending_message_tokens();
+
+        let stats = match self.worker_stats.read() {
+            Ok(stats) => stats,
+            Err(_) => {
+                return format!(
+                    "status=stats_lock pend={} ptok={}",
+                    pending_messages, pending_tokens
+                );
+            }
+        };
+
+        let Some(worker_stats) = stats.get(worker.url()) else {
+            return format!(
+                "status=no_stats pend={} ptok={}",
+                pending_messages, pending_tokens
+            );
+        };
+
+        let queue_tokens = worker_stats
+            .waiting_queue_info
+            .as_ref()
+            .map(|info| info.total_extend_len)
+            .unwrap_or(0);
+        let age_ms = worker_stats.timestamp.elapsed().as_millis() as u64;
+        let accepted_count = worker_stats
+            .accepted_request_ids
+            .as_ref()
+            .map(|ids| ids.len())
+            .unwrap_or(0);
+
+        format!(
+            "reqs={} q={} qtok={} pend={} ptok={} batch={} mode={} iter={} age={}ms accepted={} sim={}",
+            worker_stats.num_requests,
+            worker_stats.waiting_queue_size,
+            queue_tokens,
+            pending_messages,
+            pending_tokens,
+            worker_stats.batch_size_tokens,
+            worker_stats.forward_mode,
+            worker_stats.iteration_num,
+            age_ms,
+            accepted_count,
+            if worker_stats.prefill_sim_metrics.is_some() {
+                "Y"
+            } else {
+                "N"
+            }
+        )
+    }
+
+    fn explain_worker_for_request(&self, worker: &dyn Worker, request: &PendingRequest) -> String {
+        let request_tokens = request
+            .input_token_count
+            .unwrap_or_else(|| (request.text.len() / 4) as i64);
+
+        match &self.policy {
+            WorkerSelectionPolicy::FirstAvailable => {
+                let why = if self.has_pending_work(worker) {
+                    "busy"
+                } else {
+                    "available"
+                };
+                format!(
+                    "why={} tok={} {}",
+                    why,
+                    request_tokens,
+                    self.format_worker_belief(worker)
+                )
+            }
+            WorkerSelectionPolicy::TTFTAware { margin_ms } => {
+                let target_ttft_ms = request.target_ttft_ms.unwrap_or(1000.0) as f64;
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as f64;
+                let elapsed_ms = now_ms - request.arrival_time_ms;
+                let remaining_slack_ms = target_ttft_ms - elapsed_ms;
+
+                match self.estimate_ttft_diagnostic(worker, request_tokens, *margin_ms) {
+                    Ok(estimated_ttft) if estimated_ttft <= remaining_slack_ms => format!(
+                        "why=fit tok={} est={:.1}<=slack={:.1} {}",
+                        request_tokens,
+                        estimated_ttft,
+                        remaining_slack_ms,
+                        self.format_worker_belief(worker)
+                    ),
+                    Ok(estimated_ttft) => format!(
+                        "why=ttft tok={} est={:.1}>slack={:.1} {}",
+                        request_tokens,
+                        estimated_ttft,
+                        remaining_slack_ms,
+                        self.format_worker_belief(worker)
+                    ),
+                    Err(reason) => format!(
+                        "why={} tok={} slack={:.1} {}",
+                        reason,
+                        request_tokens,
+                        remaining_slack_ms,
+                        self.format_worker_belief(worker)
+                    ),
+                }
+            }
+        }
+    }
+
+    fn build_unscheduled_diagnostic(
+        &self,
+        config: &Arc<SchedulerConfig>,
+        tier_worker_ids: &[WorkerId],
+        queue_idx: usize,
+        request: &PendingRequest,
+        sampled_count: usize,
+        queue_len: usize,
+    ) -> String {
+        let tier_tpot = self
+            .tpot_buckets
+            .get(queue_idx)
+            .map(|b| *b as u32)
+            .unwrap_or(0);
+        let request_tokens = request
+            .input_token_count
+            .unwrap_or_else(|| (request.text.len() / 4) as i64);
+        let target_ttft_ms = request.target_ttft_ms.unwrap_or(1000.0) as f64;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as f64;
+        let elapsed_ms = now_ms - request.arrival_time_ms;
+        let remaining_slack_ms = target_ttft_ms - elapsed_ms;
+
+        let available_worker_urls: HashSet<String> =
+            available_workers_for_request(&config.worker_registry, request.model_id.as_deref())
+                .into_iter()
+                .map(|worker| worker.url().to_string())
+                .collect();
+
+        let mut worker_diags = Vec::new();
+        for worker_id in tier_worker_ids {
+            if let Some(worker) = config.worker_registry.get(worker_id) {
+                let letter = self.get_worker_letter(worker.url());
+                if !available_worker_urls.contains(worker.url()) {
+                    worker_diags.push(format!(
+                        "{}{{why=model_unavailable {}}}",
+                        letter,
+                        self.format_worker_belief(worker.as_ref())
+                    ));
+                } else {
+                    worker_diags.push(format!(
+                        "{}{{{}}}",
+                        letter,
+                        self.explain_worker_for_request(worker.as_ref(), request)
+                    ));
+                }
+            }
+        }
+
+        format!(
+            "[SCHED_DIAG] tier={} sampled={}/{} head_req={} tok={} slack_ms={:.1} workers=[{}]",
+            tier_tpot,
+            sampled_count,
+            queue_len,
+            request.request_id,
+            request_tokens,
+            remaining_slack_ms,
+            worker_diags.join(" ")
+        )
     }
 
     /// Estimate TTFT for a worker given a new request
@@ -1076,6 +1307,16 @@ impl SloAwareScheduler {
         worker: &dyn Worker,
         new_request_tokens: i64,
         margin_ms: f64,
+    ) -> Option<f64> {
+        self.estimate_ttft_with_virtual(worker, new_request_tokens, margin_ms, 0)
+    }
+
+    fn estimate_ttft_with_virtual(
+        &self,
+        worker: &dyn Worker,
+        new_request_tokens: i64,
+        margin_ms: f64,
+        virtual_pending_tokens: i64,
     ) -> Option<f64> {
         // Get worker stats
         let stats = self.worker_stats.read().ok()?;
@@ -1095,7 +1336,11 @@ impl SloAwareScheduler {
         let sim_metrics = sim_metrics.unwrap();
 
         // Calculate pending tokens
-        let pending_tokens = self.calculate_pending_tokens(worker, worker_stats);
+        let pending_tokens = self.calculate_pending_tokens_with_virtual(
+            worker,
+            worker_stats,
+            virtual_pending_tokens,
+        );
 
         // Total tokens = pending + new request
         let total_tokens = pending_tokens + new_request_tokens;
@@ -1155,6 +1400,23 @@ impl SloAwareScheduler {
         remaining_slack_ms: f64,
         margin_ms: f64,
     ) -> Option<Arc<dyn Worker>> {
+        self.select_worker_ttft_aware_with_virtual(
+            workers,
+            request_tokens,
+            remaining_slack_ms,
+            margin_ms,
+            &HashMap::new(),
+        )
+    }
+
+    fn select_worker_ttft_aware_with_virtual(
+        &self,
+        workers: &[Arc<dyn Worker>],
+        request_tokens: i64,
+        remaining_slack_ms: f64,
+        margin_ms: f64,
+        virtual_pending_tokens_by_worker: &HashMap<String, i64>,
+    ) -> Option<Arc<dyn Worker>> {
         if workers.is_empty() {
             info!("[TTFT_SEL] no workers available");
             return None;
@@ -1163,9 +1425,16 @@ impl SloAwareScheduler {
         // Phase 1: Find first worker that can meet remaining TTFT slack
         // This maintains a load gradient similar to first-available policy
         for worker in workers {
-            if let Some(estimated_ttft) =
-                self.estimate_ttft(worker.as_ref(), request_tokens, margin_ms)
-            {
+            let virtual_pending_tokens = virtual_pending_tokens_by_worker
+                .get(worker.url())
+                .copied()
+                .unwrap_or(0);
+            if let Some(estimated_ttft) = self.estimate_ttft_with_virtual(
+                worker.as_ref(),
+                request_tokens,
+                margin_ms,
+                virtual_pending_tokens,
+            ) {
                 if estimated_ttft <= remaining_slack_ms {
                     // info!(
                     //     "[TTFT_SEL] worker={} ACCEPT est={:.1}ms <= slack={:.1}ms",
@@ -1237,6 +1506,103 @@ impl SloAwareScheduler {
         self.select_worker_first_available(workers)
     }
 
+    fn build_schedule_decisions_for_tier(
+        &self,
+        config: &Arc<SchedulerConfig>,
+        queue: &VecDeque<PendingRequest>,
+        tier_worker_ids: &[WorkerId],
+    ) -> (Vec<(usize, Arc<dyn Worker>)>, usize) {
+        // Traverse oldest-first so backlog is drained in submission order.
+        // If queue is very long, only check a random sample to limit runtime.
+        const MAX_QUEUE_SCAN: usize = 100;
+
+        let indices_to_check: Vec<usize> = if queue.len() > MAX_QUEUE_SCAN {
+            let mut indices: Vec<usize> = (0..queue.len()).collect();
+            indices.shuffle(&mut rand::rng());
+            let mut sampled: Vec<usize> = indices.into_iter().take(MAX_QUEUE_SCAN).collect();
+            sampled.sort_unstable(); // Oldest-first within sampled set
+            sampled
+        } else {
+            (0..queue.len()).collect()
+        };
+
+        // Decide which indices to schedule, carrying same-tick virtual pending
+        // forward so later requests see earlier admissions to the same worker.
+        let mut schedule_decisions: Vec<(usize, Arc<dyn Worker>)> = Vec::new();
+        let mut virtual_pending_tokens_by_worker: HashMap<String, i64> = HashMap::new();
+        let mut virtual_pending_messages_by_worker: HashMap<String, usize> = HashMap::new();
+
+        for &i in &indices_to_check {
+            let request = &queue[i];
+            let request_tokens = request
+                .input_token_count
+                .unwrap_or_else(|| (request.text.len() / 4) as i64);
+
+            let available =
+                available_workers_for_request(&config.worker_registry, request.model_id.as_deref());
+            if available.is_empty() {
+                continue;
+            }
+
+            let tier_filtered: Vec<Arc<dyn Worker>> = tier_worker_ids
+                .iter()
+                .filter_map(|worker_id| {
+                    available
+                        .iter()
+                        .find(|w| {
+                            config
+                                .worker_registry
+                                .get_worker_id_by_url(w.url())
+                                .map(|id| &id == worker_id)
+                                .unwrap_or(false)
+                        })
+                        .cloned()
+                })
+                .collect();
+
+            if tier_filtered.is_empty() {
+                continue;
+            }
+
+            let worker = match &self.policy {
+                WorkerSelectionPolicy::FirstAvailable => self
+                    .select_worker_first_available_with_virtual(
+                        &tier_filtered,
+                        &virtual_pending_messages_by_worker,
+                    ),
+                WorkerSelectionPolicy::TTFTAware { margin_ms } => {
+                    let target_ttft_ms = request.target_ttft_ms.unwrap_or(1000.0) as f64;
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as f64;
+                    let elapsed_ms = now_ms - request.arrival_time_ms;
+                    let remaining_slack_ms = target_ttft_ms - elapsed_ms;
+
+                    self.select_worker_ttft_aware_with_virtual(
+                        &tier_filtered,
+                        request_tokens,
+                        remaining_slack_ms,
+                        *margin_ms,
+                        &virtual_pending_tokens_by_worker,
+                    )
+                }
+            };
+
+            if let Some(w) = worker {
+                *virtual_pending_tokens_by_worker
+                    .entry(w.url().to_string())
+                    .or_insert(0) += request_tokens;
+                *virtual_pending_messages_by_worker
+                    .entry(w.url().to_string())
+                    .or_insert(0) += 1;
+                schedule_decisions.push((i, w));
+            }
+        }
+
+        (schedule_decisions, indices_to_check.len())
+    }
+
     async fn drain_all_queues(
         self: &Arc<Self>,
         config: &Arc<SchedulerConfig>,
@@ -1284,114 +1650,62 @@ impl SloAwareScheduler {
             }
         };
 
-        // Second pass: try to schedule requests, skipping those that don't fit
-        // If queue is very long, only check a random sample to limit runtime
-        const MAX_QUEUE_SCAN: usize = 100;
-        let indices_to_check: Vec<usize> = if queue.len() > MAX_QUEUE_SCAN {
-            let mut indices: Vec<usize> = (0..queue.len()).collect();
-            indices.shuffle(&mut rand::rng());
-            let mut sampled: Vec<usize> = indices.into_iter().take(MAX_QUEUE_SCAN).collect();
-            sampled.sort(); // Preserve arrival order
-            sampled
-        } else {
-            (0..queue.len()).collect()
-        };
+        let (schedule_decisions, sampled_count) =
+            self.build_schedule_decisions_for_tier(config, queue, &tier_worker_ids);
 
-        // First pass: read-only, decide which indices to schedule and to which worker
-        let mut schedule_decisions: Vec<(usize, Arc<dyn Worker>)> = Vec::new();
-
-        for &i in &indices_to_check {
-            let request = &queue[i];
-
-            let available =
-                available_workers_for_request(&config.worker_registry, request.model_id.as_deref());
-            if available.is_empty() {
-                continue;
-            }
-
-            // Filter to workers in this tier, preserving the sorted order from tier_workers
-            // (tier_workers is sorted by batch size at the start of each tick)
-            let tier_filtered: Vec<Arc<dyn Worker>> = tier_worker_ids
-                .iter()
-                .filter_map(|worker_id| {
-                    available
-                        .iter()
-                        .find(|w| {
-                            config
-                                .worker_registry
-                                .get_worker_id_by_url(w.url())
-                                .map(|id| &id == worker_id)
-                                .unwrap_or(false)
-                        })
-                        .cloned()
-                })
-                .collect();
-
-            if tier_filtered.is_empty() {
-                continue;
-            }
-
-            let worker = match &self.policy {
-                WorkerSelectionPolicy::FirstAvailable => {
-                    self.select_worker_first_available(&tier_filtered)
-                }
-                WorkerSelectionPolicy::TTFTAware { margin_ms } => {
-                    // Use actual token count if available (input_ids), otherwise estimate from text
-                    let request_tokens = request
-                        .input_token_count
-                        .unwrap_or_else(|| (request.text.len() / 4) as i64);
-                    let target_ttft_ms = request.target_ttft_ms.unwrap_or(1000.0) as f64;
-                    let now_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_millis() as f64;
-                    let elapsed_ms = now_ms - request.arrival_time_ms;
-                    let remaining_slack_ms = target_ttft_ms - elapsed_ms;
-
-                    self.select_worker_ttft_aware(
-                        &tier_filtered,
-                        request_tokens,
-                        remaining_slack_ms,
-                        *margin_ms,
-                    )
-                }
-            };
-
-            if let Some(w) = worker {
-                schedule_decisions.push((i, w));
-            }
+        // Track per-worker scheduling count while preserving decision order.
+        let mut per_worker_count: HashMap<String, usize> = HashMap::new();
+        let mut scheduled_indices: HashSet<usize> = HashSet::new();
+        for (idx, worker) in &schedule_decisions {
+            scheduled_indices.insert(*idx);
+            *per_worker_count
+                .entry(worker.url().to_string())
+                .or_insert(0) += 1;
         }
 
-        // Build index -> worker map for O(1) lookup and count per-worker scheduling
-        let mut per_worker_count: HashMap<String, usize> = HashMap::new();
-        let schedule_map: HashMap<usize, Arc<dyn Worker>> = schedule_decisions
-            .into_iter()
-            .map(|(idx, worker)| {
-                *per_worker_count
-                    .entry(worker.url().to_string())
-                    .or_insert(0) += 1;
-                (idx, worker)
-            })
-            .collect();
-
-        let scheduled_count = schedule_map.len();
+        let scheduled_count = schedule_decisions.len();
         let remaining_count = queue.len() - scheduled_count;
+        let unscheduled_diag = if scheduled_count == 0 && remaining_count > 0 {
+            (0..queue.len())
+                .find(|idx| !scheduled_indices.contains(idx))
+                .and_then(|idx| queue.get(idx))
+                .map(|request| {
+                    self.build_unscheduled_diagnostic(
+                        config,
+                        &tier_worker_ids,
+                        queue_idx,
+                        request,
+                        sampled_count,
+                        queue.len(),
+                    )
+                })
+        } else {
+            None
+        };
 
-        // Build new queue with remaining requests, dispatch scheduled ones
+        // Rebuild queue while keeping selected requests in decision order for dispatch.
         let old_queue = std::mem::take(queue);
+        let mut selected_requests: HashMap<usize, PendingRequest> = HashMap::new();
         for (i, request) in old_queue.into_iter().enumerate() {
-            if let Some(worker) = schedule_map.get(&i) {
-                RouterUi::dec_queue();
-                // Record that this worker received a request
-                self.record_scheduled(worker.url());
-                let dispatcher = Arc::clone(self);
-                let cfg = Arc::clone(config);
-                dispatcher
-                    .dispatch_to_worker(cfg, request, Arc::clone(worker))
-                    .await;
+            if scheduled_indices.contains(&i) {
+                selected_requests.insert(i, request);
             } else {
                 queue.push_back(request);
             }
+        }
+
+        for (idx, worker) in schedule_decisions {
+            let Some(request) = selected_requests.remove(&idx) else {
+                continue;
+            };
+
+            RouterUi::dec_queue();
+            self.record_scheduled(worker.url());
+            let dispatcher = Arc::clone(self);
+            let cfg = Arc::clone(config);
+            dispatcher
+                .dispatch_to_worker(cfg, request, Arc::clone(&worker))
+                .await;
         }
 
         // Log scheduling stats if there was activity or pending requests
@@ -1460,6 +1774,10 @@ impl SloAwareScheduler {
                 remaining_count,
                 worker_stats_str.join(" ")
             );
+
+            if let Some(diag) = unscheduled_diag.as_ref() {
+                info!("{}", diag);
+            }
         }
     }
 
@@ -1926,4 +2244,165 @@ impl Scheduler for SloAwareScheduler {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::types::{PolicyConfig, WorkerSelectionPolicy};
+    use crate::core::{BasicWorkerBuilder, Worker};
+    use crate::policies::PolicyRegistry;
+    use std::time::Instant;
+
+    fn make_scheduler(policy: WorkerSelectionPolicy) -> SloAwareScheduler {
+        SloAwareScheduler::new(
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            vec![40.0],
+            policy,
+            None,
+            None,
+            false,
+            None,
+            "internal".to_string(),
+        )
+    }
+
+    fn make_worker_stats(
+        worker_url: &str,
+        prefill_sim_metrics: Option<HashMap<i64, f64>>,
+    ) -> WorkerStats {
+        WorkerStats {
+            worker_id: worker_url.to_string(),
+            batch_size_tokens: 0,
+            kv_tokens_used: None,
+            num_requests: 0,
+            waiting_queue_size: 0,
+            waiting_queue_info: None,
+            forward_mode: "DECODE".to_string(),
+            iteration_num: 0,
+            worker_iteration_id: None,
+            report_send_time_ms: None,
+            last_iteration_time_ms: None,
+            prefill_chunk_pairs: None,
+            prefill_sim_metrics,
+            accepted_request_ids: None,
+            batch_size_by_tpot_tier: None,
+            timestamp: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn first_available_treats_virtual_pending_messages_as_busy() {
+        let scheduler = make_scheduler(WorkerSelectionPolicy::FirstAvailable);
+        let worker1: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("http://worker1:8080").build());
+        let worker2: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("http://worker2:8080").build());
+        let workers = vec![worker1.clone(), worker2.clone()];
+
+        let mut virtual_pending_messages_by_worker = HashMap::new();
+        virtual_pending_messages_by_worker.insert(worker1.url().to_string(), 1);
+
+        let selected = scheduler
+            .select_worker_first_available_with_virtual(
+                &workers,
+                &virtual_pending_messages_by_worker,
+            )
+            .expect("worker2 should remain available");
+
+        assert_eq!(selected.url(), worker2.url());
+    }
+
+    #[test]
+    fn ttft_selection_respects_virtual_pending_tokens() {
+        let scheduler = make_scheduler(WorkerSelectionPolicy::TTFTAware { margin_ms: 0.0 });
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("http://worker1:8080").build());
+        let workers = vec![worker.clone()];
+
+        let sim_metrics = HashMap::from([(0, 10.0), (10, 40.0), (20, 120.0)]);
+        scheduler
+            .worker_stats
+            .write()
+            .expect("worker stats lock")
+            .insert(
+                worker.url().to_string(),
+                make_worker_stats(worker.url(), Some(sim_metrics)),
+            );
+
+        let selected_without_virtual = scheduler.select_worker_ttft_aware_with_virtual(
+            &workers,
+            10,
+            60.0,
+            0.0,
+            &HashMap::new(),
+        );
+        assert!(
+            selected_without_virtual.is_some(),
+            "first request should fit without virtual pending"
+        );
+
+        let mut virtual_pending_tokens_by_worker = HashMap::new();
+        virtual_pending_tokens_by_worker.insert(worker.url().to_string(), 10);
+
+        let selected_with_virtual = scheduler.select_worker_ttft_aware_with_virtual(
+            &workers,
+            10,
+            60.0,
+            0.0,
+            &virtual_pending_tokens_by_worker,
+        );
+        assert!(
+            selected_with_virtual.is_none(),
+            "second request should be deferred once same-tick virtual tokens are included"
+        );
+    }
+
+    #[test]
+    fn ttft_virtual_pending_limits_same_tick_burst_on_single_worker() {
+        let scheduler = make_scheduler(WorkerSelectionPolicy::TTFTAware { margin_ms: 0.0 });
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("http://worker1:8080").build());
+        let workers = vec![worker.clone()];
+
+        let sim_metrics = HashMap::from([(0, 10.0), (100, 40.0), (200, 220.0)]);
+        scheduler
+            .worker_stats
+            .write()
+            .expect("worker stats lock")
+            .insert(
+                worker.url().to_string(),
+                make_worker_stats(worker.url(), Some(sim_metrics)),
+            );
+
+        let request_tokens = 100;
+        let remaining_slack_ms = 100.0;
+        let mut admitted = 0;
+        let mut virtual_pending_tokens_by_worker = HashMap::new();
+
+        for _ in 0..10 {
+            let selected = scheduler.select_worker_ttft_aware_with_virtual(
+                &workers,
+                request_tokens,
+                remaining_slack_ms,
+                0.0,
+                &virtual_pending_tokens_by_worker,
+            );
+
+            let Some(selected_worker) = selected else {
+                break;
+            };
+
+            admitted += 1;
+            *virtual_pending_tokens_by_worker
+                .entry(selected_worker.url().to_string())
+                .or_insert(0) += request_tokens;
+        }
+
+        assert_eq!(
+            admitted, 1,
+            "same-tick virtual pending should stop a burst from being fully admitted to one worker"
+        );
+    }
+
 }
