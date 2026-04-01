@@ -244,6 +244,7 @@ class EmbeddingBatchResult:
     compute_end_event: Optional[torch.cuda.Event] = None
     gpu_elapsed_ms: Optional[float] = None
     launch_time_breakdown_ms: Optional[dict[str, float]] = None
+    launch_forward_breakdown_ms: Optional[dict[str, float]] = None
 
     def copy_to_cpu(self):
         """Copy embeddings tensor to CPU in overlap scheduling."""
@@ -1317,11 +1318,15 @@ class Scheduler(
                     launch_time_breakdown_ms = getattr(
                         result, "launch_time_breakdown_ms", None
                     )
+                    launch_forward_breakdown_ms = getattr(
+                        result, "launch_forward_breakdown_ms", None
+                    )
                     self._drain_finished_iteration(
                         batch,
                         actual_time_ms,
                         self._pre_batch_kv_used,
                         launch_time_breakdown_ms,
+                        launch_forward_breakdown_ms,
                     )
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -1365,11 +1370,15 @@ class Scheduler(
                 launch_time_breakdown_ms = getattr(
                     tmp_result, "launch_time_breakdown_ms", None
                 )
+                launch_forward_breakdown_ms = getattr(
+                    tmp_result, "launch_forward_breakdown_ms", None
+                )
                 self._drain_finished_iteration(
                     tmp_batch,
                     actual_time_ms,
                     self._prev_pre_batch_kv_used,
                     launch_time_breakdown_ms,
+                    launch_forward_breakdown_ms,
                 )
 
         while True:
@@ -2443,231 +2452,285 @@ class Scheduler(
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
-        # Check if the grammar is ready in the grammar queue
-        if self.grammar_manager.has_waiting_grammars():
-            ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
-            for req in ready_grammar_requests:
-                self._add_request_to_queue(req)
+        prefill_breakdown_ms = {
+            "ready": 0.0,
+            "priority": 0.0,
+            "budget": 0.0,
+            "scan": 0.0,
+            "queue": 0.0,
+            "batch": 0.0,
+            "prepare": 0.0,
+            "mix": 0.0,
+            "other": 0.0,
+        }
+        prefill_total_start = time.perf_counter()
 
-        if self.enable_hierarchical_cache:
-            self.tree_cache.check_hicache_events()
+        def _record_prefill_time(phase: str, start_time: float) -> None:
+            prefill_breakdown_ms[phase] = prefill_breakdown_ms.get(phase, 0.0) + (
+                time.perf_counter() - start_time
+            ) * 1000.0
 
-        if self.enable_priority_preemption:
-            # Reset batch_is_full to try preemption with a prefill adder.
-            self.running_batch.batch_is_full = False
+        try:
+            ready_start = time.perf_counter()
+            # Check if the grammar is ready in the grammar queue
+            if self.grammar_manager.has_waiting_grammars():
+                ready_grammar_requests = (
+                    self.grammar_manager.get_ready_grammar_requests()
+                )
+                for req in ready_grammar_requests:
+                    self._add_request_to_queue(req)
 
-        scheduling_iteration = self.iteration_count + 1
-        if self._should_skip_prefill_for_sidecar_decision(scheduling_iteration):
-            return None
+            if self.enable_hierarchical_cache:
+                self.tree_cache.check_hicache_events()
 
-        if (
-            self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
-            return None
+            if self.enable_priority_preemption:
+                # Reset batch_is_full to try preemption with a prefill adder.
+                self.running_batch.batch_is_full = False
 
-        running_bs = len(self.running_batch.reqs)
+            scheduling_iteration = self.iteration_count + 1
+            if self._should_skip_prefill_for_sidecar_decision(scheduling_iteration):
+                _record_prefill_time("ready", ready_start)
+                return None
 
-        # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked requests has just been released.
-        # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
-        # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
-        if (
-            self.get_num_allocatable_reqs(running_bs) <= 0
-            and self.chunked_req is not None
-            and not self.enable_priority_preemption
-        ):
-            self.running_batch.batch_is_full = True
-            return None
-
-        # Get priority queue
-        self.policy.calc_priority(self.waiting_queue, self.running_batch)
-
-        if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
-            # If we are testing retraction and the running batch size exceeds
-            # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
-            # in the waiting queue.
-            return None
-
-        # Determine chunked_prefill_size for this batch
-        chunked_prefill_size = self.chunked_prefill_size
-        if self.chunked_req is not None and self.enable_dynamic_chunking:
-            history_len = len(self.chunked_req.prefix_indices)
-            dynamic_size = self.predict_next_chunk_size(history_len)
-            if dynamic_size is not None:
-                chunked_prefill_size = dynamic_size
-
-        # Prefill policy
-        (
-            effective_max_prefill_tokens,
-            effective_chunked_prefill_size,
-        ) = self._get_prefill_adder_budgets(
-            self.iteration_count + 1,
-            running_bs,
-            chunked_prefill_size,
-        )
-        adder = PrefillAdder(
-            self.page_size,
-            self.tree_cache,
-            self.token_to_kv_pool_allocator,
-            self.running_batch,
-            self.new_token_ratio,
-            effective_max_prefill_tokens,
-            effective_chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
-            self.priority_scheduling_preemption_threshold,
-            max_prefill_bs=self.max_prefill_bs,
-            max_running_requests=self.max_running_requests,
-            prefill_max_requests=self.server_args.prefill_max_requests,
-            prefill_delayer_single_pass=prefill_delayer_single_pass,
-            dllm_config=self.dllm_config,
-        )
-
-        if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
-
-        if self.enable_lora:
-            running_loras = {req.lora_id for req in self.running_batch.reqs}
-
-        # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
-            if self.enable_lora and req.lora_id not in running_loras:
-                if self.enable_lora_overlap_loading:
-                    # For overlapping loading of LoRA weights with computation, we will load each adapter one at a time,
-                    # as opposed to loading them in one batch
-                    res = self.lora_overlap_loader.try_overlap_load_lora(
-                        req.lora_id, running_loras
-                    )
-                    if not res:
-                        continue
-                else:
-                    new_lora_set = {req.lora_id} | running_loras
-                    if not self.tp_worker.model_runner.lora_manager.validate_lora_batch(
-                        new_lora_set
-                    ):
-                        continue
+            if (
+                self.running_batch.batch_is_full or len(self.waiting_queue) == 0
+            ) and self.chunked_req is None:
+                _record_prefill_time("ready", ready_start)
+                return None
 
             running_bs = len(self.running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+
+            # Ignore the check if self.chunked_req is not None.
+            # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
+            # as the space for the chunked requests has just been released.
+            # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
+            # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
+            if (
+                self.get_num_allocatable_reqs(running_bs) <= 0
+                and self.chunked_req is not None
+                and not self.enable_priority_preemption
+            ):
                 self.running_batch.batch_is_full = True
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                # In prefill mode, prealloc queue and transfer queue can also take memory,
-                # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
-                    self.running_batch.batch_is_full = True
+                _record_prefill_time("ready", ready_start)
+                return None
+            _record_prefill_time("ready", ready_start)
 
-            if self.running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
-                ):
-                    break
+            priority_start = time.perf_counter()
+            # Get priority queue
+            self.policy.calc_priority(self.waiting_queue, self.running_batch)
+            _record_prefill_time("priority", priority_start)
 
-            if self.enable_hicache_storage:
-                prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
-                if not prefetch_done:
-                    # skip staging requests that are ongoing prefetch
-                    continue
-                # Pop the number of tokens loaded from storage (L3 hits)
-                req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
-                    req.rid
-                )
+            if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
+                # If we are testing retraction and the running batch size exceeds
+                # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
+                # in the waiting queue.
+                return None
 
-            req.init_next_round_input(self.tree_cache)
-            res = adder.add_one_req(
-                req,
-                has_chunked_req=(self.chunked_req is not None),
-                truncation_align_size=self.truncation_align_size,
+            budget_start = time.perf_counter()
+            # Determine chunked_prefill_size for this batch
+            chunked_prefill_size = self.chunked_prefill_size
+            if self.chunked_req is not None and self.enable_dynamic_chunking:
+                history_len = len(self.chunked_req.prefix_indices)
+                dynamic_size = self.predict_next_chunk_size(history_len)
+                if dynamic_size is not None:
+                    chunked_prefill_size = dynamic_size
+
+            # Prefill policy
+            (
+                effective_max_prefill_tokens,
+                effective_chunked_prefill_size,
+            ) = self._get_prefill_adder_budgets(
+                self.iteration_count + 1,
+                running_bs,
+                chunked_prefill_size,
             )
+            adder = PrefillAdder(
+                self.page_size,
+                self.tree_cache,
+                self.token_to_kv_pool_allocator,
+                self.running_batch,
+                self.new_token_ratio,
+                effective_max_prefill_tokens,
+                effective_chunked_prefill_size,
+                running_bs if self.is_mixed_chunk else 0,
+                self.priority_scheduling_preemption_threshold,
+                max_prefill_bs=self.max_prefill_bs,
+                max_running_requests=self.max_running_requests,
+                prefill_max_requests=self.server_args.prefill_max_requests,
+                prefill_delayer_single_pass=prefill_delayer_single_pass,
+                dllm_config=self.dllm_config,
+            )
+
+            if self.chunked_req is not None:
+                self.chunked_req.init_next_round_input()
+                self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
             if self.enable_lora:
-                running_loras.add(req.lora_id)
+                running_loras = {req.lora_id for req in self.running_batch.reqs}
+            _record_prefill_time("budget", budget_start)
 
-            if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
-                    if self.enable_hierarchical_cache:
-                        # Set batch_is_full after making sure there are requests that can be served
-                        self.running_batch.batch_is_full = len(
-                            adder.can_run_list
-                        ) > 0 or (not self.running_batch.is_empty())
+            scan_start = time.perf_counter()
+            # Get requests from the waiting queue to a new prefill batch
+            for req in self.waiting_queue:
+                if self.enable_lora and req.lora_id not in running_loras:
+                    if self.enable_lora_overlap_loading:
+                        # For overlapping loading of LoRA weights with computation, we will load each adapter one at a time,
+                        # as opposed to loading them in one batch
+                        res = self.lora_overlap_loader.try_overlap_load_lora(
+                            req.lora_id, running_loras
+                        )
+                        if not res:
+                            continue
                     else:
+                        new_lora_set = {req.lora_id} | running_loras
+                        if not self.tp_worker.model_runner.lora_manager.validate_lora_batch(
+                            new_lora_set
+                        ):
+                            continue
+
+                running_bs = len(self.running_batch.reqs)
+                if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
+                    self.running_batch.batch_is_full = True
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    # In prefill mode, prealloc queue and transfer queue can also take memory,
+                    # so we need to check if the available size for the actual available size.
+                    if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                         self.running_batch.batch_is_full = True
-                break
 
-        # Update waiting queue
-        can_run_list: List[Req] = adder.can_run_list
-        if len(can_run_list) == 0:
-            return None
+                if self.running_batch.batch_is_full:
+                    if (
+                        not self.enable_priority_preemption
+                        or not adder.preempt_to_schedule(req, self.server_args)
+                    ):
+                        break
 
-        self.waiting_queue = [
-            x for x in self.waiting_queue if x not in set(can_run_list)
-        ]
-        if adder.preempt_list:
-            for req in adder.preempt_list:
-                self._add_request_to_queue(req)
+                if self.enable_hicache_storage:
+                    prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
+                    if not prefetch_done:
+                        # skip staging requests that are ongoing prefetch
+                        continue
+                    # Pop the number of tokens loaded from storage (L3 hits)
+                    req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
+                        req.rid
+                    )
 
-        if adder.new_chunked_req is not None:
-            # Update chunked prefill
-            assert self.chunked_req is None
-            self.chunked_req = adder.new_chunked_req
+                req.init_next_round_input(self.tree_cache)
+                res = adder.add_one_req(
+                    req,
+                    has_chunked_req=(self.chunked_req is not None),
+                    truncation_align_size=self.truncation_align_size,
+                )
 
-        if self.chunked_req is not None:
-            self.chunked_req.is_chunked += 1
+                if self.enable_lora:
+                    running_loras.add(req.lora_id)
 
-        # Record for logging prefill stats after forward
-        self.adder = adder
-        self.can_run_list = can_run_list
-        self.running_bs = len(self.running_batch.reqs)
+                if res != AddReqResult.CONTINUE:
+                    if res == AddReqResult.NO_TOKEN:
+                        if self.enable_hierarchical_cache:
+                            # Set batch_is_full after making sure there are requests that can be served
+                            self.running_batch.batch_is_full = len(
+                                adder.can_run_list
+                            ) > 0 or (not self.running_batch.is_empty())
+                        else:
+                            self.running_batch.batch_is_full = True
+                    break
+            _record_prefill_time("scan", scan_start)
 
-        set_time_batch(can_run_list, "set_forward_entry_time")
+            queue_start = time.perf_counter()
+            # Update waiting queue
+            can_run_list: List[Req] = adder.can_run_list
+            if len(can_run_list) == 0:
+                _record_prefill_time("queue", queue_start)
+                return None
 
-        # Create a new batch
-        new_batch = ScheduleBatch.init_new(
-            can_run_list,
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            self.tree_cache,
-            self.model_config,
-            self.enable_overlap,
-            self.spec_algorithm,
-            chunked_req=self.chunked_req,
-        )
-        self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
-        if self.enable_hierarchical_cache:
-            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
-            new_batch.hicache_consumer_index = (
-                self.tree_cache.ready_to_load_host_cache()
+            self.waiting_queue = [
+                x for x in self.waiting_queue if x not in set(can_run_list)
+            ]
+            if adder.preempt_list:
+                for req in adder.preempt_list:
+                    self._add_request_to_queue(req)
+
+            if adder.new_chunked_req is not None:
+                # Update chunked prefill
+                assert self.chunked_req is None
+                self.chunked_req = adder.new_chunked_req
+
+            if self.chunked_req is not None:
+                self.chunked_req.is_chunked += 1
+
+            # Record for logging prefill stats after forward
+            self.adder = adder
+            self.can_run_list = can_run_list
+            self.running_bs = len(self.running_batch.reqs)
+
+            set_time_batch(can_run_list, "set_forward_entry_time")
+            _record_prefill_time("queue", queue_start)
+
+            batch_start = time.perf_counter()
+            # Create a new batch
+            new_batch = ScheduleBatch.init_new(
+                can_run_list,
+                self.req_to_token_pool,
+                self.token_to_kv_pool_allocator,
+                self.tree_cache,
+                self.model_config,
+                self.enable_overlap,
+                self.spec_algorithm,
+                chunked_req=self.chunked_req,
             )
+            self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
+            if self.enable_hierarchical_cache:
+                # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+                new_batch.hicache_consumer_index = (
+                    self.tree_cache.ready_to_load_host_cache()
+                )
 
-        new_batch.prepare_for_extend()
-
-        # Record prefill stats for logging after forward
-        new_batch.prefill_stats = PrefillStats.from_adder(
-            adder, self.running_batch.reqs, self.enable_priority_scheduling
-        )
-
-        # Mixed-style chunked prefill
-        if (
-            self.is_mixed_chunk
-            and not self.running_batch.is_empty()
-            and not (new_batch.return_logprob or self.running_batch.return_logprob)
-            # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
-            and new_batch.input_embeds is None
-        ):
-            # TODO (lianmin): support return_logprob + mixed chunked prefill
-            self.running_batch.filter_batch(v1_spec_info_filtered=True)
-            if not self.running_batch.is_empty():
-                self.running_batch.prepare_for_decode()
-                new_batch.mix_with_running(self.running_batch)
-                new_batch.decoding_reqs = self.running_batch.reqs
-            self.running_batch = ScheduleBatch(
-                reqs=[], batch_is_full=self.running_batch.batch_is_full
+            # Record prefill stats for logging after forward
+            new_batch.prefill_stats = PrefillStats.from_adder(
+                adder, self.running_batch.reqs, self.enable_priority_scheduling
             )
-        else:
-            new_batch.decoding_reqs = None
+            _record_prefill_time("batch", batch_start)
 
-        return new_batch
+            prepare_start = time.perf_counter()
+            new_batch.prepare_for_extend()
+            _record_prefill_time("prepare", prepare_start)
+
+            mix_start = time.perf_counter()
+            # Mixed-style chunked prefill
+            if (
+                self.is_mixed_chunk
+                and not self.running_batch.is_empty()
+                and not (new_batch.return_logprob or self.running_batch.return_logprob)
+                # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
+                and new_batch.input_embeds is None
+            ):
+                # TODO (lianmin): support return_logprob + mixed chunked prefill
+                self.running_batch.filter_batch(v1_spec_info_filtered=True)
+                if not self.running_batch.is_empty():
+                    self.running_batch.prepare_for_decode()
+                    new_batch.mix_with_running(self.running_batch)
+                    new_batch.decoding_reqs = self.running_batch.reqs
+                self.running_batch = ScheduleBatch(
+                    reqs=[], batch_is_full=self.running_batch.batch_is_full
+                )
+            else:
+                new_batch.decoding_reqs = None
+            _record_prefill_time("mix", mix_start)
+
+            return new_batch
+        finally:
+            tracked_ms = sum(
+                value
+                for key, value in prefill_breakdown_ms.items()
+                if key != "other"
+            )
+            prefill_breakdown_ms["other"] = max(
+                (time.perf_counter() - prefill_total_start) * 1000.0 - tracked_ms,
+                0.0,
+            )
+            SchedulerSidecarMixin._set_pending_prefill_schedule_breakdown(
+                self, prefill_breakdown_ms
+            )
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""

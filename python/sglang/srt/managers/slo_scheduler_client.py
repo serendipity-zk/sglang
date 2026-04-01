@@ -27,6 +27,16 @@ class SLOSchedulerClient:
         self.addr = addr
         self.timeout_ms = timeout_ms
 
+        from slo_scheduler.messages.serialization import (
+            deserialize_decision,
+            serialize_engine_state,
+        )
+
+        self._serialize_engine_state_impl = serialize_engine_state
+        self._deserialize_decision_impl = deserialize_decision
+        self._rpc_breakdown_ms = _empty_client_rpc_breakdown()
+        self._empty_frame = b""
+
         self.ctx = zmq.Context()
         self.socket = self.ctx.socket(zmq.DEALER)
         self.socket.setsockopt(zmq.SNDHWM, 2)
@@ -35,22 +45,26 @@ class SLOSchedulerClient:
         self.socket.connect(addr)
 
     def _serialize_engine_state(self, engine_state) -> bytes:
-        from slo_scheduler.messages.serialization import serialize_engine_state
-
-        return serialize_engine_state(engine_state)
+        return self._serialize_engine_state_impl(engine_state)
 
     def _deserialize_decision(self, payload: bytes):
-        from slo_scheduler.messages.serialization import deserialize_decision
+        return self._deserialize_decision_impl(payload)
 
-        return deserialize_decision(payload)
+    def _reset_rpc_breakdown(self):
+        rpc_breakdown_ms = self._rpc_breakdown_ms
+        for key in CLIENT_RPC_BREAKDOWN_KEYS:
+            rpc_breakdown_ms[key] = 0.0
+        return rpc_breakdown_ms
 
     def send_and_recv(self, engine_state, current_iteration: int):
         """Return (decision, wait_time_ms, rpc_breakdown_ms, decision_payload)."""
-        rpc_breakdown_ms = _empty_client_rpc_breakdown()
+        rpc_breakdown_ms = self._reset_rpc_breakdown()
         try:
             serialize_send_start = time.perf_counter()
             payload = self._serialize_engine_state(engine_state)
-            self.socket.send_multipart([b"", payload], flags=zmq.DONTWAIT)
+            self.socket.send_multipart(
+                (self._empty_frame, payload), flags=zmq.DONTWAIT
+            )
             rpc_breakdown_ms["serialize_send"] = (
                 time.perf_counter() - serialize_send_start
             ) * 1000.0

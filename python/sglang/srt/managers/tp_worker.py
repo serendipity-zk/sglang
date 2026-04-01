@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional
 
@@ -454,26 +455,62 @@ class TpModelWorker(BaseTpWorker):
     ) -> GenerationBatchResult:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
+        launch_forward_breakdown_ms = {
+            "batch_init": 0.0,
+            "model": 0.0,
+            "sample": 0.0,
+            "logprob": 0.0,
+            "other": 0.0,
+        }
+        launch_forward_total_start = time.perf_counter()
+
+        def _record_launch_forward_time(phase: str, start_time: float) -> None:
+            launch_forward_breakdown_ms[phase] = launch_forward_breakdown_ms.get(
+                phase, 0.0
+            ) + (time.perf_counter() - start_time) * 1000.0
+
+        def _finalize_batch_result(
+            batch_result: GenerationBatchResult,
+        ) -> GenerationBatchResult:
+            tracked_ms = sum(
+                value
+                for key, value in launch_forward_breakdown_ms.items()
+                if key != "other"
+            )
+            launch_forward_breakdown_ms["other"] = max(
+                (time.perf_counter() - launch_forward_total_start) * 1000.0
+                - tracked_ms,
+                0.0,
+            )
+            batch_result.launch_forward_breakdown_ms = launch_forward_breakdown_ms
+            return batch_result
 
         # Get forward batch from model worker batch
         if model_worker_batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
 
+            batch_init_start = time.perf_counter()
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
+            _record_launch_forward_time("batch_init", batch_init_start)
         else:
             # FIXME(lsyin): unify the interface of forward_batch
             assert forward_batch is not None
 
         if self.is_dllm():
-            return self._forward_batch_generation_dllm(forward_batch)
+            model_start = time.perf_counter()
+            batch_result = self._forward_batch_generation_dllm(forward_batch)
+            _record_launch_forward_time("model", model_start)
+            return _finalize_batch_result(batch_result)
 
         if self.pp_group.is_last_rank:
+            model_start = time.perf_counter()
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
+            _record_launch_forward_time("model", model_start)
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
@@ -483,7 +520,7 @@ class TpModelWorker(BaseTpWorker):
 
             if is_verify:
                 # Skip sampling and return logits for target forward
-                return batch_result
+                return _finalize_batch_result(batch_result)
 
             if (
                 self.enable_overlap
@@ -498,13 +535,15 @@ class TpModelWorker(BaseTpWorker):
                     return batch_result
 
                 batch_result.delay_sample_func = sample_batch_func
-                return batch_result
+                return _finalize_batch_result(batch_result)
 
             if not model_worker_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
+                sample_start = time.perf_counter()
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
                 )
+                _record_launch_forward_time("sample", sample_start)
             else:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
@@ -518,22 +557,28 @@ class TpModelWorker(BaseTpWorker):
                     and logits_output.next_token_logits is not None
                 ):
                     # NOTE: Compute logprobs without full sampling
+                    logprob_start = time.perf_counter()
                     self.model_runner.compute_logprobs_only(
                         logits_output, model_worker_batch
                     )
+                    _record_launch_forward_time("logprob", logprob_start)
 
-            return batch_result
+            return _finalize_batch_result(batch_result)
         else:
+            model_start = time.perf_counter()
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
+            _record_launch_forward_time("model", model_start)
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
-            return GenerationBatchResult(
+            return _finalize_batch_result(
+                GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                )
             )
 
     def forward_batch_split_prefill(self, batch: ScheduleBatch):

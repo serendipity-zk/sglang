@@ -70,7 +70,9 @@ class FinishedIterationData:
     sidecar_wait_time_ms: float | None = None
     cpu_time_breakdown_ms: dict[str, float] | None = None
     schedule_time_breakdown_ms: dict[str, float] | None = None
+    prefill_schedule_breakdown_ms: dict[str, float] | None = None
     launch_time_breakdown_ms: dict[str, float] | None = None
+    launch_forward_breakdown_ms: dict[str, float] | None = None
     sidecar_rpc_breakdown_ms: dict[str, float] | None = None
     observability_snapshot: ObservabilityBatchSnapshot | None = None
     completed_decode_lengths: list[int] = field(default_factory=list)
@@ -298,6 +300,9 @@ class TestSchedulerSidecarMixin(unittest.TestCase):
             extend_lens=[4, 2],
         )
         scheduler._drain_current_snapshot(batch, iteration_count=7)
+        scheduler._launched_batch_prefill_schedule_breakdowns_ms.append(
+            {"ready": 0.5, "scan": 1.0, "other": 0.25}
+        )
 
         scheduler._drain_finished_iteration(
             batch,
@@ -315,12 +320,16 @@ class TestSchedulerSidecarMixin(unittest.TestCase):
         self.assertEqual(finished.completed_decode_lengths, [3])
         self.assertIsNotNone(finished.cpu_time_breakdown_ms)
         self.assertIsNotNone(finished.schedule_time_breakdown_ms)
+        self.assertIsNotNone(finished.prefill_schedule_breakdown_ms)
         self.assertEqual(finished.launch_time_breakdown_ms, {"forward": 4.0, "other": 1.0})
+        self.assertIsNone(finished.launch_forward_breakdown_ms)
         self.assertIsNone(finished.sidecar_rpc_breakdown_ms)
         self.assertEqual(finished.cpu_time_breakdown_ms["recv"], 1.5)
         self.assertEqual(finished.cpu_time_breakdown_ms["schedule"], 2.5)
         self.assertEqual(finished.schedule_time_breakdown_ms["merge"], 0.75)
         self.assertEqual(finished.schedule_time_breakdown_ms["sidecar_rpc"], 1.25)
+        self.assertEqual(finished.prefill_schedule_breakdown_ms["ready"], 0.5)
+        self.assertEqual(finished.prefill_schedule_breakdown_ms["scan"], 1.0)
         self.assertIsNotNone(finished.observability_snapshot)
         self.assertEqual(finished.observability_snapshot.num_running_requests, 2)
         self.assertEqual(finished.observability_snapshot.num_waiting_requests, 0)

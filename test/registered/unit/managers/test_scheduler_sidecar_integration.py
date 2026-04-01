@@ -75,7 +75,9 @@ class FinishedIterationData:
     sidecar_wait_time_ms: float | None = None
     cpu_time_breakdown_ms: dict[str, float] | None = None
     schedule_time_breakdown_ms: dict[str, float] | None = None
+    prefill_schedule_breakdown_ms: dict[str, float] | None = None
     launch_time_breakdown_ms: dict[str, float] | None = None
+    launch_forward_breakdown_ms: dict[str, float] | None = None
     sidecar_rpc_breakdown_ms: dict[str, float] | None = None
     observability_snapshot: ObservabilityBatchSnapshot | None = None
     completed_decode_lengths: list[int] = field(default_factory=list)
@@ -585,8 +587,8 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
             lambda b, it: scheduler.call_order.append(("current", it))
         )
         scheduler._drain_finished_iteration = (
-            lambda b, elapsed, kv, launch: scheduler.call_order.append(
-                ("finished", scheduler.iteration_count, kv, launch)
+            lambda b, elapsed, kv, launch, launch_fwd=None: scheduler.call_order.append(
+                ("finished", scheduler.iteration_count, kv, launch, launch_fwd)
             )
         )
         scheduler.self_check_during_idle = lambda: None
@@ -604,7 +606,7 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
                 ("launch", None),
                 ("current", 1),
                 ("process", 1),
-                ("finished", 1, 11, None),
+                ("finished", 1, 11, None, None),
             ],
         )
 
@@ -656,8 +658,8 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
             lambda b, it: scheduler.call_order.append(("current", it))
         )
         scheduler._drain_finished_iteration = (
-            lambda b, elapsed, kv, launch: scheduler.call_order.append(
-                ("finished", scheduler.iteration_count, kv, launch)
+            lambda b, elapsed, kv, launch, launch_fwd=None: scheduler.call_order.append(
+                ("finished", scheduler.iteration_count, kv, launch, launch_fwd)
             )
         )
         scheduler.cancel_bubble_timer = lambda: None
@@ -676,7 +678,7 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
                 ("launch", None),
                 ("current", 1),
                 ("process", 0),
-                ("finished", 1, 17, None),
+                ("finished", 1, 17, None, None),
             ],
         )
 
