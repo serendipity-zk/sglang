@@ -170,7 +170,6 @@ from sglang.srt.managers.scheduler_sidecar_mixin import SchedulerSidecarMixin
 from sglang.srt.managers.scheduler_update_weights_mixin import (
     SchedulerUpdateWeightsMixin,
 )
-from sglang.srt.managers.router_message_tracker import RouterMessageAckTracker
 from sglang.srt.managers.session_controller import SessionController
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -241,6 +240,10 @@ _is_npu = is_npu()
 class EmbeddingBatchResult:
     embeddings: torch.Tensor
     copy_done: Optional[torch.cuda.Event] = None
+    compute_start_event: Optional[torch.cuda.Event] = None
+    compute_end_event: Optional[torch.cuda.Event] = None
+    gpu_elapsed_ms: Optional[float] = None
+    launch_time_breakdown_ms: Optional[dict[str, float]] = None
 
     def copy_to_cpu(self):
         """Copy embeddings tensor to CPU in overlap scheduling."""
@@ -333,8 +336,6 @@ class Scheduler(
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.enable_hicache_storage = server_args.hicache_storage_backend is not None
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
-        self.router_ack_tracker = RouterMessageAckTracker()
-
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
@@ -1260,34 +1261,75 @@ class Scheduler(
         """A normal scheduler loop."""
         while True:
             # Receive requests
+            recv_start = time.perf_counter()
             recv_reqs = self.recv_requests()
+            SchedulerSidecarMixin._record_cpu_phase_time(
+                self, "recv", (time.perf_counter() - recv_start) * 1000.0
+            )
+            process_input_start = time.perf_counter()
             self.process_input_requests(recv_reqs)
+            SchedulerSidecarMixin._record_cpu_phase_time(
+                self, "input", (time.perf_counter() - process_input_start) * 1000.0
+            )
             if self._engine_paused:
                 self.cancel_bubble_timer()
                 continue
 
             # Get the next batch to run
+            schedule_start = time.perf_counter()
             batch = self.get_next_batch_to_run()
+            SchedulerSidecarMixin._record_cpu_phase_time(
+                self, "schedule", (time.perf_counter() - schedule_start) * 1000.0
+            )
             self.cur_batch = batch
 
             # Launch the current batch
             if batch:
                 if SchedulerSidecarMixin._sidecar_owner_on_rank(self):
                     self._pre_batch_kv_used = self._get_token_info()[0]
+                    self._record_sidecar_batch_launch()
                 batch_start = time.perf_counter()
                 result = self.run_batch(batch)
-                iteration_time_ms = (time.perf_counter() - batch_start) * 1000
+                launch_wall_time_ms = (time.perf_counter() - batch_start) * 1000
+                SchedulerSidecarMixin._record_cpu_phase_time(
+                    self, "launch", launch_wall_time_ms
+                )
                 self.iteration_count += 1
                 if SchedulerSidecarMixin._sidecar_owner_on_rank(self):
+                    current_snapshot_start = time.perf_counter()
                     self._drain_current_snapshot(batch, self.iteration_count)
+                    SchedulerSidecarMixin._record_cpu_phase_time(
+                        self,
+                        "current",
+                        (time.perf_counter() - current_snapshot_start) * 1000.0,
+                    )
+                process_result_start = time.perf_counter()
                 self.process_batch_result(batch, result)
+                SchedulerSidecarMixin._record_cpu_phase_time(
+                    self, "result", (time.perf_counter() - process_result_start) * 1000.0
+                )
                 if SchedulerSidecarMixin._sidecar_owner_on_rank(self):
+                    actual_time_ms = (
+                        SchedulerOutputProcessorMixin._resolve_completed_iteration_time_ms(
+                            self, result, launch_wall_time_ms
+                        )
+                    )
+                    launch_time_breakdown_ms = getattr(
+                        result, "launch_time_breakdown_ms", None
+                    )
                     self._drain_finished_iteration(
-                        batch, iteration_time_ms, self._pre_batch_kv_used
+                        batch,
+                        actual_time_ms,
+                        self._pre_batch_kv_used,
+                        launch_time_breakdown_ms,
                     )
             else:
                 # When the server is idle, do self-check and re-init some states.
+                idle_start = time.perf_counter()
                 self.self_check_during_idle()
+                SchedulerSidecarMixin._record_cpu_phase_time(
+                    self, "idle", (time.perf_counter() - idle_start) * 1000.0
+                )
 
             # Update last_batch
             self.last_batch = batch
@@ -1307,23 +1349,50 @@ class Scheduler(
 
         def pop_and_process():
             # Process the results of the last batch
-            tmp_batch, tmp_result, tmp_elapsed_ms = self.result_queue.popleft()
+            tmp_batch, tmp_result, tmp_launch_wall_time_ms = self.result_queue.popleft()
+            process_result_start = time.perf_counter()
             self.process_batch_result(tmp_batch, tmp_result)
+            SchedulerSidecarMixin._record_cpu_phase_time(
+                self, "result", (time.perf_counter() - process_result_start) * 1000.0
+            )
             self.iteration_count += 1
             if SchedulerSidecarMixin._sidecar_owner_on_rank(self):
+                actual_time_ms = (
+                    SchedulerOutputProcessorMixin._resolve_completed_iteration_time_ms(
+                        self, tmp_result, tmp_launch_wall_time_ms
+                    )
+                )
+                launch_time_breakdown_ms = getattr(
+                    tmp_result, "launch_time_breakdown_ms", None
+                )
                 self._drain_finished_iteration(
-                    tmp_batch, tmp_elapsed_ms, self._prev_pre_batch_kv_used
+                    tmp_batch,
+                    actual_time_ms,
+                    self._prev_pre_batch_kv_used,
+                    launch_time_breakdown_ms,
                 )
 
         while True:
             # Receive requests
+            recv_start = time.perf_counter()
             recv_reqs = self.recv_requests()
+            SchedulerSidecarMixin._record_cpu_phase_time(
+                self, "recv", (time.perf_counter() - recv_start) * 1000.0
+            )
+            process_input_start = time.perf_counter()
             self.process_input_requests(recv_reqs)
+            SchedulerSidecarMixin._record_cpu_phase_time(
+                self, "input", (time.perf_counter() - process_input_start) * 1000.0
+            )
             if self._engine_paused:
                 continue
 
             # Get the next batch to run
+            schedule_start = time.perf_counter()
             batch = self.get_next_batch_to_run()
+            SchedulerSidecarMixin._record_cpu_phase_time(
+                self, "schedule", (time.perf_counter() - schedule_start) * 1000.0
+            )
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
@@ -1338,12 +1407,24 @@ class Scheduler(
             if batch:
                 if SchedulerSidecarMixin._sidecar_owner_on_rank(self):
                     self._pre_batch_kv_used = self._get_token_info()[0]
+                    self._record_sidecar_batch_launch()
                 batch_start = time.perf_counter()
                 batch_result = self.run_batch(batch)
-                batch_elapsed_ms = (time.perf_counter() - batch_start) * 1000
-                self.result_queue.append((batch.copy(), batch_result, batch_elapsed_ms))
+                launch_wall_time_ms = (time.perf_counter() - batch_start) * 1000
+                SchedulerSidecarMixin._record_cpu_phase_time(
+                    self, "launch", launch_wall_time_ms
+                )
+                self.result_queue.append(
+                    (batch.copy(), batch_result, launch_wall_time_ms)
+                )
                 if SchedulerSidecarMixin._sidecar_owner_on_rank(self):
+                    current_snapshot_start = time.perf_counter()
                     self._drain_current_snapshot(batch, self.iteration_count + 1)
+                    SchedulerSidecarMixin._record_cpu_phase_time(
+                        self,
+                        "current",
+                        (time.perf_counter() - current_snapshot_start) * 1000.0,
+                    )
             else:
                 batch_result = None
                 self.cancel_bubble_timer()
@@ -1354,12 +1435,20 @@ class Scheduler(
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
+                idle_start = time.perf_counter()
                 self.self_check_during_idle()
+                SchedulerSidecarMixin._record_cpu_phase_time(
+                    self, "idle", (time.perf_counter() - idle_start) * 1000.0
+                )
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
+                sample_start = time.perf_counter()
                 self.launch_batch_sample_if_needed(batch_result)
+                SchedulerSidecarMixin._record_cpu_phase_time(
+                    self, "sample", (time.perf_counter() - sample_start) * 1000.0
+                )
 
             # Update last_batch
             self.last_batch = batch
@@ -1655,17 +1744,6 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
-        if not self.router_ack_tracker.record(
-            recv_req.router_generation, recv_req.router_message_id
-        ):
-            logger.info(
-                "Dropping duplicate request: rid=%s, generation=%s, message_id=%s",
-                recv_req.rid,
-                recv_req.router_generation,
-                recv_req.router_message_id,
-            )
-            return
-
         self._normalize_sidecar_arrival_time(recv_req)
 
         # Route: normal request / session request / session-not-found
@@ -1716,8 +1794,7 @@ class Scheduler(
                 target_ttft_ms=recv_req.target_ttft_ms,
                 target_tpot_ms=recv_req.target_tpot_ms,
                 arrival_time_ms=recv_req.arrival_time_ms,
-                router_generation=recv_req.router_generation,
-                router_message_id=recv_req.router_message_id,
+                start_iteration=self.iteration_count,
                 http_worker_ipc=recv_req.http_worker_ipc,
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
@@ -1752,6 +1829,7 @@ class Scheduler(
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
+            req.start_iteration = self.iteration_count
             # TODO: set trace context
             req._sidecar_count_as_accepted = True
             if self.enable_metrics:
@@ -1769,6 +1847,7 @@ class Scheduler(
                 recv_req.input_ids,
                 recv_req.sampling_params,
                 vocab_size=self.model_config.vocab_size,
+                start_iteration=self.iteration_count,
             )
             req.tokenizer = self.tokenizer
             req._sidecar_count_as_accepted = True
@@ -1885,6 +1964,37 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        def record_sidecar_accepted_request() -> None:
+            sidecar_marked = getattr(req, "_sidecar_count_as_accepted", False)
+            if is_retracted or not sidecar_marked:
+                return
+            if self.slo_client is None:
+                logger.info(
+                    "[SIDECAR_ACK_SKIP] rid=%s iter=%d owner=%s sidecar_enabled=%s "
+                    "reason=no_slo_client",
+                    req.rid,
+                    getattr(self, "iteration_count", -1),
+                    SchedulerSidecarMixin._sidecar_owner_on_rank(self),
+                    getattr(self, "_sidecar_enabled", False),
+                )
+                return
+            self._accepted_since_last_send += 1
+            accepted_request_ids = getattr(
+                self, "_accepted_request_ids_since_last_send", None
+            )
+            if accepted_request_ids is not None:
+                accepted_request_ids.append(req.rid)
+            logger.info(
+                "[SIDECAR_ACK_MARK] rid=%s iter=%d accepted_since_last_send=%d "
+                "accepted_sample=%s",
+                req.rid,
+                getattr(self, "iteration_count", -1),
+                self._accepted_since_last_send,
+                ",".join(
+                    (accepted_request_ids or [])[:3]
+                ),
+            )
+
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return
@@ -1893,36 +2003,21 @@ class Scheduler(
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
-            if (
-                not is_retracted
-                and getattr(req, "_sidecar_count_as_accepted", False)
-                and self.slo_client is not None
-            ):
-                self._accepted_since_last_send += 1
+            record_sidecar_accepted_request()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
                 req, self.model_config.num_key_value_heads
             )
             req.time_stats.set_prefill_bootstrap_queue_entry_time()
-            if (
-                not is_retracted
-                and getattr(req, "_sidecar_count_as_accepted", False)
-                and self.slo_client is not None
-            ):
-                self._accepted_since_last_send += 1
+            record_sidecar_accepted_request()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.disagg_decode_prealloc_queue.add(req, is_retracted=is_retracted)
             if not is_retracted:
                 req.time_stats.set_decode_prealloc_queue_entry_time()
             else:
                 req.time_stats.set_retract_time()
-            if (
-                not is_retracted
-                and getattr(req, "_sidecar_count_as_accepted", False)
-                and self.slo_client is not None
-            ):
-                self._accepted_since_last_send += 1
+            record_sidecar_accepted_request()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
@@ -2046,6 +2141,7 @@ class Scheduler(
             lora_id=recv_req.lora_id,
             http_worker_ipc=recv_req.http_worker_ipc,
             time_stats=recv_req.time_stats,
+            start_iteration=self.iteration_count,
         )
         req.tokenizer = self.tokenizer
 
@@ -2157,6 +2253,7 @@ class Scheduler(
         return True
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        merge_start = time.perf_counter()
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
         if self.dllm_config is not None:
@@ -2209,15 +2306,35 @@ class Scheduler(
         if self.running_batch.is_prefill_only:
             self.running_batch.filter_batch()
 
+        SchedulerSidecarMixin._record_cpu_schedule_time(
+            self, "merge", (time.perf_counter() - merge_start) * 1000.0
+        )
+
         if SchedulerSidecarMixin._sidecar_enabled_for_scheduling(self):
             if SchedulerSidecarMixin._sidecar_owner_on_rank(self):
+                sidecar_prep_start = time.perf_counter()
                 self._drain_scheduling_context()
+                SchedulerSidecarMixin._record_cpu_schedule_time(
+                    self,
+                    "sidecar_prep",
+                    (time.perf_counter() - sidecar_prep_start) * 1000.0,
+                )
+            sidecar_rpc_start = time.perf_counter()
             self._assemble_and_send_engine_state()
+            SchedulerSidecarMixin._record_cpu_schedule_time(
+                self,
+                "sidecar_rpc",
+                (time.perf_counter() - sidecar_rpc_start) * 1000.0,
+            )
 
+        prefill_start = time.perf_counter()
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
         else:
             new_batch = self.get_new_batch_prefill()
+        SchedulerSidecarMixin._record_cpu_schedule_time(
+            self, "prefill", (time.perf_counter() - prefill_start) * 1000.0
+        )
 
         need_mlp_sync = self.require_mlp_sync
         if need_mlp_sync and not self.spec_algorithm.is_none():
@@ -2233,6 +2350,7 @@ class Scheduler(
             ret = new_batch
         else:
             # Run decode (skip for prefill-only batches)
+            decode_start = time.perf_counter()
             if (
                 not self.running_batch.is_empty()
                 and not self.running_batch.is_prefill_only
@@ -2241,8 +2359,12 @@ class Scheduler(
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
                 ret = None
+            SchedulerSidecarMixin._record_cpu_schedule_time(
+                self, "decode", (time.perf_counter() - decode_start) * 1000.0
+            )
 
         # Handle DP attention and log stats
+        finalize_start = time.perf_counter()
         ret = self.maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)
 
         # Handle ngram embedding
@@ -2250,6 +2372,10 @@ class Scheduler(
 
         if ret:
             set_schedule_time_batch(ret)
+
+        SchedulerSidecarMixin._record_cpu_schedule_time(
+            self, "finalize", (time.perf_counter() - finalize_start) * 1000.0
+        )
 
         return ret
 
@@ -2281,6 +2407,38 @@ class Scheduler(
         if decision is not None:
             return decision.max_prefill_tokens
         return self.max_prefill_tokens
+
+    def _get_prefill_adder_budgets(
+        self,
+        scheduling_iteration: int,
+        running_bs: int,
+        chunked_prefill_size: Optional[int],
+    ) -> tuple[int, Optional[int]]:
+        """Translate sidecar prefill budget into PrefillAdder limits.
+
+        Sidecar decisions express pure prefill-token budget. PrefillAdder, when
+        mixed chunking is enabled, subtracts the decode batch size from both the
+        input-token budget and the chunk-token budget. Preserve the old sidecar
+        behavior by adding decode tokens back into rem_chunk_tokens before that
+        subtraction happens.
+        """
+        rem_input_tokens = self._get_effective_max_prefill_tokens(
+            scheduling_iteration
+        )
+        rem_chunk_tokens = chunked_prefill_size
+
+        decision = self._get_matching_sidecar_decision(scheduling_iteration)
+        if (
+            decision is not None
+            and self.is_mixed_chunk
+            and chunked_prefill_size is not None
+        ):
+            sidecar_budget = max(0, int(decision.max_prefill_tokens))
+            sidecar_budget = min(sidecar_budget, int(chunked_prefill_size))
+            rem_input_tokens = self.max_prefill_tokens
+            rem_chunk_tokens = sidecar_budget + running_bs
+
+        return rem_input_tokens, rem_chunk_tokens
 
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
@@ -2340,8 +2498,13 @@ class Scheduler(
                 chunked_prefill_size = dynamic_size
 
         # Prefill policy
-        effective_max_prefill_tokens = self._get_effective_max_prefill_tokens(
-            self.iteration_count + 1
+        (
+            effective_max_prefill_tokens,
+            effective_chunked_prefill_size,
+        ) = self._get_prefill_adder_budgets(
+            self.iteration_count + 1,
+            running_bs,
+            chunked_prefill_size,
         )
         adder = PrefillAdder(
             self.page_size,
@@ -2350,7 +2513,7 @@ class Scheduler(
             self.running_batch,
             self.new_token_ratio,
             effective_max_prefill_tokens,
-            chunked_prefill_size,
+            effective_chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=self.max_prefill_bs,
@@ -2600,7 +2763,44 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+        launch_breakdown_ms = {
+            "prepare": 0.0,
+            "batch_prep": 0.0,
+            "forward": 0.0,
+            "state_update": 0.0,
+            "copy": 0.0,
+            "metadata": 0.0,
+            "other": 0.0,
+        }
+        launch_total_start = time.perf_counter()
 
+        def _record_launch_time(phase: str, start_time: float) -> None:
+            launch_breakdown_ms[phase] = launch_breakdown_ms.get(phase, 0.0) + (
+                time.perf_counter() - start_time
+            ) * 1000.0
+
+        def _finalize_launch_result(result):
+            tracked_ms = sum(
+                value
+                for key, value in launch_breakdown_ms.items()
+                if key != "other"
+            )
+            launch_breakdown_ms["other"] = max(
+                (time.perf_counter() - launch_total_start) * 1000.0 - tracked_ms,
+                0.0,
+            )
+            result.launch_time_breakdown_ms = launch_breakdown_ms
+            return result
+
+        def _make_timing_events():
+            if self.device == "cpu":
+                return None, None
+            return (
+                self.device_module.Event(enable_timing=True),
+                self.device_module.Event(enable_timing=True),
+            )
+
+        prepare_start = time.perf_counter()
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
@@ -2613,10 +2813,14 @@ class Scheduler(
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
-            return self._run_batch_prebuilt(batch)
+            _record_launch_time("prepare", prepare_start)
+            return _finalize_launch_result(self._run_batch_prebuilt(batch))
+        _record_launch_time("prepare", prepare_start)
 
         # Run forward
         if self.is_generation:
+            compute_start_event, compute_end_event = _make_timing_events()
+            batch_prep_start = time.perf_counter()
             if self.spec_algorithm.is_none() or self.enable_overlap:
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
@@ -2636,24 +2840,40 @@ class Scheduler(
 
                 bs = len(model_worker_batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
+                _record_launch_time("batch_prep", batch_prep_start)
 
                 with self.forward_stream_ctx, self.record_bubble_metrics(batch):
+                    state_update_start = time.perf_counter()
                     self.forward_stream.wait_stream(self.schedule_stream)
                     self.future_map.resolve_future(model_worker_batch)
+                    _record_launch_time("state_update", state_update_start)
+                    if compute_start_event is not None:
+                        compute_start_event.record()
+                    forward_start = time.perf_counter()
                     with self.record_forward_metrics(batch):
                         batch_result = self.model_worker.forward_batch_generation(
                             model_worker_batch
                             # here pp is not compatible with overlap
                         )
+                    _record_launch_time("forward", forward_start)
+                    batch_result.compute_start_event = compute_start_event
+                    batch_result.compute_end_event = compute_end_event
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
+                        state_update_start = time.perf_counter()
                         self.future_map.store_to_map(future_indices, batch_result)
+                        _record_launch_time("state_update", state_update_start)
+                        copy_start = time.perf_counter()
                         batch_result.copy_to_cpu(return_logprob=batch.return_logprob)
+                        _record_launch_time("copy", copy_start)
+                        if compute_end_event is not None:
+                            compute_end_event.record()
                     else:
                         batch_result.future_indices = future_indices
 
                 # FIXME(lsyin): move this assignment elsewhere
+                metadata_start = time.perf_counter()
                 future_indices_or_next_token_ids = -future_indices.indices
 
                 if batch.is_spec_v2:
@@ -2671,26 +2891,44 @@ class Scheduler(
                     # The future value, usually for next batch preparation
                     # Current implementation strictly synchronizes the seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                _record_launch_time("metadata", metadata_start)
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
+                _record_launch_time("batch_prep", batch_prep_start)
+                forward_start = time.perf_counter()
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                _record_launch_time("forward", forward_start)
+                metadata_start = time.perf_counter()
                 future_indices_or_next_token_ids = batch_result.next_token_ids
+                _record_launch_time("metadata", metadata_start)
             else:
+                _record_launch_time("batch_prep", batch_prep_start)
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
                     if self.spec_algorithm.is_none()
                     else {}
                 )
+                if compute_start_event is not None:
+                    compute_start_event.record()
+                forward_start = time.perf_counter()
                 with self.record_forward_metrics(batch):
                     batch_result = self.model_worker.forward_batch_generation(
                         worker_batch_or_batch, **kwargs
                     )
+                _record_launch_time("forward", forward_start)
+                state_update_start = time.perf_counter()
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
+                _record_launch_time("state_update", state_update_start)
+                batch_result.compute_start_event = compute_start_event
+                batch_result.compute_end_event = compute_end_event
+                if compute_end_event is not None:
+                    compute_end_event.record()
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
             #       which can probably be replaced by future_indices later [TODO(lsyin)].
             #       we shall still keep the original outputs, e.g. next_token_ids
             #       in the GenerationBatchOutput for processing after copy_done.
+            metadata_start = time.perf_counter()
             batch.output_ids = future_indices_or_next_token_ids
 
             # These 2 values are needed for processing the output, but the values can be
@@ -2706,25 +2944,56 @@ class Scheduler(
             else:
                 batch_result.extend_input_len_per_req = None
                 batch_result.extend_logprob_start_len_per_req = None
+            _record_launch_time("metadata", metadata_start)
 
             ret = batch_result
         else:  # embedding or reward model
+            batch_prep_start = time.perf_counter()
             model_worker_batch = batch.get_model_worker_batch()
+            _record_launch_time("batch_prep", batch_prep_start)
+            compute_start_event, compute_end_event = _make_timing_events()
 
             if self.enable_overlap:
+                state_update_start = time.perf_counter()
                 self.record_batch_in_overlap(model_worker_batch)
+                _record_launch_time("state_update", state_update_start)
                 with self.forward_stream_ctx, self.record_bubble_metrics(batch):
+                    state_update_start = time.perf_counter()
                     self.forward_stream.wait_stream(self.schedule_stream)
+                    _record_launch_time("state_update", state_update_start)
+                    if compute_start_event is not None:
+                        compute_start_event.record()
+                    forward_start = time.perf_counter()
                     embeddings = self.tp_worker.forward_batch_embedding(
                         model_worker_batch
                     )
-                    ret = EmbeddingBatchResult(embeddings=embeddings)
+                    _record_launch_time("forward", forward_start)
+                    ret = EmbeddingBatchResult(
+                        embeddings=embeddings,
+                        compute_start_event=compute_start_event,
+                        compute_end_event=compute_end_event,
+                    )
+                    copy_start = time.perf_counter()
                     ret.copy_to_cpu()
+                    _record_launch_time("copy", copy_start)
+                    if compute_end_event is not None:
+                        compute_end_event.record()
             else:
+                if compute_start_event is not None:
+                    compute_start_event.record()
+                forward_start = time.perf_counter()
                 embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
-                ret = EmbeddingBatchResult(embeddings=embeddings)
+                _record_launch_time("forward", forward_start)
+                ret = EmbeddingBatchResult(
+                    embeddings=embeddings,
+                    compute_start_event=compute_start_event,
+                    compute_end_event=compute_end_event,
+                )
+                if compute_end_event is not None:
+                    compute_end_event.record()
 
         # Capture prefill end time for EXTEND mode
+        metadata_start = time.perf_counter()
         if batch.forward_mode == ForwardMode.EXTEND:
             set_time_batch(batch.reqs, "set_prefill_run_batch_end_time")
 
@@ -2740,8 +3009,9 @@ class Scheduler(
             self.send_to_tokenizer.send_output(
                 ActiveRanksOutput(status=dp_active_ranks.tolist())
             )
+        _record_launch_time("metadata", metadata_start)
 
-        return ret
+        return _finalize_launch_result(ret)
 
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult
@@ -2757,6 +3027,8 @@ class Scheduler(
             assert _batch_result is batch_result
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
             batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
+            if batch_result.compute_end_event is not None:
+                batch_result.compute_end_event.record()
 
     def process_batch_result(
         self,

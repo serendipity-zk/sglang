@@ -36,6 +36,9 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
+    compute_start_event: Optional[torch.cuda.Event] = None
+    compute_end_event: Optional[torch.cuda.Event] = None
+    gpu_elapsed_ms: Optional[float] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[FutureIndices] = None
 
@@ -48,6 +51,7 @@ class GenerationBatchResult:
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
+    launch_time_breakdown_ms: Optional[dict[str, float]] = None
 
     def copy_to_cpu(self, return_logprob: bool):
         """Copy tensors to CPU in overlap scheduling.

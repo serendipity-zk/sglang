@@ -4,7 +4,10 @@ import unittest
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
-from sglang.srt.managers.scheduler_sidecar_mixin import SchedulerSidecarMixin
+from sglang.srt.managers.scheduler_sidecar_mixin import (
+    RuntimeSidecarDecision,
+    SchedulerSidecarMixin,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -16,15 +19,24 @@ class RequestInfo:
     target_ttft_ms: float | None
     arrival_time_ms: float | None
     tokens_generated: int
-    prompt_tokens: int
     remaining_prefill: int
-    max_new_tokens: int
+    prompt_tokens: int = 0
+    max_new_tokens: int = 0
     slo_violated: bool = False
     prefix_len: int = 0
     extend_input_len: int = 0
     evicted_seqlen_local: int = 0
-    router_generation: int | None = None
-    router_message_id: int | None = None
+
+
+@dataclass
+class RunningRequestInfo:
+    request_id: str
+    arrival_time_ms: float
+    target_tpot_ms: float | None = None
+    target_ttft_ms: float | None = None
+    tokens_generated: int = 0
+    remaining_prefill: int = 0
+    slo_violated: bool = False
 
 
 @dataclass
@@ -35,6 +47,18 @@ class PrefillChunkPair:
 
 
 @dataclass
+class ObservabilityBatchSnapshot:
+    num_running_requests: int
+    num_waiting_requests: int
+    kv_tokens_used: int
+    kv_capacity: int
+    batch_size_tokens: int
+    prefill_chunk_pairs: list[list[int]] = field(default_factory=list)
+    batch_size_by_tpot_tier: dict[str, int] = field(default_factory=dict)
+    forward_mode: str | None = None
+
+
+@dataclass
 class FinishedIterationData:
     iteration_count: int
     batch_size_tokens: int
@@ -42,6 +66,13 @@ class FinishedIterationData:
     kv_tokens_used: int
     forward_mode: str
     actual_time_ms: float
+    cpu_iteration_time_ms: float | None = None
+    sidecar_wait_time_ms: float | None = None
+    cpu_time_breakdown_ms: dict[str, float] | None = None
+    schedule_time_breakdown_ms: dict[str, float] | None = None
+    launch_time_breakdown_ms: dict[str, float] | None = None
+    sidecar_rpc_breakdown_ms: dict[str, float] | None = None
+    observability_snapshot: ObservabilityBatchSnapshot | None = None
     completed_decode_lengths: list[int] = field(default_factory=list)
 
 
@@ -57,8 +88,6 @@ class CurrentSnapshot:
     forward_mode: str | None = None
     batch_size_tokens: int = 0
     prefill_chunk_pairs: list[list[int]] = field(default_factory=list)
-    router_generation: int | None = None
-    router_last_ack_id: int | None = None
 
 
 @dataclass
@@ -70,6 +99,7 @@ class SchedulingContext:
     waiting_requests: list[RequestInfo] = field(default_factory=list)
     kv_available: int = 0
     kv_capacity: int = 0
+    page_size: int = 1
     last_batch_size: int | None = None
 
 
@@ -123,6 +153,7 @@ class FakeScheduler(SchedulerSidecarMixin):
         self.last_batch = None
         self.iteration_count = 7
         self.max_total_num_tokens = 128
+        self.page_size = 64
         self.tree_cache = object()
         self.init_sidecar(SimpleNamespace())
 
@@ -142,8 +173,10 @@ class TestSchedulerSidecarMixin(unittest.TestCase):
             )
         }
         engine_state_module = types.ModuleType("slo_scheduler.messages.engine_state")
+        engine_state_module.RunningRequestInfo = RunningRequestInfo
         engine_state_module.RequestInfo = RequestInfo
         engine_state_module.PrefillChunkPair = PrefillChunkPair
+        engine_state_module.ObservabilityBatchSnapshot = ObservabilityBatchSnapshot
         engine_state_module.FinishedIterationData = FinishedIterationData
         engine_state_module.CurrentSnapshot = CurrentSnapshot
         engine_state_module.SchedulingContext = SchedulingContext
@@ -181,13 +214,33 @@ class TestSchedulerSidecarMixin(unittest.TestCase):
         self.assertEqual(info.target_tpot_ms, 20.0)
         self.assertEqual(info.arrival_time_ms, 123.0)
         self.assertEqual(info.tokens_generated, 2)
-        self.assertEqual(info.prompt_tokens, 3)
+        self.assertEqual(info.prompt_tokens, 0)
         self.assertEqual(info.remaining_prefill, 0)
         self.assertTrue(info.slo_violated)
         self.assertEqual(info.prefix_len, 2)
         self.assertEqual(info.extend_input_len, 4)
-        self.assertEqual(info.evicted_seqlen_local, 9)
-        self.assertIsNone(info.router_generation)
+        self.assertEqual(info.evicted_seqlen_local, 0)
+
+    def test_build_runtime_sidecar_decision_keeps_only_hot_path_fields(self):
+        scheduler = FakeScheduler()
+        decision = SimpleNamespace(
+            iteration_count=9,
+            max_prefill_tokens=256,
+            decode_only_iteration=True,
+            mode_used="simulation",
+            scheduling_reason="not-synced",
+        )
+
+        runtime = scheduler._build_runtime_sidecar_decision(decision)
+
+        self.assertEqual(
+            runtime,
+            RuntimeSidecarDecision(
+                iteration_count=9,
+                max_prefill_tokens=256,
+                decode_only_iteration=True,
+            ),
+        )
 
     def test_drain_current_snapshot_mixed_batch(self):
         scheduler = FakeScheduler()
@@ -221,10 +274,13 @@ class TestSchedulerSidecarMixin(unittest.TestCase):
         self.assertEqual(
             [r.request_id for r in snapshot.running_requests], ["decode", "prefill"]
         )
-        self.assertIsNone(snapshot.router_generation)
 
     def test_drain_finished_iteration_collects_prefill_and_completed_lengths(self):
         scheduler = FakeScheduler()
+        scheduler._record_cpu_phase_time("recv", 1.5)
+        scheduler._record_cpu_phase_time("schedule", 2.5)
+        scheduler._record_cpu_schedule_time("merge", 0.75)
+        scheduler._record_cpu_schedule_time("sidecar_rpc", 1.25)
         finished_req = FakeReq(
             "finished",
             output_ids=[1, 2, 3],
@@ -241,8 +297,14 @@ class TestSchedulerSidecarMixin(unittest.TestCase):
             prefix_lens=[2, 1],
             extend_lens=[4, 2],
         )
+        scheduler._drain_current_snapshot(batch, iteration_count=7)
 
-        scheduler._drain_finished_iteration(batch, actual_time_ms=12.5, kv_tokens_used=33)
+        scheduler._drain_finished_iteration(
+            batch,
+            actual_time_ms=12.5,
+            kv_tokens_used=33,
+            launch_time_breakdown_ms={"forward": 4.0, "other": 1.0},
+        )
 
         finished = scheduler._pending_finished
         self.assertEqual(finished.iteration_count, 7)
@@ -251,12 +313,34 @@ class TestSchedulerSidecarMixin(unittest.TestCase):
         self.assertEqual(finished.forward_mode, "EXTEND")
         self.assertEqual(finished.actual_time_ms, 12.5)
         self.assertEqual(finished.completed_decode_lengths, [3])
+        self.assertIsNotNone(finished.cpu_time_breakdown_ms)
+        self.assertIsNotNone(finished.schedule_time_breakdown_ms)
+        self.assertEqual(finished.launch_time_breakdown_ms, {"forward": 4.0, "other": 1.0})
+        self.assertIsNone(finished.sidecar_rpc_breakdown_ms)
+        self.assertEqual(finished.cpu_time_breakdown_ms["recv"], 1.5)
+        self.assertEqual(finished.cpu_time_breakdown_ms["schedule"], 2.5)
+        self.assertEqual(finished.schedule_time_breakdown_ms["merge"], 0.75)
+        self.assertEqual(finished.schedule_time_breakdown_ms["sidecar_rpc"], 1.25)
+        self.assertIsNotNone(finished.observability_snapshot)
+        self.assertEqual(finished.observability_snapshot.num_running_requests, 2)
+        self.assertEqual(finished.observability_snapshot.num_waiting_requests, 0)
+        self.assertEqual(finished.observability_snapshot.kv_tokens_used, 40)
+        self.assertEqual(finished.observability_snapshot.batch_size_tokens, 6)
+        self.assertEqual(
+            finished.observability_snapshot.batch_size_by_tpot_tier, {"none": 2}
+        )
         self.assertEqual(
             [
                 (p.request_id, p.chunk_tokens, p.cumulative_prefill)
                 for p in finished.prefill_chunk_pairs
             ],
             [("finished", 4, 6), ("other", 2, 3)],
+        )
+        self.assertTrue(
+            all(value == 0.0 for value in scheduler._cpu_phase_breakdown_ms.values())
+        )
+        self.assertTrue(
+            all(value == 0.0 for value in scheduler._cpu_schedule_breakdown_ms.values())
         )
 
     def test_drain_scheduling_context_refreshes_waiting_and_chunked_requests(self):

@@ -80,6 +80,60 @@ class SchedulerOutputProcessorMixin:
             return details
         return None
 
+    def _finalize_result_gpu_elapsed_ms(
+        self: Scheduler,
+        result: Union[GenerationBatchResult, EmbeddingBatchResult, None],
+    ) -> Optional[float]:
+        """Resolve real device elapsed time from timing events when available."""
+        if result is None:
+            return None
+
+        gpu_elapsed_ms = getattr(result, "gpu_elapsed_ms", None)
+        if gpu_elapsed_ms is not None:
+            return float(gpu_elapsed_ms)
+
+        compute_start_event = getattr(result, "compute_start_event", None)
+        compute_end_event = getattr(result, "compute_end_event", None)
+        if compute_start_event is None or compute_end_event is None:
+            return None
+
+        try:
+            compute_end_event.synchronize()
+            gpu_elapsed_ms = float(compute_start_event.elapsed_time(compute_end_event))
+        except Exception:
+            logger.exception("Failed to resolve GPU elapsed time from timing events")
+            return None
+
+        result.gpu_elapsed_ms = gpu_elapsed_ms
+        return gpu_elapsed_ms
+
+    def _resolve_completed_iteration_time_ms(
+        self: Scheduler,
+        result: Union[GenerationBatchResult, EmbeddingBatchResult, None],
+        fallback_time_ms: float,
+    ) -> float:
+        """Prefer true device elapsed time and fall back to host wall time."""
+        gpu_elapsed_ms = SchedulerOutputProcessorMixin._finalize_result_gpu_elapsed_ms(
+            self, result
+        )
+        if gpu_elapsed_ms is not None:
+            return gpu_elapsed_ms
+        return float(fallback_time_ms)
+
+    def _resolve_stream_iteration_id(
+        self: Scheduler, batch: Optional[ScheduleBatch]
+    ) -> Optional[int]:
+        if batch is None:
+            return None
+
+        iteration_id = getattr(batch, "iteration_id", None)
+        if iteration_id is None:
+            iteration_id = getattr(self, "iteration_count", 0)
+            if getattr(self, "enable_overlap", False):
+                iteration_id += 1
+            batch.iteration_id = iteration_id
+        return iteration_id
+
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         for req in batch.reqs:
@@ -90,7 +144,11 @@ class SchedulerOutputProcessorMixin:
                 release_kv_cache(req, self.tree_cache)
 
         # Note: Logprobs should be handled on the prefill engine.
-        self.stream_output(batch.reqs, batch.return_logprob)
+        self.stream_output(
+            batch.reqs,
+            batch.return_logprob,
+            iteration_id=self._resolve_stream_iteration_id(batch),
+        )
 
     def maybe_collect_routed_experts(self: Scheduler, req: Req):
         """Collect routed experts for a finished request."""
@@ -128,6 +186,7 @@ class SchedulerOutputProcessorMixin:
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            self._finalize_result_gpu_elapsed_ms(result)
 
             (
                 logits_output,
@@ -262,6 +321,7 @@ class SchedulerOutputProcessorMixin:
         else:  # embedding or reward model
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            self._finalize_result_gpu_elapsed_ms(result)
 
             is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
 
@@ -304,7 +364,12 @@ class SchedulerOutputProcessorMixin:
                     req.is_chunked -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
-        self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
+        self.stream_output(
+            batch.reqs,
+            batch.return_logprob,
+            skip_stream_req,
+            self._resolve_stream_iteration_id(batch),
+        )
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
@@ -348,6 +413,7 @@ class SchedulerOutputProcessorMixin:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        self._finalize_result_gpu_elapsed_ms(result)
 
         self.stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
@@ -360,6 +426,7 @@ class SchedulerOutputProcessorMixin:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        self._finalize_result_gpu_elapsed_ms(result)
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
@@ -512,7 +579,11 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
-        self.stream_output(batch.reqs, batch.return_logprob)
+        self.stream_output(
+            batch.reqs,
+            batch.return_logprob,
+            iteration_id=self._resolve_stream_iteration_id(batch),
+        )
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
@@ -856,10 +927,11 @@ class SchedulerOutputProcessorMixin:
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
+        iteration_id: Optional[int] = None,
     ):
         """Stream the output to detokenizer."""
         if self.is_generation:
-            self.stream_output_generation(reqs, return_logprob, skip_req)
+            self.stream_output_generation(reqs, return_logprob, skip_req, iteration_id)
         else:  # embedding or reward model
             self.stream_output_embedding(reqs)
 
@@ -884,6 +956,7 @@ class SchedulerOutputProcessorMixin:
         reqs: List[Req],
         return_logprob: bool,
         skip_req: Optional[Req] = None,
+        iteration_id: Optional[int] = None,
         is_idle_batch: bool = False,
     ):
         rids = []
@@ -910,6 +983,7 @@ class SchedulerOutputProcessorMixin:
         load = self.get_load()
         routed_experts = None
         customized_info = {}
+        start_iterations = []
 
         time_stats = []
 
@@ -1011,6 +1085,7 @@ class SchedulerOutputProcessorMixin:
                 prompt_tokens.append(len(req.origin_input_ids))
                 completion_tokens.append(len(output_ids_))
                 cached_tokens.append(req.cached_tokens)
+                start_iterations.append(getattr(req, "start_iteration", None))
 
                 # Collect detailed cache breakdown if available
                 cached_tokens_details.append(self._get_cached_tokens_details(req))
@@ -1161,6 +1236,9 @@ class SchedulerOutputProcessorMixin:
                     retraction_counts=retraction_counts,
                     load=load,
                     dp_ranks=dp_ranks,
+                    start_iterations=start_iterations,
+                    iteration_id=iteration_id,
+                    server_id=getattr(self, "worker_id", None),
                 )
             )
 

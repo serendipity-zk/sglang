@@ -7,7 +7,10 @@ from unittest.mock import patch
 
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_sidecar_mixin import SchedulerSidecarMixin
+from sglang.srt.managers.scheduler_sidecar_mixin import (
+    RuntimeSidecarDecision,
+    SchedulerSidecarMixin,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -22,6 +25,45 @@ class PrefillChunkPair:
 
 
 @dataclass
+class ObservabilityBatchSnapshot:
+    num_running_requests: int
+    num_waiting_requests: int
+    kv_tokens_used: int
+    kv_capacity: int
+    batch_size_tokens: int
+    prefill_chunk_pairs: list[list[int]] = field(default_factory=list)
+    batch_size_by_tpot_tier: dict[str, int] = field(default_factory=dict)
+    forward_mode: str | None = None
+
+
+@dataclass
+class RunningRequestInfo:
+    request_id: str
+    arrival_time_ms: float
+    target_tpot_ms: float | None = None
+    target_ttft_ms: float | None = None
+    tokens_generated: int = 0
+    remaining_prefill: int = 0
+    slo_violated: bool = False
+
+
+@dataclass
+class RequestInfo:
+    request_id: str
+    target_tpot_ms: float | None
+    target_ttft_ms: float | None
+    arrival_time_ms: float | None
+    tokens_generated: int
+    remaining_prefill: int
+    prompt_tokens: int = 0
+    max_new_tokens: int = 0
+    slo_violated: bool = False
+    prefix_len: int = 0
+    extend_input_len: int = 0
+    evicted_seqlen_local: int = 0
+
+
+@dataclass
 class FinishedIterationData:
     iteration_count: int
     batch_size_tokens: int
@@ -29,6 +71,13 @@ class FinishedIterationData:
     kv_tokens_used: int
     forward_mode: str
     actual_time_ms: float
+    cpu_iteration_time_ms: float | None = None
+    sidecar_wait_time_ms: float | None = None
+    cpu_time_breakdown_ms: dict[str, float] | None = None
+    schedule_time_breakdown_ms: dict[str, float] | None = None
+    launch_time_breakdown_ms: dict[str, float] | None = None
+    sidecar_rpc_breakdown_ms: dict[str, float] | None = None
+    observability_snapshot: ObservabilityBatchSnapshot | None = None
     completed_decode_lengths: list[int] = field(default_factory=list)
 
 
@@ -44,8 +93,6 @@ class CurrentSnapshot:
     forward_mode: str | None = None
     batch_size_tokens: int = 0
     prefill_chunk_pairs: list[list[int]] = field(default_factory=list)
-    router_generation: int | None = None
-    router_last_ack_id: int | None = None
 
 
 @dataclass
@@ -57,6 +104,7 @@ class SchedulingContext:
     waiting_requests: list = field(default_factory=list)
     kv_available: int = 0
     kv_capacity: int = 0
+    page_size: int = 1
     last_batch_size: int | None = None
 
 
@@ -69,6 +117,7 @@ class EngineState:
     current: CurrentSnapshot
     scheduling: SchedulingContext
     accepted_requests_count: int = 0
+    accepted_request_ids: list[str] = field(default_factory=list)
 
 
 class FakeClient:
@@ -78,7 +127,16 @@ class FakeClient:
 
     def send_and_recv(self, state, current_iteration):
         self.calls.append((state, current_iteration))
-        return self.decision
+        return (
+            self.decision,
+            7.5,
+            {
+                "serialize_send": 1.0,
+                "wait": 2.0,
+                "recv_deserialize": 0.5,
+            },
+            b"decision-payload",
+        )
 
 
 class FakeRunningBatch:
@@ -95,6 +153,7 @@ class FakeScheduler(SchedulerSidecarMixin):
         self.chunked_req = None
         self.running_batch = FakeRunningBatch()
         self.max_total_num_tokens = 128
+        self.page_size = 64
         self.iteration_count = 4
         self.tp_size = 1
         self.tp_rank = 0
@@ -116,17 +175,31 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
                 "slo_scheduler",
                 "slo_scheduler.messages",
                 "slo_scheduler.messages.engine_state",
+                "slo_scheduler.messages.serialization",
             )
         }
         engine_state_module = types.ModuleType("slo_scheduler.messages.engine_state")
+        engine_state_module.RunningRequestInfo = RunningRequestInfo
+        engine_state_module.RequestInfo = RequestInfo
         engine_state_module.PrefillChunkPair = PrefillChunkPair
+        engine_state_module.ObservabilityBatchSnapshot = ObservabilityBatchSnapshot
         engine_state_module.FinishedIterationData = FinishedIterationData
         engine_state_module.CurrentSnapshot = CurrentSnapshot
         engine_state_module.SchedulingContext = SchedulingContext
         engine_state_module.EngineState = EngineState
+        serialization_module = types.ModuleType("slo_scheduler.messages.serialization")
+        serialization_module.serialize_decision = lambda decision: b"serialized-decision"
+        serialization_module.deserialize_decision = (
+            lambda payload: SimpleNamespace(
+                iteration_count=5,
+                max_prefill_tokens=96,
+                payload=payload,
+            )
+        )
         sys.modules["slo_scheduler"] = types.ModuleType("slo_scheduler")
         sys.modules["slo_scheduler.messages"] = types.ModuleType("slo_scheduler.messages")
         sys.modules["slo_scheduler.messages.engine_state"] = engine_state_module
+        sys.modules["slo_scheduler.messages.serialization"] = serialization_module
 
     @classmethod
     def tearDownClass(cls):
@@ -194,13 +267,19 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
     def test_assemble_and_send_engine_state_uses_defaults_and_resets_buffers(self):
         scheduler = FakeScheduler()
         scheduler.slo_client = FakeClient(
-            decision=SimpleNamespace(iteration_count=5, max_prefill_tokens=77)
+            decision=SimpleNamespace(
+                iteration_count=5,
+                max_prefill_tokens=77,
+                decode_only_iteration=False,
+                mode_used="simulation",
+            )
         )
         scheduler._pending_scheduling = SchedulingContext(
             iteration_count=5,
             scheduling_time_ms=1.0,
         )
         scheduler._accepted_since_last_send = 3
+        scheduler._accepted_request_ids_since_last_send = ["r1", "r2", "r3"]
         scheduler.waiting_queue = [object()]
 
         scheduler._assemble_and_send_engine_state()
@@ -212,17 +291,43 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
         self.assertEqual(state.protocol_version, 1)
         self.assertEqual(state.min_sidecar_version, 1)
         self.assertEqual(state.accepted_requests_count, 3)
+        self.assertEqual(state.accepted_request_ids, ["r1", "r2", "r3"])
         self.assertEqual(state.finished.actual_time_ms, 0.0)
         self.assertEqual(state.current.kv_tokens_used, 33)
         self.assertEqual(scheduler._accepted_since_last_send, 0)
+        self.assertEqual(scheduler._accepted_request_ids_since_last_send, [])
         self.assertIsNone(scheduler._pending_finished)
         self.assertIsNone(scheduler._pending_current)
-        self.assertEqual(scheduler._last_sidecar_decision.max_prefill_tokens, 77)
+        self.assertEqual(scheduler._pending_launch_sidecar_wait_time_ms, 7.5)
+        self.assertEqual(
+            scheduler._pending_launch_sidecar_rpc_breakdown_ms,
+            {
+                "build_state": unittest.mock.ANY,
+                "serialize_send": 1.0,
+                "wait": 2.0,
+                "recv_deserialize": 0.5,
+                "tp_sync": unittest.mock.ANY,
+                "other": unittest.mock.ANY,
+            },
+        )
+        self.assertEqual(
+            scheduler._last_sidecar_decision,
+            RuntimeSidecarDecision(
+                iteration_count=5,
+                max_prefill_tokens=77,
+                decode_only_iteration=False,
+            ),
+        )
+        self.assertEqual(scheduler._last_sidecar_full_decision.max_prefill_tokens, 77)
 
     def test_assemble_and_send_engine_state_reports_idle_state(self):
         scheduler = FakeScheduler()
         scheduler.slo_client = FakeClient(
-            decision=SimpleNamespace(iteration_count=5, max_prefill_tokens=64)
+            decision=SimpleNamespace(
+                iteration_count=5,
+                max_prefill_tokens=64,
+                decode_only_iteration=False,
+            )
         )
         scheduler._pending_scheduling = SchedulingContext(
             iteration_count=5,
@@ -244,20 +349,25 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
         scheduler._sidecar_enabled = True
         scheduler._sidecar_is_owner = False
         scheduler._sidecar_sync_across_tp = True
-        scheduler.tp_group = SimpleNamespace(rank=1, first_rank=0)
-        scheduler.tp_cpu_group = object()
+        scheduler.tp_group = SimpleNamespace()
 
-        synced_decision = SimpleNamespace(iteration_count=5, max_prefill_tokens=96)
         with patch(
-            "sglang.srt.managers.scheduler_sidecar_mixin.broadcast_pyobj",
-            return_value=[synced_decision],
+            "sglang.srt.managers.scheduler_sidecar_mixin.SchedulerSidecarMixin._broadcast_sidecar_runtime_decision",
+            return_value=RuntimeSidecarDecision(
+                iteration_count=5,
+                max_prefill_tokens=96,
+                decode_only_iteration=True,
+            ),
         ) as mock_broadcast:
             decision = scheduler._assemble_and_send_engine_state()
 
-        self.assertIs(decision, synced_decision)
-        self.assertIs(scheduler._last_sidecar_decision, synced_decision)
+        self.assertEqual(decision.iteration_count, 5)
+        self.assertEqual(decision.max_prefill_tokens, 96)
+        self.assertTrue(decision.decode_only_iteration)
+        self.assertIs(scheduler._last_sidecar_decision, decision)
+        self.assertIsNone(scheduler._last_sidecar_full_decision)
         self.assertEqual(mock_broadcast.call_count, 1)
-        self.assertEqual(mock_broadcast.call_args.args[0], [])
+        self.assertIsNone(mock_broadcast.call_args.args[0])
 
     def test_get_effective_max_prefill_tokens_prefers_matching_sidecar_decision(self):
         scheduler = Scheduler.__new__(Scheduler)
@@ -268,6 +378,36 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
 
         self.assertEqual(scheduler._get_effective_max_prefill_tokens(9), 512)
         self.assertEqual(scheduler._get_effective_max_prefill_tokens(10), 16384)
+
+    def test_get_prefill_adder_budgets_restores_pure_sidecar_budget_in_mixed_chunk(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.max_prefill_tokens = 16384
+        scheduler.chunked_prefill_size = 4096
+        scheduler.is_mixed_chunk = True
+        scheduler._last_sidecar_decision = SimpleNamespace(
+            iteration_count=9, max_prefill_tokens=666
+        )
+
+        rem_input_tokens, rem_chunk_tokens = scheduler._get_prefill_adder_budgets(
+            9, running_bs=634, chunked_prefill_size=4096
+        )
+
+        self.assertEqual(rem_input_tokens, 16384)
+        self.assertEqual(rem_chunk_tokens, 1300)
+
+    def test_get_prefill_adder_budgets_keeps_fallback_semantics_without_sidecar(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.max_prefill_tokens = 16384
+        scheduler.chunked_prefill_size = 4096
+        scheduler.is_mixed_chunk = True
+        scheduler._last_sidecar_decision = None
+
+        rem_input_tokens, rem_chunk_tokens = scheduler._get_prefill_adder_budgets(
+            9, running_bs=634, chunked_prefill_size=4096
+        )
+
+        self.assertEqual(rem_input_tokens, 16384)
+        self.assertEqual(rem_chunk_tokens, 4096)
 
     def test_should_skip_prefill_for_sidecar_decision_abandons_chunked_request(self):
         scheduler = Scheduler.__new__(Scheduler)
@@ -323,6 +463,7 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.slo_client = object()
         scheduler._accepted_since_last_send = 0
+        scheduler._accepted_request_ids_since_last_send = []
         scheduler.waiting_queue = []
         scheduler._set_or_validate_priority = lambda req: True
         scheduler._abort_on_queued_limit = lambda req: False
@@ -341,12 +482,14 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
 
         self.assertEqual(len(scheduler.waiting_queue), 1)
         self.assertEqual(scheduler._accepted_since_last_send, 1)
+        self.assertEqual(scheduler._accepted_request_ids_since_last_send, ["r1"])
 
     def test_add_request_to_queue_does_not_count_unmarked_request(self):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.slo_client = object()
         scheduler._accepted_since_last_send = 0
+        scheduler._accepted_request_ids_since_last_send = []
         scheduler.waiting_queue = []
         scheduler._set_or_validate_priority = lambda req: True
         scheduler._abort_on_queued_limit = lambda req: False
@@ -365,11 +508,11 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
 
         self.assertEqual(len(scheduler.waiting_queue), 1)
         self.assertEqual(scheduler._accepted_since_last_send, 0)
+        self.assertEqual(scheduler._accepted_request_ids_since_last_send, [])
 
     def test_handle_generate_request_marks_grammar_deferred_req_for_sidecar_counting(self):
         scheduler = Scheduler.__new__(Scheduler)
         captured = {}
-        scheduler.router_ack_tracker = SimpleNamespace(record=lambda *_args: True)
         scheduler.server_args = SimpleNamespace(
             disaggregation_bootstrap_port=31000,
             allow_auto_truncate=False,
@@ -384,6 +527,7 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
         scheduler.enable_metrics = False
         scheduler.tokenizer = None
         scheduler.dllm_config = None
+        scheduler.iteration_count = 0
         scheduler.max_req_input_len = 4096
         scheduler.grammar_manager = SimpleNamespace(
             process_req_with_grammar=lambda req: captured.setdefault("req", req) or True
@@ -434,11 +578,16 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
         scheduler.process_batch_result = (
             lambda b, r: scheduler.call_order.append(("process", scheduler.iteration_count))
         )
+        scheduler._record_sidecar_batch_launch = (
+            lambda: scheduler.call_order.append(("launch", None))
+        )
         scheduler._drain_current_snapshot = (
             lambda b, it: scheduler.call_order.append(("current", it))
         )
         scheduler._drain_finished_iteration = (
-            lambda b, elapsed, kv: scheduler.call_order.append(("finished", scheduler.iteration_count, kv))
+            lambda b, elapsed, kv, launch: scheduler.call_order.append(
+                ("finished", scheduler.iteration_count, kv, launch)
+            )
         )
         scheduler.self_check_during_idle = lambda: None
         scheduler.self_check_during_busy = lambda: None
@@ -451,7 +600,12 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
         self.assertEqual(scheduler.iteration_count, 1)
         self.assertEqual(
             scheduler.call_order,
-            [("current", 1), ("process", 1), ("finished", 1, 11)],
+            [
+                ("launch", None),
+                ("current", 1),
+                ("process", 1),
+                ("finished", 1, 11, None),
+            ],
         )
 
     def test_event_loop_overlap_uses_prev_kv_for_finished_drain(self):
@@ -495,11 +649,16 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
         scheduler.process_batch_result = (
             lambda b, r: scheduler.call_order.append(("process", scheduler.iteration_count))
         )
+        scheduler._record_sidecar_batch_launch = (
+            lambda: scheduler.call_order.append(("launch", None))
+        )
         scheduler._drain_current_snapshot = (
             lambda b, it: scheduler.call_order.append(("current", it))
         )
         scheduler._drain_finished_iteration = (
-            lambda b, elapsed, kv: scheduler.call_order.append(("finished", scheduler.iteration_count, kv))
+            lambda b, elapsed, kv, launch: scheduler.call_order.append(
+                ("finished", scheduler.iteration_count, kv, launch)
+            )
         )
         scheduler.cancel_bubble_timer = lambda: None
         scheduler.self_check_during_idle = lambda: None
@@ -513,7 +672,12 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
         self.assertEqual(scheduler.iteration_count, 1)
         self.assertEqual(
             scheduler.call_order,
-            [("current", 1), ("process", 0), ("finished", 1, 17)],
+            [
+                ("launch", None),
+                ("current", 1),
+                ("process", 0),
+                ("finished", 1, 17, None),
+            ],
         )
 
 

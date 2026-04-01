@@ -80,9 +80,16 @@ class TestSLOSchedulerClient(unittest.TestCase):
                 ],
             ),
         ):
-            decision = client.send_and_recv(object(), current_iteration=5)
+            decision, wait_time_ms, rpc_breakdown_ms, decision_payload = client.send_and_recv(
+                object(), current_iteration=5
+            )
 
         self.assertEqual(decision.iteration_count, 5)
+        self.assertEqual(decision_payload, b"match")
+        self.assertGreaterEqual(wait_time_ms, 0.0)
+        self.assertGreaterEqual(rpc_breakdown_ms["serialize_send"], 0.0)
+        self.assertGreaterEqual(rpc_breakdown_ms["wait"], 0.0)
+        self.assertGreaterEqual(rpc_breakdown_ms["recv_deserialize"], 0.0)
         self.assertEqual(socket.sent_frames, [([b"", b"payload"], zmq.DONTWAIT)])
 
     def test_send_and_recv_returns_none_on_timeout(self):
@@ -90,9 +97,14 @@ class TestSLOSchedulerClient(unittest.TestCase):
         client, _context = self.make_client(socket)
 
         with patch.object(client, "_serialize_engine_state", return_value=b"payload"):
-            decision = client.send_and_recv(object(), current_iteration=5)
+            decision, wait_time_ms, rpc_breakdown_ms, decision_payload = client.send_and_recv(
+                object(), current_iteration=5
+            )
 
         self.assertIsNone(decision)
+        self.assertIsNone(decision_payload)
+        self.assertGreaterEqual(wait_time_ms, 0.0)
+        self.assertGreaterEqual(rpc_breakdown_ms["wait"], 0.0)
         self.assertEqual(socket.sent_frames, [([b"", b"payload"], zmq.DONTWAIT)])
 
     def test_send_and_recv_rejects_only_stale_decisions(self):
@@ -110,9 +122,14 @@ class TestSLOSchedulerClient(unittest.TestCase):
                 return_value=SimpleNamespace(iteration_count=4),
             ),
         ):
-            decision = client.send_and_recv(object(), current_iteration=5)
+            decision, wait_time_ms, rpc_breakdown_ms, decision_payload = client.send_and_recv(
+                object(), current_iteration=5
+            )
 
         self.assertIsNone(decision)
+        self.assertIsNone(decision_payload)
+        self.assertGreaterEqual(wait_time_ms, 0.0)
+        self.assertGreaterEqual(rpc_breakdown_ms["recv_deserialize"], 0.0)
 
     def test_close_closes_socket_and_context(self):
         socket = FakeSocket()
@@ -148,7 +165,9 @@ class TestSLOSchedulerClient(unittest.TestCase):
                     return_value=SimpleNamespace(iteration_count=5),
                 ),
             ):
-                decision = client.send_and_recv(object(), current_iteration=5)
+                decision, wait_time_ms, rpc_breakdown_ms, decision_payload = client.send_and_recv(
+                    object(), current_iteration=5
+                )
         finally:
             thread.join(timeout=1)
             client.close()
@@ -157,6 +176,9 @@ class TestSLOSchedulerClient(unittest.TestCase):
 
         self.assertIsNotNone(decision)
         self.assertEqual(decision.iteration_count, 5)
+        self.assertEqual(decision_payload, b"decision")
+        self.assertGreaterEqual(wait_time_ms, 0.0)
+        self.assertGreaterEqual(rpc_breakdown_ms["serialize_send"], 0.0)
 
 
 if __name__ == "__main__":

@@ -186,6 +186,8 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 # Global constants
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 120))
+HTTP_INGRESS_STATE_ATTR = "worker_http_ingress_time_ms"
+TRANSPORT_TIMING_LOG_PATHS = frozenset({"/generate"})
 
 
 # Store global states
@@ -394,6 +396,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def record_http_ingress_timing(request: Request, call_next):
+    if request.url.path in TRANSPORT_TIMING_LOG_PATHS:
+        http_ingress_time_ms = time.time() * 1000.0
+        setattr(request.state, HTTP_INGRESS_STATE_ATTR, http_ingress_time_ms)
+        request_id = request.headers.get("x-request-id", "-")
+        client_host = request.client.host if request.client is not None else "-"
+        content_length = request.headers.get("content-length", "-")
+        logger.info(
+            "[WORKER_HTTP_INGRESS] path=%s method=%s request_id=%s "
+            "http_ingress_time_ms=%.3f client=%s content_length=%s",
+            request.url.path,
+            request.method,
+            request_id,
+            http_ingress_time_ms,
+            client_host,
+            content_length,
+        )
+    return await call_next(request)
 
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
@@ -677,6 +700,42 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
 )
 async def generate_request(obj: GenerateReqInput, request: Request):
     """Handle a generate request."""
+    http_recv_time_ms = time.time() * 1000.0
+    rid = getattr(obj, "rid", None)
+    if isinstance(rid, list):
+        rid = ",".join(str(item) for item in rid)
+    request_id = request.headers.get("x-request-id", "-")
+    http_ingress_time_ms = getattr(request.state, HTTP_INGRESS_STATE_ATTR, None)
+    submit_time_ms = getattr(obj, "arrival_time_ms", None)
+    if isinstance(submit_time_ms, (int, float)):
+        submit_to_recv_ms = f"{http_recv_time_ms - float(submit_time_ms):.3f}"
+        submit_time_str = f"{float(submit_time_ms):.3f}"
+    else:
+        submit_to_recv_ms = "n/a"
+        submit_time_str = "n/a"
+    if isinstance(http_ingress_time_ms, (int, float)):
+        ingress_to_recv_ms = f"{http_recv_time_ms - float(http_ingress_time_ms):.3f}"
+        http_ingress_time_str = f"{float(http_ingress_time_ms):.3f}"
+    else:
+        ingress_to_recv_ms = "n/a"
+        http_ingress_time_str = "n/a"
+    client_host = request.client.host if request.client is not None else "-"
+    logger.info(
+        "[WORKER_HTTP_RECV] path=%s method=%s rid=%s request_id=%s "
+        "http_recv_time_ms=%.3f http_ingress_time_ms=%s ingress_to_recv_ms=%s "
+        "submit_time_ms=%s submit_to_recv_ms=%s stream=%s client=%s",
+        request.url.path,
+        request.method,
+        rid if rid is not None else "-",
+        request_id,
+        http_recv_time_ms,
+        http_ingress_time_str,
+        ingress_to_recv_ms,
+        submit_time_str,
+        submit_to_recv_ms,
+        getattr(obj, "stream", None),
+        client_host,
+    )
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
@@ -2126,6 +2185,7 @@ def _setup_and_run_http_server(
                 root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
                 timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                timeout_worker_healthcheck=envs.SGLANG_TIMEOUT_WORKER_HEALTHCHECK.get(),
                 loop="uvloop",
                 workers=server_args.tokenizer_worker_num,
                 ssl_keyfile=server_args.ssl_keyfile,

@@ -218,8 +218,7 @@ class Session:
             target_ttft_ms=req.target_ttft_ms,
             target_tpot_ms=req.target_tpot_ms,
             arrival_time_ms=req.arrival_time_ms,
-            router_generation=req.router_generation,
-            router_message_id=req.router_message_id,
+            start_iteration=getattr(req, "start_iteration", None),
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
         )

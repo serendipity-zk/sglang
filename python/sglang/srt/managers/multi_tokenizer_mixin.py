@@ -198,6 +198,9 @@ def _handle_output_by_index(output, i):
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
+            start_iterations=_extract_field_by_index(output, "start_iterations", i),
+            iteration_id=getattr(output, "iteration_id", None),
+            server_id=getattr(output, "server_id", None),
         )
     elif isinstance(output, BatchEmbeddingOutput):
         new_output = BatchEmbeddingOutput(
@@ -280,6 +283,12 @@ def _handle_output_by_index(output, i):
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
+            ),
+            start_iterations=_extract_field_by_index(output, "start_iterations", i),
+            iteration_id=getattr(output, "iteration_id", None),
+            server_id=getattr(output, "server_id", None),
+            detokenize_timestamps=_extract_field_by_index(
+                output, "detokenize_timestamps", i
             ),
         )
     elif isinstance(output, BatchMultimodalOutput):

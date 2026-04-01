@@ -522,8 +522,7 @@ class Req(ReqDllmMixin):
         target_ttft_ms: Optional[float] = None,
         target_tpot_ms: Optional[float] = None,
         arrival_time_ms: Optional[float] = None,
-        router_generation: Optional[int] = None,
-        router_message_id: Optional[int] = None,
+        start_iteration: Optional[int] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
         time_stats: Optional[
@@ -622,8 +621,7 @@ class Req(ReqDllmMixin):
         self.target_ttft_ms = target_ttft_ms
         self.target_tpot_ms = target_tpot_ms
         self.arrival_time_ms = arrival_time_ms
-        self.router_generation = router_generation
-        self.router_message_id = router_message_id
+        self.start_iteration = start_iteration
         self.slo_violated: bool = False
 
         # For incremental decoding
@@ -2303,9 +2301,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def copy(self):
-        # Only contain fields that will be used by process_batch_result.
-        # Shallow-copy the reqs list so that in-place mutations (filter_batch,
-        # merge_batch) on the original don't corrupt this snapshot.
+        # Only contain fields that will be used by process_batch_result and
+        # post-launch observability/sidecar bookkeeping.
+        # Shallow-copy list fields so later in-place batch mutations do not
+        # corrupt the finished-iteration snapshot kept in the overlap queue.
         return ScheduleBatch(
             reqs=self.reqs[:],
             req_to_token_pool=self.req_to_token_pool,
@@ -2314,7 +2313,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             forward_mode=self.forward_mode,
             out_cache_loc=self.out_cache_loc,
             return_logprob=self.return_logprob,
-            decoding_reqs=self.decoding_reqs,
+            prefix_lens=self.prefix_lens[:] if self.prefix_lens is not None else None,
+            extend_lens=self.extend_lens[:] if self.extend_lens is not None else None,
+            extend_num_tokens=self.extend_num_tokens,
+            decoding_reqs=self.decoding_reqs[:] if self.decoding_reqs is not None else None,
             spec_algorithm=self.spec_algorithm,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,

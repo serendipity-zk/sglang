@@ -1503,6 +1503,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 "weight_version": self.server_args.weight_version,
                 "total_retractions": recv_obj.retraction_counts[i],
             }
+            server_id = getattr(recv_obj, "server_id", None)
+            iteration_id = getattr(recv_obj, "iteration_id", None)
+            start_iterations = getattr(recv_obj, "start_iterations", None)
+            if server_id is not None:
+                meta_info["server_id"] = server_id
+            if iteration_id is not None:
+                meta_info["iteration_id"] = iteration_id
+            if start_iterations is not None and len(start_iterations) > i:
+                meta_info["start_iteration"] = start_iterations[i]
+
+            detokenize_timestamps = getattr(recv_obj, "detokenize_timestamps", None)
+            if detokenize_timestamps is not None and len(detokenize_timestamps) > i:
+                meta_info["detokenize_timestamp"] = detokenize_timestamps[i]
 
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:

@@ -534,8 +534,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             lora_path=["path1", "path2"],
             custom_logit_processor=["processor1", "processor2"],
             return_hidden_states=True,
-            router_generation=123,
-            router_message_id=456,
             arrival_time_ms=789.0,
         )
         req.normalize_batch_and_arguments()
@@ -557,8 +555,6 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         self.assertEqual(item0.lora_path, "path1")
         self.assertEqual(item0.custom_logit_processor, "processor1")
         self.assertEqual(item0.return_hidden_states, True)
-        self.assertEqual(item0.router_generation, 123)
-        self.assertEqual(item0.router_message_id, 456)
         self.assertEqual(item0.arrival_time_ms, 789.0)
 
     def test_regenerate_rid(self):
@@ -626,8 +622,6 @@ class TestSidecarRequestHelpers(unittest.TestCase):
             target_ttft_ms=90.0,
             target_tpot_ms=45.0,
             arrival_time_ms=1234.5,
-            router_generation=12,
-            router_message_id=34,
         )
 
         tokenized = build_tokenized_generate_req_input(
@@ -641,8 +635,6 @@ class TestSidecarRequestHelpers(unittest.TestCase):
         self.assertEqual(tokenized.target_ttft_ms, 90.0)
         self.assertEqual(tokenized.target_tpot_ms, 45.0)
         self.assertEqual(tokenized.arrival_time_ms, 1234.5)
-        self.assertEqual(tokenized.router_generation, 12)
-        self.assertEqual(tokenized.router_message_id, 34)
 
 
 if __name__ == "__main__":

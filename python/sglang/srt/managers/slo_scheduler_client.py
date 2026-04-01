@@ -9,6 +9,16 @@ import zmq
 
 logger = logging.getLogger(__name__)
 
+CLIENT_RPC_BREAKDOWN_KEYS = (
+    "serialize_send",
+    "wait",
+    "recv_deserialize",
+)
+
+
+def _empty_client_rpc_breakdown():
+    return {key: 0.0 for key in CLIENT_RPC_BREAKDOWN_KEYS}
+
 
 class SLOSchedulerClient:
     """Send engine state to the sidecar and receive a correlated decision."""
@@ -35,27 +45,40 @@ class SLOSchedulerClient:
         return deserialize_decision(payload)
 
     def send_and_recv(self, engine_state, current_iteration: int):
-        """Return a matching sidecar decision or None on timeout/error/staleness."""
+        """Return (decision, wait_time_ms, rpc_breakdown_ms, decision_payload)."""
+        rpc_breakdown_ms = _empty_client_rpc_breakdown()
         try:
+            serialize_send_start = time.perf_counter()
             payload = self._serialize_engine_state(engine_state)
             self.socket.send_multipart([b"", payload], flags=zmq.DONTWAIT)
+            rpc_breakdown_ms["serialize_send"] = (
+                time.perf_counter() - serialize_send_start
+            ) * 1000.0
         except zmq.Again:
             logger.warning("SLOSchedulerClient: send HWM reached, dropping message")
-            return None
+            return None, 0.0, rpc_breakdown_ms, None
         except Exception:
             logger.exception("SLOSchedulerClient: send failed")
-            return None
+            return None, 0.0, rpc_breakdown_ms, None
 
-        start = time.monotonic()
+        wait_start = time.perf_counter()
+        poll_start = time.perf_counter()
         if not self.socket.poll(self.timeout_ms):
-            return None
+            rpc_breakdown_ms["wait"] += (time.perf_counter() - poll_start) * 1000.0
+            return None, (time.perf_counter() - wait_start) * 1000.0, rpc_breakdown_ms, None
+        rpc_breakdown_ms["wait"] += (time.perf_counter() - poll_start) * 1000.0
 
         drained = 0
         while True:
             try:
                 while True:
+                    recv_start = time.perf_counter()
                     frames = self.socket.recv_multipart(flags=zmq.DONTWAIT)
-                    decision = self._deserialize_decision(frames[-1])
+                    decision_payload = frames[-1]
+                    decision = self._deserialize_decision(decision_payload)
+                    rpc_breakdown_ms["recv_deserialize"] += (
+                        time.perf_counter() - recv_start
+                    ) * 1000.0
                     if decision.iteration_count == current_iteration:
                         if drained > 0:
                             logger.info(
@@ -64,17 +87,29 @@ class SLOSchedulerClient:
                                 drained,
                                 current_iteration,
                             )
-                        return decision
+                        return (
+                            decision,
+                            (time.perf_counter() - wait_start) * 1000.0,
+                            rpc_breakdown_ms,
+                            decision_payload,
+                        )
                     drained += 1
             except zmq.Again:
                 pass
             except Exception:
                 logger.exception("SLOSchedulerClient: recv/deserialize failed")
-                return None
+                return (
+                    None,
+                    (time.perf_counter() - wait_start) * 1000.0,
+                    rpc_breakdown_ms,
+                    None,
+                )
 
-            elapsed_ms = (time.monotonic() - start) * 1000
+            elapsed_ms = (time.perf_counter() - wait_start) * 1000
             remaining_ms = int(self.timeout_ms - elapsed_ms)
+            poll_start = time.perf_counter()
             if remaining_ms <= 0 or not self.socket.poll(remaining_ms):
+                rpc_breakdown_ms["wait"] += (time.perf_counter() - poll_start) * 1000.0
                 if drained > 0:
                     logger.info(
                         "SLOSchedulerClient: drained %d stale responses "
@@ -82,7 +117,13 @@ class SLOSchedulerClient:
                         drained,
                         current_iteration,
                     )
-                return None
+                return (
+                    None,
+                    (time.perf_counter() - wait_start) * 1000.0,
+                    rpc_breakdown_ms,
+                    None,
+                )
+            rpc_breakdown_ms["wait"] += (time.perf_counter() - poll_start) * 1000.0
 
     def close(self):
         self.socket.close()

@@ -17,6 +17,7 @@ import dataclasses
 import logging
 import os
 import signal
+import time
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -364,6 +365,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
+        detokenize_timestamps = [time.time() * 1000.0 for _ in recv_obj.rids]
         routed_experts = self._extract_routed_experts(recv_obj)
 
         return BatchStrOutput(
@@ -402,6 +404,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             load=recv_obj.load,
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
+            start_iterations=recv_obj.start_iterations,
+            iteration_id=recv_obj.iteration_id,
+            server_id=recv_obj.server_id,
+            detokenize_timestamps=detokenize_timestamps,
         )
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
