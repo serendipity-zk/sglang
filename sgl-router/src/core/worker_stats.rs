@@ -47,6 +47,14 @@ pub struct WorkerStats {
     /// Iteration counter
     pub iteration_num: i64,
 
+    /// Explicit worker scheduling iteration id from the reporting path
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_iteration_id: Option<i64>,
+
+    /// Wall-clock send timestamp of the stats report in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_send_time_ms: Option<f64>,
+
     /// Duration of the last completed iteration in milliseconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_iteration_time_ms: Option<f64>,
@@ -60,13 +68,9 @@ pub struct WorkerStats {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_sim_metrics: Option<HashMap<i64, f64>>,
 
-    /// Router generation reported by the worker (for message acknowledgments)
+    /// Newly accepted request IDs since the previous stats report
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub router_generation: Option<i64>,
-
-    /// Highest contiguous message ID received for the reported generation
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_received_message_id: Option<i64>,
+    pub accepted_request_ids: Option<Vec<String>>,
 
     /// Batch size breakdown by TPOT tier (e.g., {"40": 5, "80": 3, "none": 2})
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -143,10 +147,10 @@ impl WorkerStats {
             .get("iteration_num")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
+        let worker_iteration_id = stats.get("worker_iteration_id").and_then(|v| v.as_i64());
+        let report_send_time_ms = stats.get("report_send_time_ms").and_then(|v| v.as_f64());
 
-        let last_iteration_time_ms = stats
-            .get("last_iteration_time_ms")
-            .and_then(|v| v.as_f64());
+        let last_iteration_time_ms = stats.get("last_iteration_time_ms").and_then(|v| v.as_f64());
 
         let prefill_chunk_pairs = stats
             .get("prefill_chunk_pairs")
@@ -182,10 +186,14 @@ impl WorkerStats {
 
         let kv_tokens_used = stats.get("kv_tokens_used").and_then(|v| v.as_i64());
 
-        let router_generation = stats.get("router_generation").and_then(|v| v.as_i64());
-        let last_received_message_id = stats
-            .get("last_received_message_id")
-            .and_then(|v| v.as_i64());
+        let accepted_request_ids = stats
+            .get("accepted_request_ids")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|value| value.as_str().map(ToString::to_string))
+                    .collect()
+            });
 
         // Parse batch_size_by_tpot_tier: {"40": 5, "80": 3, "none": 2}
         // Keys are TPOT values as strings (or "none"), values are request counts
@@ -210,11 +218,12 @@ impl WorkerStats {
             waiting_queue_info,
             forward_mode,
             iteration_num,
+            worker_iteration_id,
+            report_send_time_ms,
             last_iteration_time_ms,
             prefill_chunk_pairs,
             prefill_sim_metrics,
-            router_generation,
-            last_received_message_id,
+            accepted_request_ids,
             batch_size_by_tpot_tier,
             timestamp: Instant::now(),
         })

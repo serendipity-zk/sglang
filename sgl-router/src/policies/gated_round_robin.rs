@@ -47,7 +47,12 @@ impl GatedRoundRobinPolicy {
         // Check router-tracked pending messages
         let pending_messages = worker.pending_message_count();
 
-        tracing::warn!("worker {} has pending work: queue_size={}, pending_messages={}", worker.url(), queue_size, pending_messages);
+        tracing::warn!(
+            "worker {} has pending work: queue_size={}, pending_messages={}",
+            worker.url(),
+            queue_size,
+            pending_messages
+        );
         // Worker is busy if either queue has work or pending messages exist
         (queue_size + pending_messages as i64) > 0
     }
@@ -166,11 +171,12 @@ mod tests {
                 waiting_queue_info: None,
                 forward_mode: "DECODE".to_string(),
                 iteration_num: 10,
+                worker_iteration_id: None,
+                report_send_time_ms: None,
                 last_iteration_time_ms: None,
                 prefill_chunk_pairs: None,
                 prefill_sim_metrics: None,
-                router_generation: None,
-                last_received_message_id: None,
+                accepted_request_ids: None,
                 batch_size_by_tpot_tier: None,
                 timestamp: std::time::Instant::now(),
             },
@@ -186,11 +192,12 @@ mod tests {
                 waiting_queue_info: None,
                 forward_mode: "DECODE".to_string(),
                 iteration_num: 10,
+                worker_iteration_id: None,
+                report_send_time_ms: None,
                 last_iteration_time_ms: None,
                 prefill_chunk_pairs: None,
                 prefill_sim_metrics: None,
-                router_generation: None,
-                last_received_message_id: None,
+                accepted_request_ids: None,
                 batch_size_by_tpot_tier: None,
                 timestamp: std::time::Instant::now(),
             },
@@ -233,11 +240,12 @@ mod tests {
                 waiting_queue_info: None,
                 forward_mode: "DECODE".to_string(),
                 iteration_num: 10,
+                worker_iteration_id: None,
+                report_send_time_ms: None,
                 last_iteration_time_ms: None,
                 prefill_chunk_pairs: None,
                 prefill_sim_metrics: None,
-                router_generation: None,
-                last_received_message_id: None,
+                accepted_request_ids: None,
                 batch_size_by_tpot_tier: None,
                 timestamp: std::time::Instant::now(),
             },
@@ -253,11 +261,12 @@ mod tests {
                 waiting_queue_info: None,
                 forward_mode: "DECODE".to_string(),
                 iteration_num: 10,
+                worker_iteration_id: None,
+                report_send_time_ms: None,
                 last_iteration_time_ms: None,
                 prefill_chunk_pairs: None,
                 prefill_sim_metrics: None,
-                router_generation: None,
-                last_received_message_id: None,
+                accepted_request_ids: None,
                 batch_size_by_tpot_tier: None,
                 timestamp: std::time::Instant::now(),
             },
@@ -299,13 +308,9 @@ mod tests {
         assert_eq!(result1, Some(0), "First selection should return worker1");
 
         // Simulate adding pending message to worker1 (what dispatch_to_worker does now)
-        let msg_id = worker1.next_message_id();
-        let gen = worker1.generation();
         worker1.add_pending_message(crate::core::PendingMessage::new(
-            msg_id,
-            gen,
             "/generate".to_string(),
-            Some("test-req".to_string()),
+            "test-req".to_string(),
             serde_json::json!({"test": true}),
             512, // default token count for tests
         ));
@@ -315,22 +320,25 @@ mod tests {
 
         // Second selection should return worker2 (index 1) because worker1 is busy
         let result2 = policy.select_worker(&workers, None);
-        assert_eq!(result2, Some(1), "Second selection should return worker2, not worker1");
+        assert_eq!(
+            result2,
+            Some(1),
+            "Second selection should return worker2, not worker1"
+        );
 
         // Add pending message to worker2 as well
-        let msg_id = worker2.next_message_id();
-        let gen = worker2.generation();
         worker2.add_pending_message(crate::core::PendingMessage::new(
-            msg_id,
-            gen,
             "/generate".to_string(),
-            Some("test-req-2".to_string()),
+            "test-req-2".to_string(),
             serde_json::json!({"test": true}),
             512, // default token count for tests
         ));
 
         // Now both workers are busy, should defer
         let result3 = policy.select_worker(&workers, None);
-        assert_eq!(result3, None, "Should defer when all workers have pending work");
+        assert_eq!(
+            result3, None,
+            "Should defer when all workers have pending work"
+        );
     }
 }

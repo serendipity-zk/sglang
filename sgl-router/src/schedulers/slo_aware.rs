@@ -1432,7 +1432,7 @@ impl SloAwareScheduler {
                                     })
                                     .unwrap_or_else(|| "none".to_string());
                                 debug!(
-                                    "[DIAG] tier={} worker={} pending_work={} num_reqs={} queue={} pending_msgs={} pending_tokens={} ack={:?}/{:?} pending_ledger={} prefill_map=[{}]",
+                                    "[DIAG] tier={} worker={} pending_work={} num_reqs={} queue={} pending_msgs={} pending_tokens={} accepted_count={} pending_ledger={} prefill_map=[{}]",
                                     tier_tpot,
                                     letter,
                                     has_pending,
@@ -1440,8 +1440,10 @@ impl SloAwareScheduler {
                                     ws.waiting_queue_size,
                                     pending_messages,
                                     pending_tokens,
-                                    ws.router_generation,
-                                    ws.last_received_message_id,
+                                    ws.accepted_request_ids
+                                        .as_ref()
+                                        .map(|ids| ids.len())
+                                        .unwrap_or(0),
                                     pending_debug.compact_string(),
                                     prefill_map
                                 );

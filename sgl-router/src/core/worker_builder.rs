@@ -1,30 +1,16 @@
 use super::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use super::worker::{
-    BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RouterMessageState,
-    WorkerMetadata, WorkerType,
+    BasicWorker, ConnectionMode, DPAwareWorker, HealthConfig, RouterMessageState, WorkerMetadata,
+    WorkerType,
 };
 use crate::grpc::client::SglangSchedulerClient;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::convert::TryFrom;
-use std::sync::LazyLock;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-/// Router generation - Unix timestamp at router startup
-/// This allows workers to detect when the router has restarted
-static ROUTER_GENERATION: LazyLock<i64> = LazyLock::new(|| {
-    let generation = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("System time before Unix epoch")
-        .as_millis();
-    i64::try_from(generation).expect("Unix time has exceeded the bounds of i64")
-});
 
 /// Builder for creating BasicWorker instances with fluent API
 pub struct BasicWorkerBuilder {
     // Required fields
     url: String,
-    generation: i64,
 
     // Optional fields with defaults
     api_key: Option<String>,
@@ -38,11 +24,9 @@ pub struct BasicWorkerBuilder {
 
 impl BasicWorkerBuilder {
     /// Create a new builder with URL (defaults to Regular worker type)
-    /// Uses the router's generation (initialized at startup)
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
-            generation: *ROUTER_GENERATION,
             api_key: None,
             worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
@@ -57,24 +41,8 @@ impl BasicWorkerBuilder {
     pub fn new_with_type(url: impl Into<String>, worker_type: WorkerType) -> Self {
         Self {
             url: url.into(),
-            generation: *ROUTER_GENERATION,
             api_key: None,
             worker_type,
-            connection_mode: ConnectionMode::Http,
-            labels: HashMap::new(),
-            health_config: HealthConfig::default(),
-            circuit_breaker_config: CircuitBreakerConfig::default(),
-            grpc_client: None,
-        }
-    }
-
-    /// Create a new builder with explicit generation (for testing)
-    pub fn new_with_generation(url: impl Into<String>, generation: i64) -> Self {
-        Self {
-            url: url.into(),
-            generation,
-            api_key: None,
-            worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
             labels: HashMap::new(),
             health_config: HealthConfig::default(),
@@ -153,8 +121,6 @@ impl BasicWorkerBuilder {
             load_counter: Arc::new(AtomicUsize::new(0)),
             processed_counter: Arc::new(AtomicUsize::new(0)),
             router_state: Arc::new(RwLock::new(RouterMessageState {
-                generation: self.generation,
-                next_message_id: 0,
                 pending_messages: Vec::new(),
             })),
             healthy: Arc::new(AtomicBool::new(true)),
@@ -170,7 +136,6 @@ impl BasicWorkerBuilder {
 pub struct DPAwareWorkerBuilder {
     // Required fields
     base_url: String,
-    generation: i64,
     api_key: Option<String>,
     dp_rank: usize,
     dp_size: usize,
@@ -186,11 +151,9 @@ pub struct DPAwareWorkerBuilder {
 
 impl DPAwareWorkerBuilder {
     /// Create a new DP-aware worker builder (defaults to Regular worker type)
-    /// Uses the router's generation (initialized at startup)
     pub fn new(base_url: impl Into<String>, dp_rank: usize, dp_size: usize) -> Self {
         Self {
             base_url: base_url.into(),
-            generation: *ROUTER_GENERATION,
             api_key: None,
             dp_rank,
             dp_size,
@@ -212,33 +175,10 @@ impl DPAwareWorkerBuilder {
     ) -> Self {
         Self {
             base_url: base_url.into(),
-            generation: *ROUTER_GENERATION,
             api_key: None,
             dp_rank,
             dp_size,
             worker_type,
-            connection_mode: ConnectionMode::Http,
-            labels: HashMap::new(),
-            health_config: HealthConfig::default(),
-            circuit_breaker_config: CircuitBreakerConfig::default(),
-            grpc_client: None,
-        }
-    }
-
-    /// Create a new DP-aware worker builder with explicit generation (for testing)
-    pub fn new_with_generation(
-        base_url: impl Into<String>,
-        generation: i64,
-        dp_rank: usize,
-        dp_size: usize,
-    ) -> Self {
-        Self {
-            base_url: base_url.into(),
-            generation,
-            api_key: None,
-            dp_rank,
-            dp_size,
-            worker_type: WorkerType::Regular,
             connection_mode: ConnectionMode::Http,
             labels: HashMap::new(),
             health_config: HealthConfig::default(),
@@ -301,7 +241,7 @@ impl DPAwareWorkerBuilder {
         let worker_url = format!("{}@{}", self.base_url, self.dp_rank);
 
         // Use BasicWorkerBuilder to create a properly configured base worker
-        let mut builder = BasicWorkerBuilder::new_with_generation(worker_url, self.generation)
+        let mut builder = BasicWorkerBuilder::new(worker_url)
             .worker_type(self.worker_type)
             .connection_mode(self.connection_mode)
             .labels(self.labels)

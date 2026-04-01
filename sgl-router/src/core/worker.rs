@@ -6,11 +6,11 @@ use crate::metrics::RouterMetrics;
 use async_trait::async_trait;
 use futures;
 use parking_lot::RwLock;
-use serde_json::{self, json};
+use serde_json::{self};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -30,12 +30,8 @@ pub const MAX_RESEND_ATTEMPTS: u32 = 3;
 /// Represents a request dispatched to a worker that hasn't been acknowledged yet.
 #[derive(Debug, Clone)]
 pub struct PendingMessage {
-    /// Unique message ID assigned by the router
-    pub message_id: i64,
-    /// Router generation (epoch) when the message was created
-    pub generation: i64,
-    /// Optional request identifier from the incoming request
-    pub request_id: Option<String>,
+    /// Router-visible request identifier used for pending cleanup and resend bookkeeping
+    pub request_id: String,
     /// Route/endpoint that was invoked (e.g., "/generate")
     pub route: String,
     /// Timestamp when the router dispatched the message
@@ -44,7 +40,7 @@ pub struct PendingMessage {
     pub resend_count: u32,
     /// Timestamp of the last send (initial send or resend)
     pub last_send_time: Instant,
-    /// Request body stored for potential resend (contains router_generation and router_message_id)
+    /// Request body stored for potential resend.
     pub body_json: serde_json::Value,
     /// Number of input tokens for this request (for TTFT estimation)
     pub input_token_count: i64,
@@ -54,10 +50,6 @@ pub struct PendingMessage {
 #[derive(Debug, Clone, Default)]
 pub struct PendingMessageDebugInfo {
     pub count: usize,
-    pub min_message_id: Option<i64>,
-    pub max_message_id: Option<i64>,
-    pub generation: Option<i64>,
-    pub sample_message_ids: Vec<i64>,
     pub sample_request_ids: Vec<String>,
     pub oldest_age_ms: Option<u64>,
     pub newest_age_ms: Option<u64>,
@@ -65,21 +57,7 @@ pub struct PendingMessageDebugInfo {
 }
 
 #[derive(Debug, Clone)]
-pub struct RouterEpochResetInfo {
-    pub failed_generation: i64,
-    pub failed_message_id: i64,
-    pub new_generation: i64,
-    pub cleared_count: usize,
-    pub cleared_min_message_id: Option<i64>,
-    pub cleared_max_message_id: Option<i64>,
-    pub cleared_message_ids: Vec<i64>,
-    pub cleared_request_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
 pub struct RouterMessageState {
-    pub generation: i64,
-    pub next_message_id: i64,
     pub pending_messages: Vec<PendingMessage>,
 }
 
@@ -89,18 +67,6 @@ impl PendingMessageDebugInfo {
             return "count=0".to_string();
         }
 
-        let ids = if self.sample_message_ids.is_empty() {
-            "[]".to_string()
-        } else {
-            format!(
-                "[{}]",
-                self.sample_message_ids
-                    .iter()
-                    .map(|id| id.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        };
         let reqs = if self.sample_request_ids.is_empty() {
             "[]".to_string()
         } else {
@@ -108,16 +74,8 @@ impl PendingMessageDebugInfo {
         };
 
         format!(
-            "count={} gen={:?} min_id={:?} max_id={:?} oldest_ms={:?} newest_ms={:?} max_resend={} ids={} reqs={}",
-            self.count,
-            self.generation,
-            self.min_message_id,
-            self.max_message_id,
-            self.oldest_age_ms,
-            self.newest_age_ms,
-            self.max_resend_count,
-            ids,
-            reqs
+            "count={} oldest_ms={:?} newest_ms={:?} max_resend={} reqs={}",
+            self.count, self.oldest_age_ms, self.newest_age_ms, self.max_resend_count, reqs
         )
     }
 }
@@ -128,39 +86,24 @@ fn build_pending_message_debug_info(pending: &[PendingMessage]) -> PendingMessag
     }
 
     let now = Instant::now();
-    let mut min_message_id = None;
-    let mut max_message_id = None;
     let mut oldest_age_ms = None;
     let mut newest_age_ms = None;
     let mut max_resend_count = 0;
-    let mut sample_message_ids = Vec::new();
     let mut sample_request_ids = Vec::new();
 
     for msg in pending.iter() {
-        min_message_id = Some(min_message_id.map_or(msg.message_id, |v: i64| v.min(msg.message_id)));
-        max_message_id = Some(max_message_id.map_or(msg.message_id, |v: i64| v.max(msg.message_id)));
-
         let age_ms = now.saturating_duration_since(msg.timestamp).as_millis() as u64;
         oldest_age_ms = Some(oldest_age_ms.map_or(age_ms, |v: u64| v.max(age_ms)));
         newest_age_ms = Some(newest_age_ms.map_or(age_ms, |v: u64| v.min(age_ms)));
         max_resend_count = max_resend_count.max(msg.resend_count);
 
-        if sample_message_ids.len() < 5 {
-            sample_message_ids.push(msg.message_id);
-        }
         if sample_request_ids.len() < 3 {
-            if let Some(request_id) = &msg.request_id {
-                sample_request_ids.push(request_id.clone());
-            }
+            sample_request_ids.push(msg.request_id.clone());
         }
     }
 
     PendingMessageDebugInfo {
         count: pending.len(),
-        min_message_id,
-        max_message_id,
-        generation: pending.first().map(|msg| msg.generation),
-        sample_message_ids,
         sample_request_ids,
         oldest_age_ms,
         newest_age_ms,
@@ -168,33 +111,42 @@ fn build_pending_message_debug_info(pending: &[PendingMessage]) -> PendingMessag
     }
 }
 
-fn next_router_generation(current_generation: i64) -> i64 {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("System time before Unix epoch")
-        .as_millis() as i64;
-    if now_ms > current_generation {
-        now_ms
-    } else {
-        current_generation + 1
+fn strip_parallel_sample_suffix(request_id: &str) -> Option<&str> {
+    let (base_request_id, suffix) = request_id.rsplit_once('_')?;
+    if base_request_id.is_empty()
+        || suffix.is_empty()
+        || !suffix.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
     }
+    Some(base_request_id)
+}
+
+fn resolve_pending_request_id<'a>(
+    pending_request_ids: &std::collections::HashSet<&str>,
+    request_id: &'a str,
+) -> Option<&'a str> {
+    if pending_request_ids.contains(request_id) {
+        return Some(request_id);
+    }
+
+    let base_request_id = strip_parallel_sample_suffix(request_id)?;
+    pending_request_ids
+        .contains(base_request_id)
+        .then_some(base_request_id)
 }
 
 impl PendingMessage {
     /// Convenience constructor for creating pending messages.
     pub fn new(
-        message_id: i64,
-        generation: i64,
         route: impl Into<String>,
-        request_id: Option<String>,
+        request_id: impl Into<String>,
         body_json: serde_json::Value,
         input_token_count: i64,
     ) -> Self {
         let now = Instant::now();
         Self {
-            message_id,
-            generation,
-            request_id,
+            request_id: request_id.into(),
             route: route.into(),
             timestamp: now,
             resend_count: 0,
@@ -215,25 +167,18 @@ impl PendingMessage {
 /// This is a fire-and-forget operation - we don't wait for the response since
 /// the original request handler is already waiting.
 pub async fn resend_message(worker_url: &str, message: &PendingMessage) {
-    // Prepare the body with router metadata (same as prepare_request_payload)
-    let mut body = message.body_json.clone();
-    if let Some(map) = body.as_object_mut() {
-        map.insert("router_generation".to_string(), json!(message.generation));
-        map.insert("router_message_id".to_string(), json!(message.message_id));
-    }
+    let body = message.body_json.clone();
 
     let url = format!("{}{}", worker_url, message.route);
     info!(
         worker = worker_url,
-        generation = message.generation,
-        message_id = message.message_id,
-        request_id = message.request_id.as_deref().unwrap_or("-"),
+        request_id = message.request_id.as_str(),
         route = message.route.as_str(),
         resend_attempt = message.resend_count + 1,
         age_ms = message.timestamp.elapsed().as_millis() as u64,
         since_last_send_ms = message.last_send_time.elapsed().as_millis() as u64,
         input_tokens = message.input_token_count,
-        "[PENDING_TRACE] resending pending router message"
+        "[PENDING_TRACE] resending pending router request"
     );
 
     // Fire and forget - spawn to avoid blocking the resend checker
@@ -324,37 +269,24 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Track a dispatched message until it is acknowledged.
     fn add_pending_message(&self, message: PendingMessage);
 
-    /// Atomically allocate router message metadata and track the message as pending.
+    /// Track a dispatched request as pending using its request_id.
     fn allocate_pending_message(
         &self,
         route: String,
-        request_id: Option<String>,
+        request_id: String,
         body_json: serde_json::Value,
         input_token_count: i64,
     ) -> PendingMessage;
 
-    /// Remove a specific pending message when the router knows dispatch failed.
-    fn remove_pending_message(&self, generation: i64, message_id: i64) -> Option<PendingMessage>;
+    /// Remove a specific pending request when the router or worker stats identify it by request_id.
+    fn remove_pending_request_by_id(&self, request_id: &str) -> Option<PendingMessage>;
 
-    /// Reset this worker's router epoch after an undelivered transport failure.
-    fn reset_router_epoch_after_transport_failure(
-        &self,
-        generation: i64,
-        message_id: i64,
-    ) -> Option<RouterEpochResetInfo>;
-
-    /// Remove acknowledged messages up to and including the provided ID for a generation.
+    /// Remove a batch of acknowledged requests identified by request_id.
     /// Returns removed messages so callers can emit metrics.
-    fn remove_messages_up_to(&self, generation: i64, last_message_id: i64) -> Vec<PendingMessage>;
+    fn remove_pending_requests_by_id(&self, request_ids: &[String]) -> Vec<PendingMessage>;
 
     /// Remove pending messages older than the specified TTL. Returns removed entries.
     fn cleanup_stale_messages(&self, ttl: Duration) -> Vec<PendingMessage>;
-
-    /// Generate next message ID for this worker
-    fn next_message_id(&self) -> i64;
-
-    /// Get the router generation (startup timestamp)
-    fn generation(&self) -> i64;
 
     /// Cleanup stale pending messages and record metrics
     /// This method handles its own metrics recording
@@ -363,8 +295,8 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Get messages that need to be resent (timed out but not exceeded max attempts)
     fn get_messages_to_resend(&self) -> Vec<PendingMessage>;
 
-    /// Mark a message as resent (increment resend count and update last_send_time)
-    fn mark_resent(&self, message_id: i64);
+    /// Mark a request as resent (increment resend count and update last_send_time)
+    fn mark_resent(&self, request_id: &str);
 
     /// Get the number of processed requests
     fn processed_requests(&self) -> usize;
@@ -829,73 +761,56 @@ impl Worker for BasicWorker {
     fn allocate_pending_message(
         &self,
         route: String,
-        request_id: Option<String>,
+        request_id: String,
         body_json: serde_json::Value,
         input_token_count: i64,
     ) -> PendingMessage {
         let mut state = self.router_state.write();
-        let message = PendingMessage::new(
-            state.next_message_id,
-            state.generation,
-            route.clone(),
-            request_id.clone(),
-            body_json,
-            input_token_count,
-        );
-        state.next_message_id += 1;
+        let message = PendingMessage::new(route.clone(), request_id, body_json, input_token_count);
         state.pending_messages.push(message.clone());
 
         message
     }
 
-    fn remove_pending_message(&self, generation: i64, message_id: i64) -> Option<PendingMessage> {
+    fn remove_pending_request_by_id(&self, request_id: &str) -> Option<PendingMessage> {
         let mut state = self.router_state.write();
+        let pending_request_ids: std::collections::HashSet<&str> = state
+            .pending_messages
+            .iter()
+            .map(|msg| msg.request_id.as_str())
+            .collect();
+        let resolved_request_id = resolve_pending_request_id(&pending_request_ids, request_id)?;
         let idx = state
             .pending_messages
             .iter()
-            .position(|msg| msg.generation == generation && msg.message_id == message_id)?;
+            .position(|msg| msg.request_id == resolved_request_id)?;
         Some(state.pending_messages.remove(idx))
     }
 
-    fn reset_router_epoch_after_transport_failure(
-        &self,
-        generation: i64,
-        message_id: i64,
-    ) -> Option<RouterEpochResetInfo> {
-        let mut state = self.router_state.write();
-        if state.generation != generation {
-            return None;
+    fn remove_pending_requests_by_id(&self, request_ids: &[String]) -> Vec<PendingMessage> {
+        if request_ids.is_empty() {
+            return Vec::new();
         }
 
-        let cleared_info = build_pending_message_debug_info(&state.pending_messages);
-        let new_generation = next_router_generation(state.generation);
-        let cleared_count = state.pending_messages.len();
-        let cleared_min_message_id = cleared_info.min_message_id;
-        let cleared_max_message_id = cleared_info.max_message_id;
-        let cleared_message_ids = cleared_info.sample_message_ids.clone();
-        let cleared_request_ids = cleared_info.sample_request_ids.clone();
-
-        state.pending_messages.clear();
-        state.generation = new_generation;
-        state.next_message_id = 0;
-
-        Some(RouterEpochResetInfo {
-            failed_generation: generation,
-            failed_message_id: message_id,
-            new_generation,
-            cleared_count,
-            cleared_min_message_id,
-            cleared_max_message_id,
-            cleared_message_ids,
-            cleared_request_ids,
-        })
-    }
-
-    fn remove_messages_up_to(&self, generation: i64, last_message_id: i64) -> Vec<PendingMessage> {
-        let mut removed = Vec::new();
         let mut state = self.router_state.write();
+        let pending_request_ids: std::collections::HashSet<&str> = state
+            .pending_messages
+            .iter()
+            .map(|msg| msg.request_id.as_str())
+            .collect();
+        let request_ids: std::collections::HashSet<&str> = request_ids
+            .iter()
+            .filter_map(|request_id| {
+                resolve_pending_request_id(&pending_request_ids, request_id.as_str())
+            })
+            .collect();
+        if request_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let mut removed = Vec::new();
         state.pending_messages.retain(|msg| {
-            let should_remove = msg.generation == generation && msg.message_id <= last_message_id;
+            let should_remove = request_ids.contains(msg.request_id.as_str());
             if should_remove {
                 removed.push(msg.clone());
             }
@@ -918,17 +833,6 @@ impl Worker for BasicWorker {
         removed
     }
 
-    fn next_message_id(&self) -> i64 {
-        let mut state = self.router_state.write();
-        let next = state.next_message_id;
-        state.next_message_id += 1;
-        next
-    }
-
-    fn generation(&self) -> i64 {
-        self.router_state.read().generation
-    }
-
     fn cleanup_pending_messages(&self, ttl: Duration) {
         let pending_before = self.pending_message_debug_info();
         let removed = self.cleanup_stale_messages(ttl);
@@ -936,29 +840,16 @@ impl Worker for BasicWorker {
             RouterMetrics::record_message_timeout(self.url(), removed.len());
             RouterMetrics::set_pending_messages(self.url(), self.pending_message_count());
             let pending_after = self.pending_message_debug_info();
-            let removed_min_id = removed.first().map(|msg| msg.message_id);
-            let removed_max_id = removed.last().map(|msg| msg.message_id);
-            let removed_generation = removed.first().map(|msg| msg.generation);
-            let removed_message_ids = removed
-                .iter()
-                .take(5)
-                .map(|msg| msg.message_id.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
             let removed_request_ids = removed
                 .iter()
-                .filter_map(|msg| msg.request_id.as_deref())
-                .take(3)
+                .map(|msg| msg.request_id.as_str())
+                .take(5)
                 .collect::<Vec<_>>()
                 .join(",");
             warn!(
                 worker = self.url(),
                 removed = removed.len(),
-                removed_generation = removed_generation,
-                removed_min_id = removed_min_id,
-                removed_max_id = removed_max_id,
                 ttl_secs = ttl.as_secs(),
-                removed_message_ids = removed_message_ids,
                 removed_request_ids = removed_request_ids,
                 pending_before = pending_before.compact_string(),
                 pending_after = pending_after.compact_string(),
@@ -977,12 +868,12 @@ impl Worker for BasicWorker {
             .collect()
     }
 
-    fn mark_resent(&self, message_id: i64) {
+    fn mark_resent(&self, request_id: &str) {
         let mut state = self.router_state.write();
         if let Some(msg) = state
             .pending_messages
             .iter_mut()
-            .find(|m| m.message_id == message_id)
+            .find(|m| m.request_id == request_id)
         {
             msg.resend_count += 1;
             msg.last_send_time = Instant::now();
@@ -1103,47 +994,24 @@ impl Worker for DPAwareWorker {
     fn allocate_pending_message(
         &self,
         route: String,
-        request_id: Option<String>,
+        request_id: String,
         body_json: serde_json::Value,
         input_token_count: i64,
     ) -> PendingMessage {
-        self.base_worker.allocate_pending_message(
-            route,
-            request_id,
-            body_json,
-            input_token_count,
-        )
+        self.base_worker
+            .allocate_pending_message(route, request_id, body_json, input_token_count)
     }
 
-    fn remove_pending_message(&self, generation: i64, message_id: i64) -> Option<PendingMessage> {
-        self.base_worker
-            .remove_pending_message(generation, message_id)
+    fn remove_pending_request_by_id(&self, request_id: &str) -> Option<PendingMessage> {
+        self.base_worker.remove_pending_request_by_id(request_id)
     }
 
-    fn reset_router_epoch_after_transport_failure(
-        &self,
-        generation: i64,
-        message_id: i64,
-    ) -> Option<RouterEpochResetInfo> {
-        self.base_worker
-            .reset_router_epoch_after_transport_failure(generation, message_id)
-    }
-
-    fn remove_messages_up_to(&self, generation: i64, last_message_id: i64) -> Vec<PendingMessage> {
-        self.base_worker
-            .remove_messages_up_to(generation, last_message_id)
+    fn remove_pending_requests_by_id(&self, request_ids: &[String]) -> Vec<PendingMessage> {
+        self.base_worker.remove_pending_requests_by_id(request_ids)
     }
 
     fn cleanup_stale_messages(&self, ttl: Duration) -> Vec<PendingMessage> {
         self.base_worker.cleanup_stale_messages(ttl)
-    }
-
-    fn next_message_id(&self) -> i64 {
-        self.base_worker.next_message_id()
-    }
-
-    fn generation(&self) -> i64 {
-        self.base_worker.generation()
     }
 
     fn cleanup_pending_messages(&self, ttl: Duration) {
@@ -1154,8 +1022,8 @@ impl Worker for DPAwareWorker {
         self.base_worker.get_messages_to_resend()
     }
 
-    fn mark_resent(&self, message_id: i64) {
-        self.base_worker.mark_resent(message_id)
+    fn mark_resent(&self, request_id: &str) {
+        self.base_worker.mark_resent(request_id)
     }
 
     fn processed_requests(&self) -> usize {
@@ -2341,10 +2209,8 @@ mod tests {
 
     fn make_pending(id: i64) -> PendingMessage {
         PendingMessage::new(
-            id,
-            777,
             "/generate",
-            Some(format!("req-{id}")),
+            format!("req-{id}"),
             serde_json::json!({"test": true}),
             512, // default token count for tests
         )
@@ -2362,41 +2228,135 @@ mod tests {
     }
 
     #[test]
-    fn remove_messages_up_to_returns_removed_entries() {
+    fn remove_pending_request_by_id_removes_exact_entry_only() {
         let worker = ledger_worker();
         for id in 0..5 {
             worker.add_pending_message(make_pending(id));
         }
 
-        let removed = worker.remove_messages_up_to(777, 2);
-        assert_eq!(removed.len(), 3);
-        assert_eq!(worker.pending_message_count(), 2);
-
-        // Different generation should leave entries untouched
-        let removed_other = worker.remove_messages_up_to(778, 10);
-        assert!(removed_other.is_empty());
-        assert_eq!(worker.pending_message_count(), 2);
-    }
-
-    #[test]
-    fn remove_pending_message_removes_exact_entry_only() {
-        let worker = ledger_worker();
-        for id in 0..5 {
-            worker.add_pending_message(make_pending(id));
-        }
-
-        let removed = worker.remove_pending_message(777, 2).unwrap();
-        assert_eq!(removed.message_id, 2);
+        let removed = worker.remove_pending_request_by_id("req-2").unwrap();
+        assert_eq!(removed.request_id, "req-2");
         assert_eq!(worker.pending_message_count(), 4);
 
-        let remaining_ids: Vec<i64> = worker
+        let remaining_ids: Vec<String> = worker
             .router_state
             .read()
             .pending_messages
             .iter()
-            .map(|msg| msg.message_id)
+            .map(|msg| msg.request_id.clone())
             .collect();
-        assert_eq!(remaining_ids, vec![0, 1, 3, 4]);
+        assert_eq!(remaining_ids, vec!["req-0", "req-1", "req-3", "req-4"]);
+    }
+
+    #[test]
+    fn remove_pending_request_by_id_falls_back_to_parallel_sample_base_id() {
+        let worker = ledger_worker();
+        worker.add_pending_message(make_pending(2));
+
+        let removed = worker.remove_pending_request_by_id("req-2_0").unwrap();
+        assert_eq!(removed.request_id, "req-2");
+        assert_eq!(worker.pending_message_count(), 0);
+    }
+
+    #[test]
+    fn remove_pending_request_by_id_prefers_exact_parallel_sample_match() {
+        let worker = ledger_worker();
+        worker.add_pending_message(PendingMessage::new(
+            "/generate",
+            "req-2".to_string(),
+            serde_json::json!({"test": true}),
+            512,
+        ));
+        worker.add_pending_message(PendingMessage::new(
+            "/generate",
+            "req-2_0".to_string(),
+            serde_json::json!({"test": true}),
+            512,
+        ));
+
+        let removed = worker.remove_pending_request_by_id("req-2_0").unwrap();
+        assert_eq!(removed.request_id, "req-2_0");
+
+        let remaining_ids: Vec<String> = worker
+            .router_state
+            .read()
+            .pending_messages
+            .iter()
+            .map(|msg| msg.request_id.clone())
+            .collect();
+        assert_eq!(remaining_ids, vec!["req-2"]);
+    }
+
+    #[test]
+    fn remove_pending_requests_by_id_returns_removed_entries() {
+        let worker = ledger_worker();
+        for id in 0..5 {
+            worker.add_pending_message(make_pending(id));
+        }
+
+        let removed = worker.remove_pending_requests_by_id(&[
+            "req-1".to_string(),
+            "req-3".to_string(),
+            "missing".to_string(),
+        ]);
+        let removed_request_ids = removed
+            .iter()
+            .map(|msg| msg.request_id.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(removed.len(), 2);
+        assert_eq!(
+            removed_request_ids,
+            vec!["req-1".to_string(), "req-3".to_string()]
+        );
+        assert_eq!(worker.pending_message_count(), 3);
+    }
+
+    #[test]
+    fn remove_pending_requests_by_id_normalizes_parallel_sample_suffix() {
+        let worker = ledger_worker();
+        worker.add_pending_message(PendingMessage::new(
+            "/generate",
+            "req-1".to_string(),
+            serde_json::json!({"test": true}),
+            512,
+        ));
+        worker.add_pending_message(PendingMessage::new(
+            "/generate",
+            "req-2_0".to_string(),
+            serde_json::json!({"test": true}),
+            512,
+        ));
+        worker.add_pending_message(PendingMessage::new(
+            "/generate",
+            "req-3".to_string(),
+            serde_json::json!({"test": true}),
+            512,
+        ));
+
+        let removed = worker.remove_pending_requests_by_id(&[
+            "req-1_0".to_string(),
+            "req-2_0".to_string(),
+            "missing_0".to_string(),
+        ]);
+        let removed_request_ids = removed
+            .iter()
+            .map(|msg| msg.request_id.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            removed_request_ids,
+            vec!["req-1".to_string(), "req-2_0".to_string()]
+        );
+
+        let remaining_ids: Vec<String> = worker
+            .router_state
+            .read()
+            .pending_messages
+            .iter()
+            .map(|msg| msg.request_id.clone())
+            .collect();
+        assert_eq!(remaining_ids, vec!["req-3"]);
     }
 
     #[test]
@@ -2411,7 +2371,7 @@ mod tests {
 
         let removed = worker.cleanup_stale_messages(Duration::from_secs(60));
         assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].message_id, 11);
+        assert_eq!(removed[0].request_id, "req-11");
         assert_eq!(worker.pending_message_count(), 1);
 
         // Force the remaining entry to be stale and clean again
@@ -2425,97 +2385,26 @@ mod tests {
     }
 
     #[test]
-    fn reset_router_epoch_after_transport_failure_clears_pending_and_resets_counter() {
-        let worker = ledger_worker();
-        for id in 0..3 {
-            worker.add_pending_message(make_pending(id));
-        }
-
-        let old_generation = worker.generation();
-        let reset = worker
-            .reset_router_epoch_after_transport_failure(old_generation, 1)
-            .unwrap();
-
-        assert_eq!(reset.failed_generation, old_generation);
-        assert_eq!(reset.failed_message_id, 1);
-        assert_eq!(reset.cleared_count, 3);
-        assert_eq!(reset.cleared_min_message_id, Some(0));
-        assert_eq!(reset.cleared_max_message_id, Some(2));
-        assert!(reset.new_generation > old_generation);
-        assert_eq!(worker.pending_message_count(), 0);
-        assert_eq!(worker.generation(), reset.new_generation);
-        assert_eq!(worker.next_message_id(), 0);
-        assert_eq!(worker.next_message_id(), 1);
-    }
-
-    #[test]
-    fn test_per_worker_message_id_counter() {
-        const TEST_GEN: i64 = 12345;
-        let worker = BasicWorkerBuilder::new_with_generation("http://test:8080", TEST_GEN).build();
-
-        // Test that message IDs increment per worker
-        assert_eq!(worker.next_message_id(), 0);
-        assert_eq!(worker.next_message_id(), 1);
-        assert_eq!(worker.next_message_id(), 2);
-        assert_eq!(worker.next_message_id(), 3);
-
-        // Verify generation
-        assert_eq!(worker.generation(), TEST_GEN);
-    }
-
-    #[test]
-    fn test_multiple_workers_independent_counters() {
-        const TEST_GEN: i64 = 67890;
-        let worker1 = BasicWorkerBuilder::new_with_generation("http://w1:8080", TEST_GEN).build();
-        let worker2 = BasicWorkerBuilder::new_with_generation("http://w2:8080", TEST_GEN).build();
-        let worker3 = BasicWorkerBuilder::new_with_generation("http://w3:8080", TEST_GEN).build();
-
-        // Each worker should have independent counters starting at 0
-        assert_eq!(worker1.next_message_id(), 0);
-        assert_eq!(worker2.next_message_id(), 0);
-        assert_eq!(worker3.next_message_id(), 0);
-
-        assert_eq!(worker1.next_message_id(), 1);
-        assert_eq!(worker1.next_message_id(), 2);
-
-        assert_eq!(worker2.next_message_id(), 1);
-
-        assert_eq!(worker3.next_message_id(), 1);
-        assert_eq!(worker3.next_message_id(), 2);
-        assert_eq!(worker3.next_message_id(), 3);
-
-        // All workers share the same generation
-        assert_eq!(worker1.generation(), TEST_GEN);
-        assert_eq!(worker2.generation(), TEST_GEN);
-        assert_eq!(worker3.generation(), TEST_GEN);
-    }
-
-    #[test]
-    fn test_dp_aware_worker_message_ids() {
-        const TEST_GEN: i64 = 111222;
-        let dp_worker =
-            DPAwareWorkerBuilder::new_with_generation("http://worker:8080", TEST_GEN, 0, 4).build();
-
-        // DP-aware workers should also have independent per-worker counters
-        assert_eq!(dp_worker.next_message_id(), 0);
-        assert_eq!(dp_worker.next_message_id(), 1);
-        assert_eq!(dp_worker.next_message_id(), 2);
-        assert_eq!(dp_worker.generation(), TEST_GEN);
-    }
-
-    #[test]
-    fn test_shared_router_generation() {
-        // Workers created without explicit generation should share ROUTER_GENERATION
+    fn pending_ledgers_are_isolated_per_worker() {
         let worker1 = BasicWorkerBuilder::new("http://w1:8080").build();
         let worker2 = BasicWorkerBuilder::new("http://w2:8080").build();
 
-        // Both should have the same generation (ROUTER_GENERATION)
-        assert_eq!(worker1.generation(), worker2.generation());
+        worker1.add_pending_message(PendingMessage::new(
+            "/generate".to_string(),
+            "req-a".to_string(),
+            serde_json::json!({"test": true}),
+            512,
+        ));
+        worker2.add_pending_message(PendingMessage::new(
+            "/generate".to_string(),
+            "req-b".to_string(),
+            serde_json::json!({"test": true}),
+            512,
+        ));
 
-        // But independent message ID counters
-        assert_eq!(worker1.next_message_id(), 0);
-        assert_eq!(worker2.next_message_id(), 0);
-        assert_eq!(worker1.next_message_id(), 1);
-        assert_eq!(worker2.next_message_id(), 1);
+        assert_eq!(worker1.pending_message_count(), 1);
+        assert_eq!(worker2.pending_message_count(), 1);
+        assert!(worker1.remove_pending_request_by_id("req-b").is_none());
+        assert!(worker2.remove_pending_request_by_id("req-a").is_none());
     }
 }

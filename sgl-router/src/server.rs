@@ -505,6 +505,25 @@ async fn worker_stats(
             return (StatusCode::BAD_REQUEST, format!("Invalid stats: {}", e)).into_response();
         }
     };
+    let raw_worker_id = worker_stats.worker_id.clone();
+    // let worker_iteration_id = worker_stats.worker_iteration_id;
+    // let report_send_time_ms = worker_stats.report_send_time_ms;
+    // let report_recv_time_ms = std::time::SystemTime::now()
+    //     .duration_since(std::time::UNIX_EPOCH)
+    //     .unwrap_or_default()
+    //     .as_secs_f64()
+    //     * 1000.0;
+    // let stats_transport_delay_ms = report_send_time_ms.map(|send_ms| report_recv_time_ms - send_ms);
+    // let accepted_request_count = worker_stats
+    //     .accepted_request_ids
+    //     .as_ref()
+    //     .map(|ids| ids.len())
+    //     .unwrap_or(0);
+    // let accepted_request_sample = worker_stats
+    //     .accepted_request_ids
+    //     .as_ref()
+    //     .map(|ids| ids.iter().take(3).cloned().collect::<Vec<_>>().join(","))
+    //     .unwrap_or_default();
 
     // Detailed debug logging
     let queue_info_str = worker_stats.waiting_queue_info.as_ref().map(|info| {
@@ -605,15 +624,35 @@ async fn worker_stats(
     let resolved_worker_url = state
         .context
         .worker_registry
-        .resolve_worker_url(&worker_stats.worker_id)
+        .resolve_worker_url(&raw_worker_id)
         .or_else(|| {
             tracing::debug!(
                 "Worker stats identifier {} does not match a registered worker yet",
-                worker_stats.worker_id
+                raw_worker_id
             );
             None
         })
-        .unwrap_or_else(|| worker_stats.worker_id.clone());
+        .unwrap_or_else(|| raw_worker_id.clone());
+
+    // if stats_source == "sidecar" {
+    //     tracing::info!(
+    //         "[WORKER_STATS_RECV] source={} raw_worker={} resolved={} worker_iteration_id={:?} iter={} report_send_time_ms={:?} report_recv_time_ms={:.3} stats_transport_delay_ms={:?} num_reqs={} queue={} batch={} mode={} accepted_count={} accepted_sample={}",
+    //         stats_source,
+    //         raw_worker_id,
+    //         resolved_worker_url,
+    //         worker_iteration_id,
+    //         worker_stats.iteration_num,
+    //         report_send_time_ms,
+    //         report_recv_time_ms,
+    //         stats_transport_delay_ms,
+    //         worker_stats.num_requests,
+    //         worker_stats.waiting_queue_size,
+    //         worker_stats.batch_size_tokens,
+    //         worker_stats.forward_mode,
+    //         accepted_request_count,
+    //         accepted_request_sample.as_str(),
+    //     );
+    // }
 
     worker_stats.worker_id = resolved_worker_url.clone();
     state

@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -10,9 +10,9 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::core::{PendingMessage, Worker, WorkerRegistry};
+use crate::core::{Worker, WorkerRegistry};
 use crate::metrics::RouterMetrics;
 use crate::routers::header_utils;
 use crate::routers::http::scheduler::{PendingRequest, SchedulerConfig};
@@ -43,30 +43,14 @@ pub trait SchedulerBase: Send + Sync + Debug + 'static {
     ) {
         let dispatch_fn_start = std::time::Instant::now();
 
-        // Generate message ID and add pending message BEFORE async spawn
-        // This prevents race conditions where multiple requests select the same worker
-        let (message_id, generation) = if request.route == "/generate" {
-            // Prefer middleware-provided request_id; fall back to payload if missing/empty
-            let request_id = if !request.request_id.is_empty() {
-                Some(request.request_id.clone())
-            } else {
-                request
-                    .body_json
-                    .get("request_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            };
-
-            // Add pending message NOW, before spawning async task
-            // Store the original body_json for potential resend
-            // Use actual token count if available, otherwise estimate from text
+        if request.route == "/generate" {
             let input_token_count = request
                 .input_token_count
                 .unwrap_or_else(|| (request.text.len() / 4) as i64);
             let add_pending_start = std::time::Instant::now();
-            let pending_message = worker.allocate_pending_message(
+            worker.allocate_pending_message(
                 request.route.clone(),
-                request_id,
+                request.request_id.clone(),
                 request.body_json.clone(),
                 input_token_count,
             );
@@ -74,18 +58,11 @@ pub trait SchedulerBase: Send + Sync + Debug + 'static {
             if add_pending_us > 500 {
                 tracing::warn!("add_pending_message took {}us", add_pending_us);
             }
-
-            (
-                Some(pending_message.message_id),
-                Some(pending_message.generation),
-            )
-        } else {
-            (None, None)
-        };
+        }
 
         let spawn_start = std::time::Instant::now();
         tokio::spawn(async move {
-            process_pending(self, config, request, worker, message_id, generation).await;
+            process_pending(self, config, request, worker).await;
         });
         let spawn_us = spawn_start.elapsed().as_micros() as u64;
 
@@ -204,8 +181,6 @@ async fn process_pending<S: SchedulerBase + ?Sized>(
     config: Arc<SchedulerConfig>,
     pending: PendingRequest,
     worker: Arc<dyn Worker>,
-    message_id: Option<i64>,
-    generation: Option<i64>,
 ) {
     let PendingRequest {
         headers,
@@ -214,16 +189,38 @@ async fn process_pending<S: SchedulerBase + ?Sized>(
         model_id,
         is_stream,
         text: _,
-        request_id: _,
-        enqueue_started: _,
+        request_id,
+        enqueue_started,
         arrival_time_ms,
         response_tx,
-        target_ttft_ms: _,
-        target_tpot_ms: _,
-        input_token_count: _,
+        target_ttft_ms,
+        target_tpot_ms,
+        input_token_count,
     } = pending;
 
     let start = Instant::now();
+    let submit_time_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let arrival_time_ms_u64 = arrival_time_ms.max(0.0) as u64;
+    let router_queue_wait_ms = enqueue_started.elapsed().as_millis() as u64;
+    let ingress_wait_ms = submit_time_ms.saturating_sub(arrival_time_ms_u64);
+
+    info!(
+        request_id = request_id,
+        worker = worker.url(),
+        route = route,
+        arrival_time_ms = arrival_time_ms_u64,
+        submit_time_ms = submit_time_ms,
+        router_queue_wait_ms = router_queue_wait_ms,
+        ingress_wait_ms = ingress_wait_ms,
+        target_ttft_ms = ?target_ttft_ms,
+        target_tpot_ms = ?target_tpot_ms,
+        input_token_count = ?input_token_count,
+        is_stream = is_stream,
+        "[ROUTER_SUBMIT] dispatching request to worker"
+    );
 
     let dispatch_result = dispatch_request(
         &scheduler,
@@ -234,8 +231,7 @@ async fn process_pending<S: SchedulerBase + ?Sized>(
         model_id.as_deref(),
         is_stream,
         worker,
-        message_id,
-        generation,
+        request_id.as_str(),
         arrival_time_ms,
     )
     .await;
@@ -272,8 +268,6 @@ impl<'a> RequestPayload<'a> {
 fn prepare_request_payload<'a>(
     route: &str,
     body_json: &'a serde_json::Value,
-    message_id: Option<i64>,
-    generation: Option<i64>,
     arrival_time_ms: f64,
 ) -> RequestPayload<'a> {
     if !body_json.is_object() {
@@ -288,10 +282,6 @@ fn prepare_request_payload<'a>(
 
     if let Some(map) = owned.as_object_mut() {
         if route == "/generate" {
-            if let (Some(msg_id), Some(gen)) = (message_id, generation) {
-                map.insert("router_generation".to_string(), json!(gen));
-                map.insert("router_message_id".to_string(), json!(msg_id));
-            }
             // Only inject arrival_time_ms if not already present in payload
             // (New clients provide it; old payloads need router injection)
             if !map.contains_key("arrival_time_ms") {
@@ -314,8 +304,7 @@ async fn dispatch_request<S: SchedulerBase + ?Sized>(
     model_id: Option<&str>,
     is_stream: bool,
     worker: Arc<dyn Worker>,
-    message_id: Option<i64>,
-    generation: Option<i64>,
+    request_id: &str,
     arrival_time_ms: f64,
 ) -> DispatchResult {
     tracing::debug!(
@@ -341,8 +330,7 @@ async fn dispatch_request<S: SchedulerBase + ?Sized>(
 
     RouterUi::inc_worker_issued(worker.url());
 
-    let request_payload =
-        prepare_request_payload(route, body_json, message_id, generation, arrival_time_ms);
+    let request_payload = prepare_request_payload(route, body_json, arrival_time_ms);
 
     let dispatch_result = scheduler
         .send_http_request(
@@ -356,51 +344,18 @@ async fn dispatch_request<S: SchedulerBase + ?Sized>(
         )
         .await;
 
-    let request_id = body_json
-        .get("request_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("-");
-
-    if let (Some(msg_id), Some(gen)) = (message_id, generation) {
-        if !dispatch_result.delivered {
+    if !dispatch_result.delivered {
+        if let Some(removed) = worker.remove_pending_request_by_id(request_id) {
+            RouterMetrics::set_pending_messages(worker.url(), worker.pending_message_count());
             warn!(
                 worker = worker.url(),
-                generation = gen,
-                message_id = msg_id,
                 request_id = request_id,
                 route = route,
                 status = %dispatch_result.response.status(),
+                removed_request_id = removed.request_id.as_str(),
                 pending_ledger = worker.pending_message_debug_info().compact_string(),
-                "[PENDING_TRACE] router transport failed after pending message creation"
+                "[PENDING_TRACE] removed undelivered pending request after dispatch transport failure"
             );
-        }
-    }
-
-    if !dispatch_result.delivered {
-        if let (Some(msg_id), Some(gen)) = (message_id, generation) {
-            if let Some(reset) = worker.reset_router_epoch_after_transport_failure(gen, msg_id) {
-                RouterMetrics::set_pending_messages(worker.url(), worker.pending_message_count());
-                warn!(
-                    worker = worker.url(),
-                    failed_generation = reset.failed_generation,
-                    failed_message_id = reset.failed_message_id,
-                    new_generation = reset.new_generation,
-                    request_id = request_id,
-                    route = route,
-                    status = %dispatch_result.response.status(),
-                    cleared_pending_count = reset.cleared_count,
-                    cleared_min_id = reset.cleared_min_message_id,
-                    cleared_max_id = reset.cleared_max_message_id,
-                    cleared_message_ids = reset
-                        .cleared_message_ids
-                        .iter()
-                        .map(|id| id.to_string())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    cleared_request_ids = reset.cleared_request_ids.join(","),
-                    "[PENDING_TRACE] reset worker router epoch after dispatch transport failure"
-                );
-            }
         }
     }
 
@@ -418,7 +373,18 @@ async fn send_http_request_impl(
     is_stream: bool,
     load_incremented: bool,
 ) -> DispatchResult {
-    let mut request_builder = if config.dp_aware {
+    let request_id = headers
+        .and_then(|header_map| header_map.get("x-request-id"))
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-");
+    let rid = body_json
+        .get("rid")
+        .and_then(|value| value.as_str())
+        .unwrap_or("-");
+    let arrival_time_ms = body_json
+        .get("arrival_time_ms")
+        .and_then(|value| value.as_f64());
+    let (mut request_builder, request_url) = if config.dp_aware {
         let (worker_url_prefix, dp_rank) =
             match crate::routers::http::router::Router::extract_dp_rank(worker_url) {
                 Ok(parts) => parts,
@@ -456,15 +422,17 @@ async fn send_http_request_impl(
             };
         }
 
-        config
-            .client
-            .post(format!("{}{}", worker_url_prefix, route))
-            .json(&json_val)
+        let request_url = format!("{}{}", worker_url_prefix, route);
+        (
+            config.client.post(&request_url).json(&json_val),
+            request_url,
+        )
     } else {
-        config
-            .client
-            .post(format!("{}{}", worker_url, route))
-            .json(body_json)
+        let request_url = format!("{}{}", worker_url, route);
+        (
+            config.client.post(&request_url).json(body_json),
+            request_url,
+        )
     };
 
     if let Some(headers) = headers {
@@ -474,6 +442,22 @@ async fn send_http_request_impl(
             }
         }
     }
+
+    let http_send_time_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    info!(
+        request_id = request_id,
+        rid = rid,
+        worker = worker_url,
+        url = request_url,
+        route = route,
+        http_send_time_ms = http_send_time_ms,
+        arrival_time_ms = ?arrival_time_ms,
+        is_stream = is_stream,
+        "[ROUTER_HTTP_SEND] sending request to worker over http"
+    );
 
     let res = match request_builder.send().await {
         Ok(res) => res,
@@ -500,6 +484,24 @@ async fn send_http_request_impl(
             };
         }
     };
+
+    let http_headers_recv_time_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    info!(
+        request_id = request_id,
+        rid = rid,
+        worker = worker_url,
+        url = request_url,
+        route = route,
+        http_send_time_ms = http_send_time_ms,
+        http_headers_recv_time_ms = http_headers_recv_time_ms,
+        http_send_to_headers_ms = http_headers_recv_time_ms.saturating_sub(http_send_time_ms),
+        status = %res.status(),
+        is_stream = is_stream,
+        "[ROUTER_HTTP_HEADERS_RECV] received worker response headers"
+    );
 
     let status =
         StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -658,7 +660,7 @@ async fn send_http_request_impl(
 mod tests {
     use super::*;
     use crate::config::types::PolicyConfig;
-    use crate::core::BasicWorkerBuilder;
+    use crate::core::{BasicWorkerBuilder, PendingMessage};
     use crate::policies::PolicyRegistry;
     use reqwest::Client;
     use std::time::Duration;
@@ -697,13 +699,9 @@ mod tests {
             "prompt": "hello",
             "request_id": "req-test"
         });
-        let message_id = worker.next_message_id();
-        let generation = worker.generation();
         worker.add_pending_message(PendingMessage::new(
-            message_id,
-            generation,
             "/generate".to_string(),
-            Some("req-test".to_string()),
+            "req-test".to_string(),
             body.clone(),
             512,
         ));
@@ -727,8 +725,7 @@ mod tests {
             None,
             false,
             worker.clone(),
-            Some(message_id),
-            Some(generation),
+            "req-test",
             0.0,
         )
         .await;
@@ -738,12 +735,10 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR
         );
         assert_eq!(worker.pending_message_count(), 0);
-        assert!(worker.generation() > generation);
-        assert_eq!(worker.next_message_id(), 0);
     }
 
     #[test]
-    fn prepare_request_payload_injects_metadata_and_tracks_pending() {
+    fn prepare_request_payload_keeps_generate_body_pure() {
         let worker: Arc<dyn Worker> =
             Arc::new(BasicWorkerBuilder::new("http://worker:8080").build());
         let body = json!({
@@ -751,32 +746,24 @@ mod tests {
             "request_id": "req-test"
         });
 
-        // Simulate what dispatch_to_worker does: generate ID and add pending message
-        let message_id = worker.next_message_id();
-        let generation = worker.generation();
         worker.add_pending_message(PendingMessage::new(
-            message_id,
-            generation,
             "/generate".to_string(),
-            Some("req-test".to_string()),
+            "req-test".to_string(),
             body.clone(),
             512, // default token count for tests
         ));
 
-        let payload =
-            prepare_request_payload("/generate", &body, Some(message_id), Some(generation), 0.0);
+        let payload = prepare_request_payload("/generate", &body, 0.0);
         let value = payload.as_ref();
 
-        // First message from this worker should have ID 0
         assert_eq!(
-            value.get("router_message_id").and_then(|v| v.as_i64()),
-            Some(0)
+            value.get("request_id").and_then(|v| v.as_str()),
+            Some("req-test")
         );
-        // Should have a valid generation (ROUTER_GENERATION)
-        assert!(value
-            .get("router_generation")
-            .and_then(|v| v.as_i64())
-            .is_some());
+        assert_eq!(
+            value.get("arrival_time_ms").and_then(|v| v.as_f64()),
+            Some(0.0)
+        );
         assert_eq!(worker.pending_message_count(), 1);
     }
 
@@ -790,11 +777,14 @@ mod tests {
         });
 
         // For non-/generate routes, no message ID should be passed
-        let payload = prepare_request_payload("/v1/chat/completions", &body, None, None, 0.0);
+        let payload = prepare_request_payload("/v1/chat/completions", &body, 0.0);
         let value = payload.as_ref();
 
-        assert!(value.get("router_message_id").is_none());
-        assert!(value.get("router_generation").is_none());
+        assert_eq!(
+            value.get("request_id").and_then(|v| v.as_str()),
+            Some("req-test")
+        );
+        assert!(value.get("arrival_time_ms").is_none());
         assert_eq!(worker.pending_message_count(), 0);
     }
 
@@ -804,14 +794,10 @@ mod tests {
             Arc::new(BasicWorkerBuilder::new("http://worker:8080").build());
         let body = serde_json::Value::String("not-an-object".to_string());
 
-        // Even with message_id/generation, non-object bodies should be rejected
-        let message_id = worker.next_message_id();
-        let generation = worker.generation();
-        let payload =
-            prepare_request_payload("/generate", &body, Some(message_id), Some(generation), 0.0);
+        let payload = prepare_request_payload("/generate", &body, 0.0);
         let value = payload.as_ref();
 
-        assert!(value.get("router_message_id").is_none());
+        assert!(value.is_string());
         assert_eq!(worker.pending_message_count(), 0);
     }
 }

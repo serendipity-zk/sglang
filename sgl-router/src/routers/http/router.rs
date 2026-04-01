@@ -475,7 +475,7 @@ impl Router {
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
 
-        let body_json = match serde_json::to_value(typed_req) {
+        let mut body_json = match serde_json::to_value(typed_req) {
             Ok(val) => val,
             Err(err) => {
                 error!(
@@ -489,6 +489,13 @@ impl Router {
                     .into_response();
             }
         };
+
+        if route == "/generate" {
+            if let Some(map) = body_json.as_object_mut() {
+                map.entry("request_id".to_string())
+                    .or_insert_with(|| serde_json::json!(request_id));
+            }
+        }
 
         let model_id_owned = model_id.map(|m| m.to_string());
         let headers_owned = headers.cloned();

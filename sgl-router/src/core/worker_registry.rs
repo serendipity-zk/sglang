@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use url::Url;
 use uuid::Uuid;
 
-const PENDING_MESSAGE_TTL: Duration = Duration::from_secs(60);
+const PENDING_MESSAGE_TTL: Duration = Duration::from_secs(1);
 const PENDING_DIAG_LOG_INTERVAL: Duration = Duration::from_secs(2);
 /// Interval for checking and resending unacknowledged messages (50ms)
 const RESEND_CHECK_INTERVAL_MS: u64 = 50;
@@ -494,7 +494,7 @@ impl WorkerRegistry {
                         // Resend the message
                         resend_message(worker.url(), message).await;
                         // Mark it as resent (increment counter and update timestamp)
-                        worker.mark_resent(message.message_id);
+                        worker.mark_resent(message.request_id.as_str());
                     }
                 }
             }
@@ -507,16 +507,20 @@ impl WorkerRegistry {
     pub fn update_stats(&self, worker_url: &str, stats: WorkerStats) {
         if let Some(worker) = self.get_by_url(worker_url) {
             let pending_before = worker.pending_message_debug_info();
-            let ack_gen = stats.router_generation;
-            let ack_last_id = stats.last_received_message_id;
+            let accepted_request_ids = stats.accepted_request_ids.clone().unwrap_or_default();
+            let accepted_request_count = accepted_request_ids.len();
+            let accepted_request_sample = accepted_request_ids
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",");
             let mut removed_count = 0usize;
             let mut removed_messages = Vec::new();
 
-            if let (Some(generation), Some(last_id)) =
-                (stats.router_generation, stats.last_received_message_id)
-            {
+            if !accepted_request_ids.is_empty() {
                 let now = Instant::now();
-                let removed = worker.remove_messages_up_to(generation, last_id);
+                let removed = worker.remove_pending_requests_by_id(&accepted_request_ids);
                 removed_count = removed.len();
                 for message in removed.iter() {
                     let latency = now.saturating_duration_since(message.timestamp);
@@ -531,18 +535,10 @@ impl WorkerRegistry {
             let is_idle_from_stats = stats.num_requests == 0 && stats.waiting_queue_size == 0;
 
             if removed_count > 0 && pending_after.count == 0 {
-                let removed_min_id = removed_messages.first().map(|msg| msg.message_id);
-                let removed_max_id = removed_messages.last().map(|msg| msg.message_id);
-                let removed_message_ids = removed_messages
-                    .iter()
-                    .take(5)
-                    .map(|msg| msg.message_id.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
                 let removed_request_ids = removed_messages
                     .iter()
-                    .filter_map(|msg| msg.request_id.as_deref())
-                    .take(3)
+                    .map(|msg| msg.request_id.as_str())
+                    .take(5)
                     .collect::<Vec<_>>()
                     .join(",");
 
@@ -552,12 +548,9 @@ impl WorkerRegistry {
                     num_requests = stats.num_requests,
                     waiting_queue = stats.waiting_queue_size,
                     batch_tokens = stats.batch_size_tokens,
-                    ack_generation = ack_gen,
-                    ack_last_id = ack_last_id,
+                    accepted_request_count = accepted_request_count,
+                    accepted_request_sample = accepted_request_sample.as_str(),
                     removed = removed_count,
-                    removed_min_id = removed_min_id,
-                    removed_max_id = removed_max_id,
-                    removed_message_ids = removed_message_ids,
                     removed_request_ids = removed_request_ids,
                     pending_before = pending_before.compact_string(),
                     pending_after = pending_after.compact_string(),
@@ -567,8 +560,7 @@ impl WorkerRegistry {
 
             if pending_before.count > 0
                 && removed_count == 0
-                && ack_gen.is_some()
-                && ack_last_id.is_some()
+                && accepted_request_count > 0
                 && self.should_log_pending_diag(worker.url(), "ack_no_progress")
             {
                 tracing::warn!(
@@ -577,16 +569,16 @@ impl WorkerRegistry {
                     num_requests = stats.num_requests,
                     waiting_queue = stats.waiting_queue_size,
                     batch_tokens = stats.batch_size_tokens,
-                    ack_generation = ack_gen,
-                    ack_last_id = ack_last_id,
+                    accepted_request_count = accepted_request_count,
+                    accepted_request_sample = accepted_request_sample.as_str(),
                     pending_before = pending_before.compact_string(),
                     pending_after = pending_after.compact_string(),
-                    "[ACK_NO_PROGRESS] Worker stats carried an ack but router pending ledger did not advance"
+                    "[ACK_NO_PROGRESS] Worker stats carried accepted_request_ids but router pending ledger did not advance"
                 );
             }
 
             if pending_after.count > 0
-                && (ack_gen.is_none() || ack_last_id.is_none())
+                && accepted_request_count == 0
                 && self.should_log_pending_diag(worker.url(), "ack_missing")
             {
                 tracing::warn!(
@@ -595,10 +587,9 @@ impl WorkerRegistry {
                     num_requests = stats.num_requests,
                     waiting_queue = stats.waiting_queue_size,
                     batch_tokens = stats.batch_size_tokens,
-                    ack_generation = ack_gen,
-                    ack_last_id = ack_last_id,
+                    accepted_request_count = accepted_request_count,
                     pending = pending_after.compact_string(),
-                    "[ACK_MISSING] Worker still has router pending messages but sidecar stats did not include a usable ack"
+                    "[ACK_MISSING] Worker still has router pending messages but sidecar stats did not include accepted_request_ids"
                 );
             }
 
@@ -611,8 +602,8 @@ impl WorkerRegistry {
                     iter = stats.iteration_num,
                     forward_mode = stats.forward_mode.as_str(),
                     batch_tokens = stats.batch_size_tokens,
-                    ack_generation = ack_gen,
-                    ack_last_id = ack_last_id,
+                    accepted_request_count = accepted_request_count,
+                    accepted_request_sample = accepted_request_sample.as_str(),
                     pending = pending_after.compact_string(),
                     "[PENDING_STALL] Worker stats are idle (num_requests=0, waiting_queue=0) but router pending ledger is still non-empty"
                 );
@@ -773,8 +764,6 @@ mod tests {
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
-    const TEST_GENERATION: i64 = 1234567890;
-
     #[test]
     fn test_worker_registry() {
         let registry = WorkerRegistry::new();
@@ -786,7 +775,7 @@ mod tests {
         labels.insert("cost".to_string(), "0.8".to_string());
 
         let worker: Box<dyn Worker> = Box::new(
-            BasicWorkerBuilder::new_with_generation("http://worker1:8080", TEST_GENERATION)
+            BasicWorkerBuilder::new("http://worker1:8080")
                 .worker_type(WorkerType::Regular)
                 .labels(labels)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
@@ -822,7 +811,7 @@ mod tests {
         let mut labels1 = HashMap::new();
         labels1.insert("model_id".to_string(), "llama-3".to_string());
         let worker1: Box<dyn Worker> = Box::new(
-            BasicWorkerBuilder::new_with_generation("http://worker1:8080", TEST_GENERATION)
+            BasicWorkerBuilder::new("http://worker1:8080")
                 .worker_type(WorkerType::Regular)
                 .labels(labels1)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
@@ -833,7 +822,7 @@ mod tests {
         let mut labels2 = HashMap::new();
         labels2.insert("model_id".to_string(), "llama-3".to_string());
         let worker2: Box<dyn Worker> = Box::new(
-            BasicWorkerBuilder::new_with_generation("http://worker2:8080", TEST_GENERATION)
+            BasicWorkerBuilder::new("http://worker2:8080")
                 .worker_type(WorkerType::Regular)
                 .labels(labels2)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
@@ -844,7 +833,7 @@ mod tests {
         let mut labels3 = HashMap::new();
         labels3.insert("model_id".to_string(), "gpt-4".to_string());
         let worker3: Box<dyn Worker> = Box::new(
-            BasicWorkerBuilder::new_with_generation("http://worker3:8080", TEST_GENERATION)
+            BasicWorkerBuilder::new("http://worker3:8080")
                 .worker_type(WorkerType::Regular)
                 .labels(labels3)
                 .circuit_breaker_config(CircuitBreakerConfig::default())
@@ -888,7 +877,7 @@ mod tests {
     fn test_resolve_worker_url_basic_identifier() {
         let registry = WorkerRegistry::new();
         let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new_with_generation("http://worker-basic:8080", TEST_GENERATION)
+            BasicWorkerBuilder::new("http://worker-basic:8080")
                 .worker_type(WorkerType::Regular)
                 .build(),
         );
@@ -908,15 +897,8 @@ mod tests {
     #[test]
     fn test_resolve_worker_url_dp_identifier() {
         let registry = WorkerRegistry::new();
-        let worker: Arc<dyn Worker> = Arc::new(
-            DPAwareWorkerBuilder::new_with_generation(
-                "http://worker-dp:9090",
-                TEST_GENERATION,
-                1,
-                2,
-            )
-            .build(),
-        );
+        let worker: Arc<dyn Worker> =
+            Arc::new(DPAwareWorkerBuilder::new("http://worker-dp:9090", 1, 2).build());
         registry.register(worker);
 
         let resolved = registry
@@ -932,17 +914,15 @@ mod tests {
     fn test_update_stats_clears_acknowledged_messages() {
         let registry = WorkerRegistry::new();
         let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new_with_generation("http://worker-ack:8080", TEST_GENERATION)
+            BasicWorkerBuilder::new("http://worker-ack:8080")
                 .worker_type(WorkerType::Regular)
                 .build(),
         );
         registry.register(worker.clone());
 
         let pending = PendingMessage::new(
-            1,
-            99,
             "/generate",
-            Some("req-1".into()),
+            "req-1",
             serde_json::json!({"test": true}),
             512, // default token count for tests
         );
@@ -958,11 +938,50 @@ mod tests {
             waiting_queue_info: None,
             forward_mode: "UNKNOWN".to_string(),
             iteration_num: 0,
+            worker_iteration_id: None,
+            report_send_time_ms: None,
             last_iteration_time_ms: None,
             prefill_chunk_pairs: None,
             prefill_sim_metrics: None,
-            router_generation: Some(99),
-            last_received_message_id: Some(1),
+            accepted_request_ids: Some(vec!["req-1".to_string()]),
+            batch_size_by_tpot_tier: None,
+            timestamp: Instant::now(),
+        };
+
+        registry.update_stats(worker.url(), stats);
+        assert_eq!(worker.pending_message_count(), 0);
+    }
+
+    #[test]
+    fn test_update_stats_clears_acknowledged_messages_with_parallel_sample_suffix() {
+        let registry = WorkerRegistry::new();
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker-ack-batch:8080")
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        registry.register(worker.clone());
+
+        let pending =
+            PendingMessage::new("/generate", "req-1", serde_json::json!({"test": true}), 512);
+        worker.add_pending_message(pending);
+        assert_eq!(worker.pending_message_count(), 1);
+
+        let stats = WorkerStats {
+            worker_id: worker.url().to_string(),
+            batch_size_tokens: 0,
+            kv_tokens_used: Some(0),
+            num_requests: 0,
+            waiting_queue_size: 0,
+            waiting_queue_info: None,
+            forward_mode: "UNKNOWN".to_string(),
+            iteration_num: 0,
+            worker_iteration_id: None,
+            report_send_time_ms: None,
+            last_iteration_time_ms: None,
+            prefill_chunk_pairs: None,
+            prefill_sim_metrics: None,
+            accepted_request_ids: Some(vec!["req-1_0".to_string()]),
             batch_size_by_tpot_tier: None,
             timestamp: Instant::now(),
         };
@@ -975,25 +994,23 @@ mod tests {
     fn test_cleanup_pending_messages_removes_stale_entries() {
         let registry = WorkerRegistry::new();
         let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new_with_generation("http://worker-ttl:8080", TEST_GENERATION)
+            BasicWorkerBuilder::new("http://worker-ttl:8080")
                 .worker_type(WorkerType::Regular)
                 .build(),
         );
         registry.register(worker.clone());
 
         let mut pending = PendingMessage::new(
-            1,
-            77,
             "/generate",
-            None,
+            "req-stale".to_string(),
             serde_json::json!({"test": true}),
             512, // default token count for tests
         );
-        pending.timestamp = Instant::now() - Duration::from_secs(120);
+        pending.timestamp = Instant::now() - Duration::from_secs(2);
         worker.add_pending_message(pending);
         assert_eq!(worker.pending_message_count(), 1);
 
-        worker.cleanup_pending_messages(Duration::from_secs(60));
+        worker.cleanup_pending_messages(Duration::from_secs(1));
         assert_eq!(worker.pending_message_count(), 0);
     }
 }
