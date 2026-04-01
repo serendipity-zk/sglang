@@ -620,7 +620,7 @@ mod tests {
             tool_parser_registry: None,     // HTTP mode doesn't need tool parser
             router_manager: None,           // Test doesn't need router manager
             response_storage: Arc::new(crate::data_connector::MemoryResponseStorage::new()),
-            shadow_stats_logger: None,      // Service discovery doesn't use shadow mode
+            shadow_stats_logger: None, // Service discovery doesn't use shadow mode
         });
 
         let router = Router::new(&app_context).await.unwrap();

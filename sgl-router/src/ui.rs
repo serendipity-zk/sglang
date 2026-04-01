@@ -272,9 +272,12 @@ impl RouterUi {
         // Try to get SLO scheduler's tier order
         if let Some(scheduler) = app_state.context.scheduler_registry.try_get_scheduler() {
             if scheduler.name() == "slo_aware" {
-                if let Some(slo_scheduler) = scheduler.as_any().downcast_ref::<SloAwareScheduler>() {
+                if let Some(slo_scheduler) = scheduler.as_any().downcast_ref::<SloAwareScheduler>()
+                {
                     // Get all tiers in order
-                    let mut tier_indices: Vec<usize> = slo_scheduler.tier_workers.iter()
+                    let mut tier_indices: Vec<usize> = slo_scheduler
+                        .tier_workers
+                        .iter()
                         .map(|entry| *entry.key())
                         .collect();
                     tier_indices.sort();
@@ -283,12 +286,14 @@ impl RouterUi {
                     for tier_idx in tier_indices {
                         if let Some(worker_ids) = slo_scheduler.tier_workers.get(&tier_idx) {
                             for (position, worker_id) in worker_ids.iter().enumerate() {
-                                if let Some(worker) = app_state.context.worker_registry.get(worker_id) {
+                                if let Some(worker) =
+                                    app_state.context.worker_registry.get(worker_id)
+                                {
                                     let letter = (b'A' + (global_idx % 26)) as char;
                                     let port = Self::extract_port(worker.url());
                                     worker_id_map.insert(
                                         worker.url().to_string(),
-                                        (format!("{}({})", letter, port), position)
+                                        (format!("{}({})", letter, port), position),
                                     );
                                     global_idx += 1;
                                 }
@@ -301,7 +306,10 @@ impl RouterUi {
         }
 
         // Fallback: alphabetical order for non-SLO schedulers
-        let mut worker_urls: Vec<String> = app_state.context.worker_registry.get_all_stats()
+        let mut worker_urls: Vec<String> = app_state
+            .context
+            .worker_registry
+            .get_all_stats()
             .keys()
             .cloned()
             .collect();
@@ -358,7 +366,9 @@ impl RouterUi {
                             // Find nearest numeric key within 0.8x-1.2x range
                             let mut nearest: Option<(f64, i64)> = None;
                             for (k, &v) in tier_map.iter() {
-                                if k == "none" { continue; }
+                                if k == "none" {
+                                    continue;
+                                }
                                 if let Ok(k_val) = k.parse::<f64>() {
                                     let ratio = k_val / tpot as f64;
                                     // Only consider if within 0.8x-1.2x range (20% tolerance)
@@ -400,7 +410,14 @@ impl RouterUi {
                 };
                 format!(
                     "{:<10} {}  B:{:<4} T:{:<7} KV:{:<7} P:{}  {}  {}",
-                    worker_id, boundary_str, batch_size, tokens, kv_tokens, prefill_str, last_iter_str, tier_counts_str
+                    worker_id,
+                    boundary_str,
+                    batch_size,
+                    tokens,
+                    kv_tokens,
+                    prefill_str,
+                    last_iter_str,
+                    tier_counts_str
                 )
             }
             None => {
@@ -454,15 +471,18 @@ impl RouterUi {
             if let Some(slo_queue_info) = Self::get_slo_queue_info(app_state) {
                 let _ = writeln!(handle, "");
                 let _ = writeln!(handle, "Per-SLO Queue States:");
-                let num_slo_tiers = slo_queue_info.iter()
+                let num_slo_tiers = slo_queue_info
+                    .iter()
                     .filter(|(_, boundary, _)| boundary.is_some())
                     .count();
 
                 // Collect all SLO boundaries for range calculation
-                let mut slo_boundaries: Vec<f32> = slo_queue_info.iter()
+                let mut slo_boundaries: Vec<f32> = slo_queue_info
+                    .iter()
                     .filter_map(|(_, boundary, _)| *boundary)
                     .collect();
-                slo_boundaries.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                slo_boundaries
+                    .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
                 for (tier_idx, boundary, queue_size) in &slo_queue_info {
                     if let Some(ms) = boundary {
@@ -471,14 +491,29 @@ impl RouterUi {
                             format!("≤{:.1} ms", ms)
                         } else {
                             // Find previous boundary by position in sorted list
-                            let pos = slo_boundaries.iter().position(|&b| (b - ms).abs() < 0.01).unwrap_or(0);
-                            let prev_boundary = if pos > 0 { slo_boundaries[pos - 1] } else { 0.0 };
+                            let pos = slo_boundaries
+                                .iter()
+                                .position(|&b| (b - ms).abs() < 0.01)
+                                .unwrap_or(0);
+                            let prev_boundary = if pos > 0 {
+                                slo_boundaries[pos - 1]
+                            } else {
+                                0.0
+                            };
                             format!(">{:.1} ms, ≤{:.1} ms", prev_boundary, ms)
                         };
-                        let _ = writeln!(handle, "  Queue {} ({}): {} requests", tier_idx, range_desc, queue_size);
+                        let _ = writeln!(
+                            handle,
+                            "  Queue {} ({}): {} requests",
+                            tier_idx, range_desc, queue_size
+                        );
                     } else if *tier_idx == num_slo_tiers {
                         // Idle tier
-                        let _ = writeln!(handle, "  Queue {} (idle/autoscaling): {} requests", tier_idx, queue_size);
+                        let _ = writeln!(
+                            handle,
+                            "  Queue {} (idle/autoscaling): {} requests",
+                            tier_idx, queue_size
+                        );
                     }
                 }
                 let _ = writeln!(handle, "");
@@ -517,12 +552,16 @@ impl RouterUi {
         let (worker_to_tier, tpot_buckets): (HashMap<String, usize>, Option<Vec<f32>>) =
             if let Some(scheduler) = app_state.context.scheduler_registry.try_get_scheduler() {
                 if scheduler.name() == "slo_aware" {
-                    if let Some(slo_scheduler) = scheduler.as_any().downcast_ref::<SloAwareScheduler>() {
+                    if let Some(slo_scheduler) =
+                        scheduler.as_any().downcast_ref::<SloAwareScheduler>()
+                    {
                         let mut map = HashMap::new();
                         for tier_entry in slo_scheduler.tier_workers.iter() {
                             let tier_idx = *tier_entry.key();
                             for worker_id in tier_entry.value() {
-                                if let Some(worker) = app_state.context.worker_registry.get(worker_id) {
+                                if let Some(worker) =
+                                    app_state.context.worker_registry.get(worker_id)
+                                {
                                     map.insert(worker.url().to_string(), tier_idx);
                                 }
                             }
@@ -541,17 +580,23 @@ impl RouterUi {
         // Build rows with formatted metrics and sorting keys
         let mut rows: Vec<(String, usize, usize)> = Vec::new(); // (metrics_str, tier_index, tier_position)
         for (worker_url, stats) in worker_stats.iter() {
-            let (worker_id, tier_position) = worker_id_map.get(worker_url)
+            let (worker_id, tier_position) = worker_id_map
+                .get(worker_url)
                 .map(|(id, pos)| (id.as_str(), *pos))
                 .unwrap_or(("?", usize::MAX));
-            let tpot_boundary = tier_map.as_ref().and_then(|map| map.get(worker_url).copied());
+            let tpot_boundary = tier_map
+                .as_ref()
+                .and_then(|map| map.get(worker_url).copied());
             let metrics_str = Self::format_worker_metrics(
                 worker_id,
                 stats,
                 tpot_boundary,
                 tpot_buckets.as_deref(),
             );
-            let tier_idx = worker_to_tier.get(worker_url).copied().unwrap_or(usize::MAX); // Unknown tier goes last
+            let tier_idx = worker_to_tier
+                .get(worker_url)
+                .copied()
+                .unwrap_or(usize::MAX); // Unknown tier goes last
             rows.push((metrics_str, tier_idx, tier_position));
         }
 

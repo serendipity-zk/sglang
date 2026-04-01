@@ -179,12 +179,13 @@ impl Router {
         let scheduler = match &self.scheduler_config {
             Some(json_str) => {
                 // Parse the entire SchedulerConfig from JSON
-                serde_json::from_str::<config::SchedulerConfig>(json_str)
-                    .map_err(|e| config::ConfigError::InvalidValue {
+                serde_json::from_str::<config::SchedulerConfig>(json_str).map_err(|e| {
+                    config::ConfigError::InvalidValue {
                         field: "scheduler_config".to_string(),
                         value: json_str.clone(),
                         reason: format!("Failed to parse scheduler config JSON: {}", e),
-                    })?
+                    }
+                })?
             }
             None => {
                 // Default to eager scheduler if no config provided
@@ -267,7 +268,10 @@ impl Router {
             tokenizer_path: self.tokenizer_path.clone(),
             history_backend: config::HistoryBackend::Memory,
             sidecar_urls: self.sidecar_urls.clone(),
-            stats_mode: self.stats_mode.clone().unwrap_or_else(|| "internal".to_string()),
+            stats_mode: self
+                .stats_mode
+                .clone()
+                .unwrap_or_else(|| "internal".to_string()),
         })
     }
 }

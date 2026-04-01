@@ -102,8 +102,8 @@ pub fn init_logging(config: LoggingConfig) -> LogGuard {
     // Setup stdout/stderr layer
     let mut layers = Vec::new();
 
-    // Standard timestamp format: YYYY-MM-DD HH:MM:SS
-    let time_format = "%Y-%m-%d %H:%M:%S".to_string();
+    // Standard timestamp format with milliseconds: YYYY-MM-DD HH:MM:SS.mmm
+    let time_format = "%Y-%m-%d %H:%M:%S%.3f".to_string();
 
     if config.enable_stdout {
         // Configure the console stdout layer
@@ -138,7 +138,12 @@ pub fn init_logging(config: LoggingConfig) -> LogGuard {
             }
         }
 
-        match OpenOptions::new().create(true).write(true).truncate(true).open(&path_buf) {
+        match OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path_buf)
+        {
             Ok(file) => {
                 let (non_blocking, guard) = tracing_appender::non_blocking(file);
                 file_guard = Some(guard);

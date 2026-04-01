@@ -155,7 +155,10 @@ impl AppContext {
         let shadow_stats_logger = if stats_mode == "shadow" || stats_mode == "shadow-sidecar" {
             let log_dir = router_config.log_dir.as_deref().unwrap_or(".");
             let path = format!("{}/shadow_stats.jsonl", log_dir);
-            info!("Shadow mode: logging engine/sidecar stats comparison to {}", path);
+            info!(
+                "Shadow mode: logging engine/sidecar stats comparison to {}",
+                path
+            );
             Some(Arc::new(ShadowStatsLogger::new(&path)?))
         } else {
             None
@@ -245,7 +248,10 @@ async fn v1_chat_completions(
     headers: http::HeaderMap,
     Json(body): Json<ChatCompletionRequest>,
 ) -> Response {
-    state.router.route_chat(Some(&headers), &body, None, &request_id.0).await
+    state
+        .router
+        .route_chat(Some(&headers), &body, None, &request_id.0)
+        .await
 }
 
 async fn v1_completions(
@@ -266,7 +272,10 @@ async fn rerank(
     headers: http::HeaderMap,
     Json(body): Json<RerankRequest>,
 ) -> Response {
-    state.router.route_rerank(Some(&headers), &body, None, &request_id.0).await
+    state
+        .router
+        .route_rerank(Some(&headers), &body, None, &request_id.0)
+        .await
 }
 
 async fn v1_rerank(
@@ -417,9 +426,7 @@ fn shadow_log_stats(
     let registry_stats = state.context.worker_registry.get_stats(&worker_url);
 
     // Serialize full WorkerStats (timestamp field is #[serde(skip)], all others included)
-    let stats_to_json = |s: &crate::core::WorkerStats| {
-        serde_json::to_value(s).unwrap_or_default()
-    };
+    let stats_to_json = |s: &crate::core::WorkerStats| serde_json::to_value(s).unwrap_or_default();
 
     let (engine_json, sidecar_json) = if logged_source == "sidecar" {
         // shadow mode: logged=sidecar (param), authoritative=engine (registry)
@@ -454,7 +461,8 @@ async fn worker_stats(
     Json(stats): Json<serde_json::Value>,
 ) -> Response {
     // Parse stats_source BEFORE constructing WorkerStats (not stored in WorkerStats struct)
-    let stats_source = stats.get("stats_source")
+    let stats_source = stats
+        .get("stats_source")
         .and_then(|v| v.as_str())
         .unwrap_or("engine");
 
