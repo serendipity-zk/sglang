@@ -682,6 +682,85 @@ class TestSchedulerSidecarIntegration(unittest.TestCase):
             ],
         )
 
+    def test_event_loop_overlap_keeps_finished_snapshot_aligned_with_batch(self):
+        class Batch:
+            def __init__(self, name):
+                self.name = name
+                self.reqs = [object()]
+
+            def copy(self):
+                return self
+
+        batch_a = Batch("batch-a")
+        batch_b = Batch("batch-b")
+        scheduler = SimpleNamespace()
+        scheduler._engine_paused = False
+        scheduler.slo_client = object()
+        scheduler.is_generation = False
+        scheduler.iteration_count = 0
+        scheduler._pre_batch_kv_used = 0
+        scheduler._prev_pre_batch_kv_used = 0
+        scheduler.last_batch = None
+        scheduler.cur_batch = None
+        scheduler.recv_index = 0
+        scheduler.batch_index = 0
+        scheduler.snapshot_by_iter = {}
+        scheduler.finished_pairs = []
+
+        def recv_requests():
+            scheduler.recv_index += 1
+            if scheduler.recv_index <= 3:
+                return []
+            raise StopIteration()
+
+        def get_next_batch_to_run():
+            scheduler.batch_index += 1
+            if scheduler.batch_index == 1:
+                return batch_a
+            if scheduler.batch_index == 2:
+                return batch_b
+            return None
+
+        scheduler.recv_requests = recv_requests
+        scheduler.process_input_requests = lambda recv_reqs: None
+        scheduler.get_next_batch_to_run = get_next_batch_to_run
+        scheduler.is_disable_overlap_for_batch = lambda batch_obj: False
+        scheduler._get_token_info = lambda: (17, 0.0, 0, 0)
+        scheduler.run_batch = lambda b: b.name
+        scheduler.process_batch_result = lambda b, r: None
+        scheduler._record_sidecar_batch_launch = lambda: None
+        scheduler._drain_current_snapshot = (
+            lambda b, it: scheduler.snapshot_by_iter.__setitem__(it, b.name)
+        )
+        scheduler._drain_finished_iteration = (
+            lambda b, elapsed, kv, launch, launch_fwd=None: scheduler.finished_pairs.append(
+                (
+                    scheduler.iteration_count,
+                    b.name,
+                    scheduler.snapshot_by_iter.pop(scheduler.iteration_count, None),
+                )
+            )
+        )
+        scheduler.cancel_bubble_timer = lambda: None
+        scheduler.self_check_during_idle = lambda: None
+        scheduler.launch_batch_sample_if_needed = lambda batch_result: None
+        scheduler.self_check_during_busy = lambda: None
+
+        with patch(
+            "sglang.srt.managers.scheduler.envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get",
+            return_value=False,
+        ):
+            with self.assertRaises(StopIteration):
+                Scheduler.event_loop_overlap(scheduler)
+
+        self.assertEqual(
+            scheduler.finished_pairs,
+            [
+                (1, "batch-a", "batch-a"),
+                (2, "batch-b", "batch-b"),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

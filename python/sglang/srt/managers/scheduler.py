@@ -1428,7 +1428,10 @@ class Scheduler(
                 )
                 if SchedulerSidecarMixin._sidecar_owner_on_rank(self):
                     current_snapshot_start = time.perf_counter()
-                    self._drain_current_snapshot(batch, self.iteration_count + 1)
+                    pending_finished_iteration = self.iteration_count + len(
+                        self.result_queue
+                    )
+                    self._drain_current_snapshot(batch, pending_finished_iteration)
                     SchedulerSidecarMixin._record_cpu_phase_time(
                         self,
                         "current",
