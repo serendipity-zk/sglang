@@ -30,6 +30,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
+from sglang.srt.observability.prefill_record import PrefillRecordWriter
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.device_timer import DeviceTimer, GapTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
@@ -112,6 +113,15 @@ class SchedulerMetricsMixin:
         self.kv_transfer_latency_ms: float = 0.0
 
         self.stats = SchedulerStats()
+        self.prefill_record_writer = PrefillRecordWriter.from_env(
+            tp_rank=self.tp_rank,
+            attn_tp_rank=self.attn_tp_rank,
+            attn_tp_size=self.attn_tp_size,
+            attn_dp_rank=self.attn_dp_rank,
+            attn_cp_rank=self.attn_cp_rank,
+            moe_ep_rank=self.moe_ep_rank,
+            dp_rank=self.dp_rank,
+        )
 
         # Metrics
         self.enable_mfu_metrics = False
@@ -328,6 +338,10 @@ class SchedulerMetricsMixin:
         prefill_stats: PrefillStats,
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
+        request_ids: Optional[List[str]] = None,
+        total_input_lens: Optional[List[int]] = None,
+        remaining_input_lens: Optional[List[int]] = None,
+        chunk_input_lens: Optional[List[int]] = None,
     ):
         if (
             not self.is_stats_logging_rank
@@ -422,6 +436,38 @@ class SchedulerMetricsMixin:
 
         if self.is_stats_logging_rank:
             logger.info(msg)
+
+        if self.prefill_record_writer is not None:
+            self.prefill_record_writer.write(
+                {
+                    "forward_iter": self.forward_ct + 1,
+                    "request_ids": request_ids or [],
+                    "total_input_lens": total_input_lens or [],
+                    "remaining_input_lens": remaining_input_lens or [],
+                    "chunk_input_lens": chunk_input_lens or [],
+                    "tp_rank": self.tp_rank,
+                    "attn_tp_rank": self.attn_tp_rank,
+                    "attn_tp_size": self.attn_tp_size,
+                    "attn_cp_rank": self.attn_cp_rank,
+                    "attn_dp_rank": self.attn_dp_rank,
+                    "dp_rank": self.dp_rank,
+                    "moe_ep_rank": self.moe_ep_rank,
+                    "head_parallel_group": self.tp_rank // max(1, self.attn_tp_size),
+                    "new_seqs": prefill_stats.num_new_seqs,
+                    "new_tokens": prefill_stats.log_input_tokens,
+                    "cached_tokens": prefill_stats.log_hit_tokens,
+                    "running_reqs": prefill_stats.num_running_reqs.total,
+                    "queue_reqs": len(self.waiting_queue),
+                    "new_token_ratio": prefill_stats.new_token_ratio,
+                    "token_usage": token_usage,
+                    "full_token_usage": full_token_usage,
+                    "input_throughput": self.last_input_throughput,
+                    "cuda_graph_enabled": can_run_cuda_graph,
+                    "device": self.device,
+                    "disaggregation_mode": self.disaggregation_mode.value,
+                    "elapsed_since_last_prefill": gap_latency,
+                }
+            )
 
         if self.current_scheduler_metrics_enabled:
             self.metrics_collector.increment_prefill_cuda_graph_pass(

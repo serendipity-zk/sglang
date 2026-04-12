@@ -329,6 +329,13 @@ class SchedulerOutputProcessorMixin:
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
+            request_ids=[req.rid for req in batch.reqs],
+            total_input_lens=[len(req.origin_input_ids) for req in batch.reqs],
+            remaining_input_lens=[
+                max(0, len(req.origin_input_ids) - len(req.prefix_indices))
+                for req in batch.reqs
+            ],
+            chunk_input_lens=[req.extend_input_len for req in batch.reqs],
         )
 
     def _resolve_spec_overlap_token_ids(
