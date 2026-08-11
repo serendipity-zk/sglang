@@ -286,6 +286,18 @@ class Envs:
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
 
+    # VibeSim alignment records. Off in production: the iteration record is one
+    # log line per forward pass, which is only wanted while a run is being
+    # compared against a simulation of the same workload.
+    SGLANG_ENABLE_VIBESIM_ALIGNMENT = EnvBool(False)
+    # Bulk dumps, each to its own JSONL file. Separate from the flag above
+    # because a single iteration's token IDs or per-layer expert histograms are
+    # far too large for the log. Unset = off.
+    SGLANG_VIBESIM_TOKEN_TRACE_PATH = EnvStr(None)
+    SGLANG_VIBESIM_TOKEN_TRACE_ITERS = EnvStr("")
+    SGLANG_VIBESIM_ROUTING_TRACE_PATH = EnvStr(None)
+    SGLANG_VIBESIM_ROUTING_TRACE_ITERS = EnvStr("")
+
     # IPC
     SGLANG_USE_PICKLE_IPC = EnvBool(True)
     # Log top-level PickleWrapper frames unwrapped on msgpack IPC decode.

@@ -267,6 +267,7 @@ from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_c
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.observability import vibesim_alignment
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
@@ -3621,6 +3622,16 @@ class Scheduler(
         batch.after_idle_gap = self._sched_idled
         self._sched_idled = False
 
+        if vibesim_alignment.is_enabled():
+            # Before the forward: the decode path advances seq_lens in place.
+            batch.vibesim_geometry = vibesim_alignment.capture_iteration_geometry(
+                launch_monotonic_ns=time.monotonic_ns(),
+                is_extend=batch.forward_mode.is_extend(),
+                prefix_lens=batch.prefix_lens,
+                extend_lens=batch.extend_lens,
+                seq_lens=batch.seq_lens,
+            )
+
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
 
@@ -3897,6 +3908,7 @@ class Scheduler(
             batch_result.logits_output.next_token_logits = None
 
     @scheduler_nvtx_method("scheduler.process_batch_result")
+    @vibesim_alignment.iteration_profile_method("process_batch_result")
     def process_batch_result(
         self,
         batch: ScheduleBatch,
@@ -3928,6 +3940,13 @@ class Scheduler(
         # Emit forward pass metrics (every iteration when enabled)
         if self.enable_fpm:
             self.metrics_reporter._emit_forward_pass_metrics(batch, result)
+
+        if batch.vibesim_geometry is not None:
+            vibesim_alignment.emit_iteration_from_geometry(
+                iteration_index=batch.forward_iter,
+                geometry=batch.vibesim_geometry,
+                observed_end_monotonic_ns=time.monotonic_ns(),
+            )
 
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()

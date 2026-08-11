@@ -32,6 +32,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_required_capture_hidden_mode,
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.observability import vibesim_alignment
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -71,6 +72,26 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def _emit_vibesim_request_timing(req: Req) -> None:
+    """Report one finished request's scheduler-side latency split.
+
+    Called beside every `set_completion_time()` rather than from inside it: the
+    stats object holds the timestamps but not the request id, and the id is what
+    joins this row to the API server's own record for the same request.
+    """
+    if not vibesim_alignment.is_enabled():
+        return
+    stats = req.time_stats
+    vibesim_alignment.emit_request_timing_record(
+        request_id=req.rid,
+        queued_monotonic=stats.wait_queue_entry_time,
+        scheduled_monotonic=stats.forward_entry_time,
+        first_token_monotonic=stats.prefill_finished_time,
+        last_token_monotonic=stats.completion_time,
+        num_output_tokens=len(req.output_ids),
+    )
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -276,6 +297,7 @@ class SchedulerBatchResultProcessor:
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
+                        _emit_vibesim_request_timing(req)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if get_memory().enable_hisparse:
@@ -355,6 +377,7 @@ class SchedulerBatchResultProcessor:
                     if req.finished():
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
+                        _emit_vibesim_request_timing(req)
                     else:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                 else:
@@ -1080,6 +1103,7 @@ class SchedulerBatchResultProcessor:
                 release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
             req.time_stats.set_completion_time()
+            _emit_vibesim_request_timing(req)
 
         self._maybe_collect_customized_info(i, req, logits_output)
 

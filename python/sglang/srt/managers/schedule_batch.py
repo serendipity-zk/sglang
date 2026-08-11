@@ -123,6 +123,7 @@ from sglang.srt.observability.req_time_stats import (
     DPControllerReqTimeStats,
     SchedulerReqTimeStats,
 )
+from sglang.srt.observability.vibesim_alignment import IterationGeometry
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -2046,6 +2047,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     forward_iter: Optional[int] = None
     launch_ts: Optional[float] = None
     after_idle_gap: bool = False
+    # Batch shape snapshotted at dispatch for the VibeSim alignment iteration
+    # record; None whenever that instrumentation is off. Held on the batch
+    # rather than the scheduler because overlap mode dispatches the next batch
+    # before the previous one's result is processed.
+    vibesim_geometry: Optional[IterationGeometry] = None
 
     # === GPU tensors crossing to ForwardBatch (clone targets for stream isolation) ===
     # Batched arguments to model runner

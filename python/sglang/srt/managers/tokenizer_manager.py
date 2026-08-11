@@ -105,6 +105,7 @@ from sglang.srt.managers.utils import (
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.observability import vibesim_alignment
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_TOKENIZER,
@@ -2417,6 +2418,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
                 state.time_stats.set_finished_time()
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
+                self._maybe_emit_vibesim_api_timing(rid, state, recv_obj, i)
 
                 if self.server_args.speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
@@ -2721,6 +2723,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 ret.append(None)
         return ret
+
+    def _maybe_emit_vibesim_api_timing(
+        self, rid: str, state, recv_obj, index: int
+    ) -> None:
+        """Report the API-server span for one finished request.
+
+        The scheduler emits its own record for the same rid. Keeping the two
+        separate is the point: they are stamped in different processes, so this
+        one never subtracts a scheduler timestamp, and the report stacks them by
+        rid instead of by clock.
+        """
+        if not vibesim_alignment.is_enabled():
+            return
+        stats = state.time_stats
+        completion_tokens = (
+            recv_obj.completion_tokens[index]
+            if not isinstance(recv_obj, BatchEmbeddingOutput)
+            else 0
+        )
+        vibesim_alignment.emit_api_request_timing_record(
+            request_id=rid,
+            created_monotonic=stats.created_time,
+            tokenize_finish_monotonic=stats.tokenize_finish_time,
+            dispatch_monotonic=stats.api_server_dispatch_time,
+            dispatch_finish_monotonic=stats.api_server_dispatch_finish_time,
+            first_token_monotonic=stats.first_token_time,
+            last_token_monotonic=stats.last_time,
+            finished_monotonic=stats.finished_time,
+            response_sent_monotonic=stats.response_sent_to_client_time,
+            output_tokens=completion_tokens,
+        )
 
     def _calculate_spec_decoding_metrics(
         self,
