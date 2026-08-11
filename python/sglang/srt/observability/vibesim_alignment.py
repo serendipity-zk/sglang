@@ -49,15 +49,24 @@ testable without a GPU, a scheduler, or a server.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
+import math
+import os
+import time
 from functools import wraps
+from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import msgspec
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.nvtx_utils import NVTX_SCHEDULER_ENABLED, profile_range
+from sglang.srt.utils.nvtx_utils import (
+    NVTX_SCHEDULER_ENABLED,
+    _nvtx_module,
+    profile_range,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,18 +75,23 @@ def is_enabled() -> bool:
     return envs.SGLANG_ENABLE_VIBESIM_ALIGNMENT.get()
 
 
-class IterationGeometry(msgspec.Struct, frozen=True, omit_defaults=True):
+class IterationGeometry(msgspec.Struct, omit_defaults=True):
     """A batch's shape, snapshotted before the forward pass mutates it.
 
     Taken at dispatch rather than at result-processing time because the decode
     path advances `seq_lens` during the forward: read afterwards, every context
     length would be one token too long, and in overlap mode the next batch may
     already be in flight.
+
+    Not frozen only because `nvtx_range_id` is a handle to a range that is
+    opened at dispatch and closed once the result is processed; the measured
+    fields are written once at capture and never touched again.
     """
 
     launch_monotonic_ns: int = 0
     prefill_chunk_pairs: list[list[int]] = []
     decode_kv_lens: list[int] = []
+    nvtx_range_id: Optional[tuple] = None
 
 
 def capture_iteration_geometry(
@@ -136,6 +150,27 @@ def _emit(record_name: str, record: dict[str, Any]) -> None:
     logger.info("%s %s", record_name, json.dumps(record, separators=(",", ":")))
 
 
+def open_iteration_forward_range(iteration_index: Optional[int]) -> Optional[tuple]:
+    """Open `sglang_iteration(N): forward`, to be closed after the result.
+
+    A start/end pair rather than a `with` block because the span has to survive
+    the return from `run_batch`: the forward it covers is only complete once the
+    result is processed, and in overlap mode the next batch is dispatched before
+    that happens. Overlapping spans are exactly what `start_range`/`end_range`
+    are for -- a push/pop `annotate` would mis-nest them.
+    """
+    if not NVTX_SCHEDULER_ENABLED:
+        return None
+    return _nvtx_module.start_range(
+        message=f"sglang_iteration({iteration_index}): forward", color="green"
+    )
+
+
+def close_iteration_forward_range(range_id: Optional[tuple]) -> None:
+    if range_id is not None:
+        _nvtx_module.end_range(range_id)
+
+
 def iteration_profile_method(stage: str):
     """Name a span `sglang_iteration(N): <stage>`, mirroring the vLLM fork.
 
@@ -143,10 +178,9 @@ def iteration_profile_method(stage: str):
     to that iteration's records with no timestamp matching, which is what makes
     a measured GPU timeline comparable to a simulated one span by span.
 
-    Only applicable where `batch.forward_iter` is already assigned. It is not,
-    on entry to `run_batch` -- that method assigns it -- so the forward keeps
-    SGLang's own `scheduler.run_batch` span, and the iteration record's
-    `observed_start/end_monotonic_ns` is what windows the forward on a timeline.
+    Only usable where `batch.forward_iter` is already assigned -- so not on
+    entry to `run_batch`, which is the method that assigns it. The forward span
+    is opened explicitly there instead, by `open_iteration_forward_range`.
     """
 
     def decorator(func):
@@ -404,3 +438,247 @@ def build_expert_load_record(
 
 def emit_expert_load_record(**kwargs: Any) -> None:
     _emit(_EXPERT_LOAD_RECORD_NAME, build_expert_load_record(**kwargs))
+
+
+# ── bulk dumps ───────────────────────────────────────────────────────────────
+#
+# The records above are one small JSON object each, on the log. These two are a
+# different kind of thing: a single iteration's token IDs or per-layer expert
+# histograms are far too large for a log line, and are only wanted for a handful
+# of hand-picked iterations. So each writes JSONL to its own path, is off unless
+# that path is set, and takes an iteration selector (`3`, `10-20`, `0,5,100-110`)
+# that defaults to every iteration.
+#
+# Rows are appended under an exclusive lock so TP ranks sharing one path
+# interleave whole rows rather than half-lines.
+
+
+def parse_iterations(raw: str) -> Optional[set[int]]:
+    """Parse an iteration selector. `None` means "every iteration"."""
+    raw = raw.strip()
+    if not raw:
+        return None
+
+    selected: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_text, end_text = part.split("-", 1)
+            selected.update(range(int(start_text), int(end_text) + 1))
+        else:
+            selected.add(int(part))
+    return selected
+
+
+def _iteration_selected(iteration_index: Optional[int], raw_selector: str) -> bool:
+    selected = parse_iterations(raw_selector)
+    if selected is None:
+        return True
+    return iteration_index in selected
+
+
+def should_trace_token_iteration(iteration_index: Optional[int]) -> bool:
+    if not envs.SGLANG_VIBESIM_TOKEN_TRACE_PATH.get():
+        return False
+    return _iteration_selected(
+        iteration_index, envs.SGLANG_VIBESIM_TOKEN_TRACE_ITERS.get()
+    )
+
+
+def should_trace_routing_iteration(iteration_index: Optional[int]) -> bool:
+    if not envs.SGLANG_VIBESIM_ROUTING_TRACE_PATH.get():
+        return False
+    return _iteration_selected(
+        iteration_index, envs.SGLANG_VIBESIM_ROUTING_TRACE_ITERS.get()
+    )
+
+
+def _append_jsonl(path_text: str, row: dict[str, Any]) -> None:
+    path = Path(path_text)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(row, sort_keys=True) + "\n"
+    with path.open("a", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            handle.write(line)
+            handle.flush()
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _sequence_int_list(values: Any) -> list[int]:
+    if hasattr(values, "tolist"):
+        values = values.tolist()
+    return [int(value) for value in values]
+
+
+def _device_provenance() -> dict[str, Any]:
+    import torch
+
+    return {
+        "timestamp_unix": time.time(),
+        "pid": os.getpid(),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "local_cuda_device": (
+            torch.cuda.current_device() if torch.cuda.is_available() else None
+        ),
+    }
+
+
+def build_token_input_row(
+    *,
+    iteration_index: Optional[int],
+    token_ids: list[int],
+    request_ids: list[str],
+    num_scheduled_tokens: list[int],
+) -> dict[str, Any]:
+    """Split a flat token buffer back into per-request spans.
+
+    Kept free of torch and of the environment: the span arithmetic is the only
+    part that can silently attribute tokens to the wrong request, so it is the
+    part worth testing directly.
+    """
+    requests: list[dict[str, Any]] = []
+    offset = 0
+    for request_id, count in zip(request_ids, num_scheduled_tokens):
+        end = offset + count
+        requests.append(
+            {
+                "req_id": request_id,
+                "start": offset,
+                "end": end,
+                "num_scheduled_tokens": count,
+                "token_ids": token_ids[offset:end],
+            }
+        )
+        offset = end
+
+    return {
+        "schema_version": 1,
+        "input_adapter": INPUT_ADAPTER,
+        "iteration": iteration_index,
+        "tokens": len(token_ids),
+        "num_reqs": len(request_ids),
+        "req_ids": request_ids,
+        "num_scheduled_tokens": num_scheduled_tokens,
+        "token_ids_flat": token_ids,
+        "requests": requests,
+    }
+
+
+def dump_token_inputs(
+    *,
+    iteration_index: Optional[int],
+    input_ids: Any,
+    request_ids: list[str],
+    num_scheduled_tokens: Sequence[int],
+) -> None:
+    """Dump the scheduled input token IDs for alignment-only reruns.
+
+    Nothing else recovers the exact token stream the engine saw; a replay would
+    otherwise have to re-tokenize prompt text and hope it matches.
+    """
+    if not should_trace_token_iteration(iteration_index):
+        return
+    trace_path = envs.SGLANG_VIBESIM_TOKEN_TRACE_PATH.get()
+    if input_ids is None or not trace_path:
+        return
+
+    counts = [int(count) for count in num_scheduled_tokens]
+    token_ids = _sequence_int_list(input_ids)[: sum(counts)]
+    row = build_token_input_row(
+        iteration_index=iteration_index,
+        token_ids=token_ids,
+        request_ids=list(request_ids),
+        num_scheduled_tokens=counts,
+    )
+    row.update(_device_provenance())
+    _append_jsonl(trace_path, row)
+
+
+def grouped_gemm_block_stats(
+    *,
+    local_counts: list[int],
+    total_assignments: int,
+    global_num_experts: int,
+    block_m: int,
+) -> dict[str, Any]:
+    """Padding cost of one grouped GEMM launch, given a per-expert load vector.
+
+    The kernel sizes its launch for the worst case -- `total_assignments` plus
+    one short block per expert -- while only `local_padded` rows carry work, so
+    the ratio between them is how much of the launch is spent on padding. Pure
+    arithmetic, so the simulator's grouped-GEMM cost model can be checked
+    against it directly.
+    """
+    nonzero_counts = [count for count in local_counts if count > 0]
+    local_padded = sum(
+        int(math.ceil(count / block_m) * block_m) for count in nonzero_counts
+    )
+    sorted_token_ids_len = total_assignments + global_num_experts * (block_m - 1)
+    launch_m_blocks = int(math.ceil(sorted_token_ids_len / block_m))
+    effective_m_blocks = int(math.ceil(local_padded / block_m)) if local_padded else 0
+    return {
+        "block_m_assumed": block_m,
+        "local_padded": local_padded,
+        "sorted_token_ids_len": sorted_token_ids_len,
+        "launch_m_blocks": launch_m_blocks,
+        "effective_m_blocks": effective_m_blocks,
+        "m_block_overlaunch": (
+            launch_m_blocks / effective_m_blocks if effective_m_blocks else None
+        ),
+    }
+
+
+def dump_routing_summary(
+    *,
+    iteration_index: Optional[int],
+    per_layer_counts: Sequence[Sequence[int]],
+    global_num_experts: int,
+    top_k: int,
+    tokens: int,
+    block_m: int = 64,
+) -> None:
+    """Dump per-layer routed expert histograms for one nominated iteration.
+
+    Complements the `ExpertLoad` record, which reads EPLB's accumulated load and
+    therefore needs EPLB enabled and only fires on its rebalance steps. This one
+    is per-iteration and carries the grouped-GEMM padding arithmetic with it.
+    """
+    if not should_trace_routing_iteration(iteration_index):
+        return
+    trace_path = envs.SGLANG_VIBESIM_ROUTING_TRACE_PATH.get()
+    if not trace_path:
+        return
+
+    provenance = _device_provenance()
+    for layer_id, layer_counts in enumerate(per_layer_counts):
+        counts = [int(count) for count in layer_counts]
+        total_assignments = sum(counts)
+        row: dict[str, Any] = {
+            "schema_version": 1,
+            "input_adapter": INPUT_ADAPTER,
+            "iteration": iteration_index,
+            "layer_id": layer_id,
+            "tokens": int(tokens),
+            "top_k": int(top_k),
+            "total_assignments": total_assignments,
+            "global_num_experts": int(global_num_experts),
+            "local_counts": counts,
+            "local_assignments": total_assignments,
+            "local_count_min": min(counts) if counts else 0,
+            "local_count_max": max(counts) if counts else 0,
+            "local_nonzero_experts": len([count for count in counts if count > 0]),
+        }
+        row.update(
+            grouped_gemm_block_stats(
+                local_counts=counts,
+                total_assignments=total_assignments,
+                global_num_experts=int(global_num_experts),
+                block_m=block_m,
+            )
+        )
+        row.update(provenance)
+        _append_jsonl(trace_path, row)

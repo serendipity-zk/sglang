@@ -18,7 +18,8 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.runtime_context import get_model
+from sglang.srt.observability import vibesim_alignment
+from sglang.srt.runtime_context import get_model, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -56,6 +57,10 @@ class EPLBManager:
         self._rebalance_num_iterations = self._server_args.eplb_rebalance_num_iterations
         self._rebalance_disabled_reason = None
         self._rebalance_disabled_logged = False
+        # Counts rebalances, so an alignment ExpertLoad row can say which one it
+        # came from. `_rebalance_num_iterations` is the interval between them,
+        # not a step number.
+        self._vibesim_rebalance_ct = 0
 
         # Otherwise, the circular buffer will contain stale data. If the case is needed, it can be implemented.
         assert (
@@ -127,6 +132,7 @@ class EPLBManager:
             output_mode="object"
         )
         logical_count = dump_record_output["logical_count"]
+        self._maybe_emit_vibesim_expert_load(logical_count)
         average_utilization_rate_over_window = dump_record_output[
             "average_utilization_rate_over_window"
         ]
@@ -224,6 +230,31 @@ class EPLBManager:
             self._model_config,
             physical_to_logical_map,
             moe_ep_rank=self._elastic_global_rank(),
+        )
+
+    def _maybe_emit_vibesim_expert_load(self, logical_count) -> None:
+        """Report the routed load this rebalance is about to act on.
+
+        Emitted before `_check_rebalance_needed` can bail out: the load is
+        evidence about the workload either way, and dropping the rounds where
+        EPLB decided not to move anything would bias the record toward the
+        skewed ones.
+
+        SGLang's recorder already folds physical experts back to logical, so
+        unlike the vLLM fork there is no mapping to undo here.
+        """
+        if not vibesim_alignment.is_enabled():
+            return
+        counts = logical_count
+        if isinstance(counts, torch.Tensor):
+            counts = counts.detach().cpu().tolist()
+        self._vibesim_rebalance_ct += 1
+        vibesim_alignment.emit_expert_load_record(
+            model=self._model_config.model_path,
+            eplb_step=self._vibesim_rebalance_ct,
+            expert_parallel_size=get_parallel().moe_ep_size,
+            experts_per_token=self._model_config.hf_text_config.num_experts_per_tok,
+            logical_expert_counts=counts,
         )
 
     def _elastic_global_rank(self) -> int:

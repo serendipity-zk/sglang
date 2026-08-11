@@ -3631,6 +3631,23 @@ class Scheduler(
                 extend_lens=batch.extend_lens,
                 seq_lens=batch.seq_lens,
             )
+            batch.vibesim_geometry.nvtx_range_id = (
+                vibesim_alignment.open_iteration_forward_range(batch.forward_iter)
+            )
+
+        if vibesim_alignment.should_trace_token_iteration(batch.forward_iter):
+            # One scheduled token per request on the decode path; the extend
+            # path already carries its own per-request counts.
+            vibesim_alignment.dump_token_inputs(
+                iteration_index=batch.forward_iter,
+                input_ids=batch.input_ids,
+                request_ids=[req.rid for req in batch.reqs],
+                num_scheduled_tokens=(
+                    batch.extend_lens
+                    if batch.forward_mode.is_extend() and batch.extend_lens is not None
+                    else [1] * len(batch.reqs)
+                ),
+            )
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
@@ -3942,6 +3959,9 @@ class Scheduler(
             self.metrics_reporter._emit_forward_pass_metrics(batch, result)
 
         if batch.vibesim_geometry is not None:
+            vibesim_alignment.close_iteration_forward_range(
+                batch.vibesim_geometry.nvtx_range_id
+            )
             vibesim_alignment.emit_iteration_from_geometry(
                 iteration_index=batch.forward_iter,
                 geometry=batch.vibesim_geometry,
