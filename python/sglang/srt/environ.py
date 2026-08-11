@@ -364,6 +364,18 @@ class Envs:
     SGLANG_JIT_LOG_LEVEL = EnvStr("WARNING")
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
 
+    # VibeSim alignment records. Off in production: the iteration record is one
+    # log line per forward pass, which is only wanted while a run is being
+    # compared against a simulation of the same workload.
+    SGLANG_ENABLE_VIBESIM_ALIGNMENT = EnvBool(False)
+    # Bulk dumps, each to its own JSONL file. Separate from the flag above
+    # because a single iteration's token IDs or per-layer expert histograms are
+    # far too large for the log. Unset = off.
+    SGLANG_VIBESIM_TOKEN_TRACE_PATH = EnvStr(None)
+    SGLANG_VIBESIM_TOKEN_TRACE_ITERS = EnvStr("")
+    SGLANG_VIBESIM_ROUTING_TRACE_PATH = EnvStr(None)
+    SGLANG_VIBESIM_ROUTING_TRACE_ITERS = EnvStr("")
+
     # ===================================================================
     # IPC, broadcasters, and ports
     # ===================================================================
