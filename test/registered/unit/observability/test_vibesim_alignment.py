@@ -16,7 +16,10 @@ from sglang.srt.observability.vibesim_alignment import (
     build_expert_load_record,
     build_iteration_record,
     build_request_timing_record,
+    build_token_input_row,
     capture_iteration_geometry,
+    grouped_gemm_block_stats,
+    parse_iterations,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -182,6 +185,60 @@ class TestExpertLoadRecord(unittest.TestCase):
         self.assertEqual(record["input_adapter"], INPUT_ADAPTER)
         self.assertEqual(record["logical_expert_counts"], [[1, 2, 3], [4, 5, 6]])
         self.assertEqual(record["experts_per_token"], 8)
+
+
+class TestBulkDumps(unittest.TestCase):
+    def test_token_spans_follow_the_scheduled_counts_not_equal_shares(self):
+        row = build_token_input_row(
+            iteration_index=7,
+            token_ids=[10, 11, 12, 13, 14, 15],
+            request_ids=["a", "b", "c"],
+            # Ragged on purpose: one prefill chunk and two single-token decodes.
+            num_scheduled_tokens=[4, 1, 1],
+        )
+
+        self.assertEqual(
+            [(r["start"], r["end"]) for r in row["requests"]],
+            [(0, 4), (4, 5), (5, 6)],
+        )
+        self.assertEqual(row["requests"][0]["token_ids"], [10, 11, 12, 13])
+        self.assertEqual(row["requests"][2]["token_ids"], [15])
+        self.assertEqual(row["input_adapter"], INPUT_ADAPTER)
+
+    def test_iteration_selector_parsing(self):
+        # Empty means every iteration, which is not the same as an empty set.
+        self.assertIsNone(parse_iterations(""))
+        self.assertIsNone(parse_iterations("   "))
+        self.assertEqual(parse_iterations("3"), {3})
+        self.assertEqual(parse_iterations("1, 4-6 ,9"), {1, 4, 5, 6, 9})
+        # A degenerate range is one iteration, not nothing.
+        self.assertEqual(parse_iterations("7-7"), {7})
+
+    def test_grouped_gemm_padding_counts_only_experts_that_got_work(self):
+        # Two experts hold 65 and 1 rows; at block_m=64 that is 2 blocks and 1.
+        stats = grouped_gemm_block_stats(
+            local_counts=[65, 1, 0, 0],
+            total_assignments=66,
+            global_num_experts=4,
+            block_m=64,
+        )
+
+        self.assertEqual(stats["local_padded"], 128 + 64)
+        # The launch is sized for the worst case: a short block per expert.
+        self.assertEqual(stats["sorted_token_ids_len"], 66 + 4 * 63)
+        self.assertEqual(stats["launch_m_blocks"], 5)
+        self.assertEqual(stats["effective_m_blocks"], 3)
+
+    def test_grouped_gemm_overlaunch_is_none_when_no_expert_is_local(self):
+        stats = grouped_gemm_block_stats(
+            local_counts=[0, 0],
+            total_assignments=0,
+            global_num_experts=2,
+            block_m=64,
+        )
+
+        # Not zero and not a division by zero: there is no ratio to report.
+        self.assertIsNone(stats["m_block_overlaunch"])
 
 
 if __name__ == "__main__":
