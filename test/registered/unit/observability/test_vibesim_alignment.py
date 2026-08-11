@@ -134,37 +134,45 @@ class TestApiRequestTimingRecord(unittest.TestCase):
             first_token_monotonic=100.020,
             last_token_monotonic=100.220,
             finished_monotonic=100.221,
-            response_sent_monotonic=100.222,
             output_tokens=32,
         )
         arguments.update(overrides)
         return build_api_request_timing_record(**arguments)
 
-    def test_frontend_span_decomposes_into_adjacent_segments(self):
+    def test_first_output_wait_is_the_parent_of_the_dispatch_segments(self):
+        """The dispatch parts nest inside the wait; they do not follow it.
+
+        Regression: they were first emitted as four adjacent segments, so
+        `api_first_output_wait_ms` was the residual after dispatch. The report
+        reads the vLLM fork's nesting, where the wait is the parent span, and
+        rejected every SGLang row for not summing.
+        """
         record = self._record()
 
         self.assertEqual(record["schema_version"], API_REQUEST_TIMING_SCHEMA_VERSION)
         self.assertAlmostEqual(record["api_frontend_prepare_ms"], 3.0)
         self.assertAlmostEqual(record["api_stream_activation_ms"], 2.0)
         self.assertAlmostEqual(record["api_add_request_ms"], 2.0)
-        self.assertAlmostEqual(record["api_first_output_wait_ms"], 13.0)
+        # created→first_token is 20 ms, of which 3 ms is prepare.
+        self.assertAlmostEqual(record["api_first_output_wait_ms"], 17.0)
         self.assertAlmostEqual(record["api_token_output_receive_span_ms"], 200.0)
         self.assertAlmostEqual(record["api_terminal_tail_ms"], 1.0)
-        self.assertAlmostEqual(record["api_e2e_ms"], 221.0)
-        # The segments up to the first token must tile that whole span.
-        self.assertAlmostEqual(
-            record["api_frontend_prepare_ms"]
-            + record["api_stream_activation_ms"]
-            + record["api_add_request_ms"]
-            + record["api_first_output_wait_ms"],
-            20.0,
+        # The dispatch parts fit inside the wait rather than extending it.
+        self.assertLess(
+            record["api_stream_activation_ms"] + record["api_add_request_ms"],
+            record["api_first_output_wait_ms"],
         )
 
-    def test_non_streaming_request_omits_the_response_sent_segment(self):
-        record = self._record(response_sent_monotonic=0.0)
+    def test_span_carries_no_field_the_vllm_fork_does_not_define(self):
+        """The record is a subset of the vLLM fork's, never a superset.
 
-        # Absent rather than zero: the non-streaming path never stamps it, and a
-        # zero would read as "sent instantly".
+        One analyzer reads both, and a field only one engine emits would either
+        go unread or force a per-engine branch. Guards against re-adding the
+        `api_e2e_ms` / `api_response_sent_ms` pair that was here first.
+        """
+        record = self._record()
+
+        self.assertNotIn("api_e2e_ms", record)
         self.assertNotIn("api_response_sent_ms", record)
 
     def test_incomplete_timestamps_produce_no_record(self):
