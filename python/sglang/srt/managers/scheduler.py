@@ -355,6 +355,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
     UocrSchedulerRuntime,
 )
 from sglang.srt.multimodal.transport.receive_budget import ReceiveFeatureBudget
+from sglang.srt.observability import vibesim_alignment
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
@@ -5044,6 +5045,15 @@ class Scheduler(
         """Run a batch."""
         self._on_step_launch(batch)
 
+        if vibesim_alignment.is_enabled():
+            # Before the forward: the decode path advances seq_lens in place.
+            batch.vibesim_geometry = vibesim_alignment.capture_iteration_geometry(
+                launch_monotonic_ns=time.monotonic_ns(),
+                is_extend=batch.forward_mode.is_extend(),
+                prefix_lens=batch.prefix_lens,
+                extend_lens=batch.extend_lens,
+                seq_lens=batch.seq_lens,
+            )
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
@@ -5501,6 +5511,7 @@ class Scheduler(
             batch_result.logits_output.next_token_logits = None
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_BATCH_RESULT)
+    @vibesim_alignment.iteration_profile_method("process_batch_result")
     def process_batch_result(
         self,
         batch: ScheduleBatch,
@@ -5544,6 +5555,13 @@ class Scheduler(
         # Emit forward pass metrics (every iteration when enabled)
         if self.enable_fpm:
             self.metrics_reporter._emit_forward_pass_metrics(batch, result)
+
+        if batch.vibesim_geometry is not None:
+            vibesim_alignment.emit_iteration_from_geometry(
+                iteration_index=batch.forward_iter,
+                geometry=batch.vibesim_geometry,
+                observed_end_monotonic_ns=time.monotonic_ns(),
+            )
 
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
