@@ -3291,6 +3291,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             launch_ts=self.launch_ts,
             after_idle_gap=self.after_idle_gap,
             extend_num_tokens=self.extend_num_tokens,
+            # Snapshotted at dispatch and read back in process_batch_result,
+            # which under overlap scheduling only ever sees this copy.
+            vibesim_geometry=self.vibesim_geometry,
         )
 
     def maybe_evict_swa(self):

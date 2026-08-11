@@ -3631,10 +3631,6 @@ class Scheduler(
                 extend_lens=batch.extend_lens,
                 seq_lens=batch.seq_lens,
             )
-            batch.vibesim_geometry.nvtx_range_id = (
-                vibesim_alignment.open_iteration_forward_range(batch.forward_iter)
-            )
-
         if vibesim_alignment.should_trace_token_iteration(batch.forward_iter):
             # One scheduled token per request on the decode path; the extend
             # path already carries its own per-request counts.
@@ -3661,6 +3657,15 @@ class Scheduler(
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
+
+        if batch.vibesim_geometry is not None:
+            # Opened below the prebuilt early return so the range exists only on
+            # the path that reaches the single `return ret` that closes it. A
+            # prebuilt batch is a PD-disagg placeholder that runs no forward, so
+            # it has no forward range to open rather than one to clean up.
+            batch.vibesim_geometry.nvtx_range_id = (
+                vibesim_alignment.open_iteration_forward_range(batch.forward_iter)
+            )
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3854,6 +3859,19 @@ class Scheduler(
 
         self._maybe_report_active_ranks()
 
+        if batch.vibesim_geometry is not None:
+            # Closed here, not after the result is processed. The range's job is
+            # to bracket this forward's *launches* -- kernels are attributed by
+            # the correlation id of the runtime call that issued them, never by
+            # when they ran -- and every launch has been issued by now. Holding
+            # it open until process_batch_result would make it span the next
+            # batch's dispatch under overlap scheduling, and hand this iteration
+            # the next one's kernels as well.
+            vibesim_alignment.close_iteration_forward_range(
+                batch.vibesim_geometry.nvtx_range_id
+            )
+            batch.vibesim_geometry.nvtx_range_id = None
+
         return ret
 
     def _maybe_report_active_ranks(self) -> None:
@@ -3959,9 +3977,6 @@ class Scheduler(
             self.metrics_reporter._emit_forward_pass_metrics(batch, result)
 
         if batch.vibesim_geometry is not None:
-            vibesim_alignment.close_iteration_forward_range(
-                batch.vibesim_geometry.nvtx_range_id
-            )
             vibesim_alignment.emit_iteration_from_geometry(
                 iteration_index=batch.forward_iter,
                 geometry=batch.vibesim_geometry,
@@ -5039,6 +5054,20 @@ def run_scheduler_process(
         display_dp_rank=display_dp_rank,
         display_moe_ep_rank=display_moe_ep_rank,
     )
+    if vibesim_alignment.is_enabled():
+        # Before anything can fail: this is the only statement of which device
+        # ran which rank, and a capture without it cannot be attributed.
+        vibesim_alignment.emit_worker_record(
+            pid=os.getpid(),
+            device_id=gpu_id,
+            visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
+            tp_rank=tp_rank,
+            dp_rank=dp_rank,
+            pp_rank=pp_rank,
+            tp_size=server_args.tp_size,
+            dp_size=server_args.dp_size,
+        )
+
     # Scheduler.__init__ reads the config namespaces before the model
     # worker's own publish.
     publish(server_args, role="scheduler")

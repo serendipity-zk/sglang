@@ -2751,7 +2751,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             first_token_monotonic=stats.first_token_time,
             last_token_monotonic=stats.last_time,
             finished_monotonic=stats.finished_time,
-            response_sent_monotonic=stats.response_sent_to_client_time,
             output_tokens=completion_tokens,
         )
 

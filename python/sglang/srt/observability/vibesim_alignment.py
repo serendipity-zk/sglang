@@ -135,11 +135,13 @@ def capture_iteration_geometry(
 #: this rather than guessing from which fields happen to be present.
 INPUT_ADAPTER = "sglang_text"
 
+WORKER_SCHEMA_VERSION = 1
 ITERATION_SCHEMA_VERSION = 2
 REQUEST_TIMING_SCHEMA_VERSION = 2
 EXPERT_LOAD_SCHEMA_VERSION = 2
 API_REQUEST_TIMING_SCHEMA_VERSION = 3
 
+_WORKER_RECORD_NAME = "VibeSimAlignmentWorker"
 _ITERATION_RECORD_NAME = "VibeSimAlignmentIteration"
 _REQUEST_TIMING_RECORD_NAME = "VibeSimAlignmentRequestTiming"
 _API_REQUEST_TIMING_RECORD_NAME = "VibeSimAlignmentApiRequestTiming"
@@ -243,6 +245,58 @@ def build_iteration_record(
     }
 
 
+# ── worker identity ──────────────────────────────────────────────────────────
+
+
+def build_worker_record(
+    *,
+    pid: int,
+    device_id: int,
+    visible_devices: Optional[str],
+    tp_rank: int,
+    dp_rank: Optional[int],
+    pp_rank: int,
+    tp_size: int,
+    dp_size: int,
+) -> dict[str, Any]:
+    """State which device this scheduler owns and which rank it holds.
+
+    A multi-rank capture is a set of per-device kernel streams, and turning it
+    back into per-rank evidence needs someone to say which device ran which
+    rank. The vLLM fork leaves that to be recovered indirectly -- its banner
+    states pid <-> rank, and the profiler separately knows pid <-> device -- but
+    a scheduler process here is handed its `gpu_id` outright, so it can state
+    the thing the analyzer actually wants and skip the join.
+
+    `visible_devices` is recorded because that directness has one precondition:
+    `gpu_id` is an index into the process's visible set, and it only equals the
+    device ordinal the profiler reports while every rank shares one visible set.
+    Under `SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS` each rank sees a single device
+    and calls it 0, so every rank would claim device 0. Recording what each rank
+    could see lets the reader detect that and refuse, instead of silently
+    folding the whole run onto one device.
+    """
+    return {
+        "schema_version": WORKER_SCHEMA_VERSION,
+        "input_adapter": INPUT_ADAPTER,
+        "pid": int(pid),
+        "device_id": int(device_id),
+        "visible_devices": visible_devices,
+        "tp_rank": int(tp_rank),
+        "dp_rank": int(dp_rank or 0),
+        "pp_rank": int(pp_rank),
+        "tp_size": int(tp_size),
+        "dp_size": int(dp_size),
+    }
+
+
+def emit_worker_record(**kwargs: Any) -> None:
+    _emit(_WORKER_RECORD_NAME, build_worker_record(**kwargs))
+
+
+# ── iteration ────────────────────────────────────────────────────────────────
+
+
 def emit_iteration_record(**kwargs: Any) -> None:
     _emit(_ITERATION_RECORD_NAME, build_iteration_record(**kwargs))
 
@@ -344,7 +398,6 @@ def build_api_request_timing_record(
     first_token_monotonic: float,
     last_token_monotonic: float,
     finished_monotonic: float,
-    response_sent_monotonic: float,
     output_tokens: int,
 ) -> Optional[dict[str, Any]]:
     """Split the API-server span the client waits on, ahead of the scheduler.
@@ -353,6 +406,13 @@ def build_api_request_timing_record(
     calibrate its API and scheduler clocks against each other, but this record
     does not lean on that: it reports one domain, and the scheduler-side
     `RequestTiming` record reports the other, exactly as the vLLM fork does.
+
+    The field set is a subset of the vLLM fork's, and deliberately so: vLLM
+    splits the wait for the first output across its output collector and its
+    per-request generator, handoffs SGLang does not have -- it moves outputs over
+    its own IPC and the phases are not separable from outside. Reporting the
+    parent span and the two dispatch segments states what is true here rather
+    than inventing a split to fill the schema.
     """
     boundaries = (
         created_monotonic,
@@ -377,25 +437,21 @@ def build_api_request_timing_record(
         # same keeps the two engines' waterfalls stackable.
         "api_frontend_prepare_ms": (tokenize_finish_monotonic - created_monotonic)
         * 1000.0,
+        # The whole wait for the first output, prepare excluded -- the parent of
+        # the two dispatch segments below, not the residual left after them.
+        # That nesting is the vLLM fork's, and the report checks it: the parts
+        # an engine reports must fit inside this span.
+        "api_first_output_wait_ms": (first_token_monotonic - tokenize_finish_monotonic)
+        * 1000.0,
         "api_stream_activation_ms": (dispatch_monotonic - tokenize_finish_monotonic)
         * 1000.0,
         "api_add_request_ms": (dispatch_finish_monotonic - dispatch_monotonic) * 1000.0,
-        "api_first_output_wait_ms": (first_token_monotonic - dispatch_finish_monotonic)
-        * 1000.0,
         "api_token_output_receive_span_ms": (
             last_token_monotonic - first_token_monotonic
         )
         * 1000.0,
         "api_terminal_tail_ms": (finished_monotonic - last_token_monotonic) * 1000.0,
-        "api_e2e_ms": (finished_monotonic - created_monotonic) * 1000.0,
     }
-    # Only the streaming path stamps the moment the last chunk left the server;
-    # the non-streaming path has no such boundary, so the field is absent rather
-    # than folded into the tail.
-    if response_sent_monotonic > 0.0:
-        record["api_response_sent_ms"] = (
-            response_sent_monotonic - finished_monotonic
-        ) * 1000.0
     return record
 
 
