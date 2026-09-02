@@ -26,7 +26,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     PhaseConfig,
 )
-from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+from sglang.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    _resolve_offline_server_args,
+    prepare_server_args,
+)
 from sglang.srt.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -43,6 +48,96 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_default_tokenizer_worker_count_is_four(self):
+        direct = ServerArgs(model_path="dummy")
+        parsed = prepare_server_args(["--model-path", "dummy"])
+
+        self.assertEqual(direct.tokenizer_worker_num, 4)
+        self.assertEqual(parsed.tokenizer_worker_num, 4)
+
+    def test_multi_tokenizer_rejects_api_keys(self):
+        for key_name in ("api_key", "admin_api_key"):
+            with self.subTest(key_name=key_name):
+                with self.assertRaisesRegex(ValueError, "tokenizer-worker-num 1"):
+                    ServerArgs(model_path="dummy", **{key_name: "secret"})
+
+                args = ServerArgs(
+                    model_path="dummy",
+                    tokenizer_worker_num=1,
+                    **{key_name: "secret"},
+                )
+                self.assertEqual(getattr(args, key_name), "secret")
+
+    def test_multi_tokenizer_rejects_ssl_refresh(self):
+        with self.assertRaisesRegex(ValueError, "tokenizer-worker-num 1"):
+            ServerArgs(model_path="dummy", enable_ssl_refresh=True)
+
+        args = ServerArgs(
+            model_path="dummy",
+            tokenizer_worker_num=1,
+            enable_ssl_refresh=True,
+        )
+        self.assertTrue(args.enable_ssl_refresh)
+
+    def test_offline_engine_keeps_single_tokenizer_default(self):
+        class FakeServerArgs:
+            def __init__(self, **kwargs):
+                self.tokenizer_worker_num = kwargs["tokenizer_worker_num"]
+                self.log_level = kwargs["log_level"]
+
+        args = _resolve_offline_server_args(FakeServerArgs, {})
+        self.assertEqual(args.tokenizer_worker_num, 1)
+        self.assertEqual(args.log_level, "error")
+
+    def test_offline_engine_rejects_explicit_multi_tokenizer_args(self):
+        for args in (
+            SimpleNamespace(tokenizer_worker_num=4),
+            ServerArgs(model_path="dummy"),
+        ):
+            with self.subTest(args=args):
+                with self.assertRaisesRegex(ValueError, "offline Engine API"):
+                    _resolve_offline_server_args(
+                        ServerArgs,
+                        {"server_args": args},
+                    )
+
+    def test_offline_engine_accepts_explicit_single_tokenizer_args(self):
+        args = ServerArgs(model_path="dummy", tokenizer_worker_num=1)
+        self.assertIs(
+            _resolve_offline_server_args(ServerArgs, {"server_args": args}),
+            args,
+        )
+
+    @staticmethod
+    def _elastic_scaling_args(tokenizer_worker_num=None):
+        kwargs = dict(
+            model_path="dummy",
+            elastic_ep_backend="mooncake",
+            max_ep_size=2,
+            load_balance_method="round_robin",
+            disable_cuda_graph=True,
+            enable_dp_attention=True,
+            enable_dp_lm_head=True,
+            moe_a2a_backend="nixl",
+        )
+        if tokenizer_worker_num is not None:
+            kwargs["tokenizer_worker_num"] = tokenizer_worker_num
+        args = ServerArgs(**kwargs)
+        args._handle_cuda_graph_config()
+        return args
+
+    def test_elastic_ep_scaling_rejects_default_multi_tokenizer(self):
+        args = self._elastic_scaling_args()
+        self.assertEqual(args.tokenizer_worker_num, 4)
+        with self.assertRaisesRegex(AssertionError, "tokenizer-worker-num 1"):
+            args._handle_elastic_ep()
+
+    def test_elastic_ep_scaling_accepts_explicit_single_tokenizer(self):
+        args = self._elastic_scaling_args(tokenizer_worker_num=1)
+        with patch.object(args, "_validate_ib_devices", return_value=None):
+            args._handle_elastic_ep()
+        self.assertEqual(args.elastic_ep_initial_size, args.tp_size)
+
     def test_return_hidden_states_mode_configuration(self):
         disabled = ServerArgs(model_path="dummy")
         self.assertFalse(disabled.enable_return_hidden_states)
@@ -1075,6 +1170,7 @@ class TestPortArgs(unittest.TestCase):
 
 class TestSSLArgs(unittest.TestCase):
     def _validate_ssl(self, **kwargs):
+        kwargs.setdefault("tokenizer_worker_num", 1)
         server_args = ServerArgs(model_path="dummy", **kwargs)
         server_args._handle_ssl_validation()
         return server_args
@@ -1882,6 +1978,9 @@ class TestGrpcServerArgs(CustomTestCase):
 
     @staticmethod
     def _args(**kwargs):
+        # Native gRPC is one of the restricted modes that must opt out of the
+        # HTTP serving default of four tokenizer workers.
+        kwargs.setdefault("tokenizer_worker_num", 1)
         return ServerArgs(model_path="dummy", **kwargs)
 
     def test_http_only_high_port_does_not_derive_grpc_port(self):
@@ -2051,6 +2150,17 @@ class TestGrpcServerArgs(CustomTestCase):
         sa = self._args(grpc_port=40000, tokenizer_worker_num=2)
         with self.assertRaises(ValueError):
             sa._handle_deprecated_args()
+
+    def test_native_grpc_rejects_default_multi_tokenizer(self):
+        sa = ServerArgs(model_path="dummy", grpc_port=40000)
+        self.assertEqual(sa.tokenizer_worker_num, 4)
+        with self.assertRaisesRegex(ValueError, "tokenizer-worker-num 1"):
+            sa._handle_deprecated_args()
+
+    def test_native_grpc_accepts_explicit_single_tokenizer(self):
+        sa = self._args(grpc_port=40000)
+        sa._handle_deprecated_args()
+        self.assertEqual(sa.tokenizer_worker_num, 1)
 
     def test_native_grpc_rejects_http_auth(self):
         sa = self._args(grpc_port=40000, api_key="secret")

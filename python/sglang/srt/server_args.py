@@ -514,8 +514,12 @@ class ServerArgs:
         NS("serving"),
     ] = "huggingface"
     tokenizer_worker_num: A[
-        int, "The worker num of the tokenizer manager.", NS("serving")
-    ] = 1
+        int,
+        "The tokenizer worker count for HTTP serving; defaults to 4. The offline "
+        "Engine API, HTTP API-key authentication, SSL refresh, native gRPC, and "
+        "elastic EP runtime scale-up require 1.",
+        NS("serving"),
+    ] = 4
     detokenizer_worker_num: A[
         int, "The worker num of the detokenizer manager.", NS("serving")
     ] = 1
@@ -3507,6 +3511,7 @@ class ServerArgs:
 
         self._handle_moe_runner_backend_alias()
         self._handle_return_hidden_states_mode()
+        self._handle_tokenizer_worker_compatibility()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3914,6 +3919,22 @@ class ServerArgs:
                 else "round_robin"
             )
             return
+
+    def _handle_tokenizer_worker_compatibility(self):
+        """Reject HTTP features not wired into multi-tokenizer workers."""
+        if self.tokenizer_worker_num == 1:
+            return
+
+        if self.api_key or self.admin_api_key:
+            raise ValueError(
+                "HTTP API-key authentication currently requires "
+                "--tokenizer-worker-num 1."
+            )
+        if self.enable_ssl_refresh:
+            raise ValueError(
+                "--enable-ssl-refresh currently requires "
+                "--tokenizer-worker-num 1."
+            )
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""
@@ -6961,7 +6982,6 @@ class ServerArgs:
                 "deployment with --max-ep-size larger than its local TP size."
             )
         if scaling_active:
-            resolved = self._resolved()
             assert (
                 self.elastic_ep_scale_timeout > 0
             ), "--elastic-ep-scale-timeout must be greater than zero."
@@ -6969,6 +6989,7 @@ class ServerArgs:
                 "Elastic EP runtime scale-up currently requires "
                 "--tokenizer-worker-num 1."
             )
+            resolved = self._resolved()
             assert (
                 not self.use_ray
             ), "Elastic EP runtime scale-up does not support --use-ray."
@@ -9500,6 +9521,26 @@ def _apply_fuseep_mode_env_compat(
         "removed in a future release. Please use --fuseep-mode instead."
     )
     raw_args.fuseep_mode = fuseep_mode
+
+
+def _resolve_offline_server_args(server_args_class, kwargs):
+    """Build/validate args for the in-process offline Engine topology."""
+    if "server_args" in kwargs:
+        server_args = kwargs["server_args"]
+    else:
+        kwargs.setdefault("log_level", "error")
+        # Multi-tokenizer workers are an HTTP serving topology. The offline
+        # Engine API owns its TokenizerManager in this process and therefore
+        # keeps the historical single-worker topology.
+        kwargs.setdefault("tokenizer_worker_num", 1)
+        server_args = server_args_class(**kwargs)
+
+    if server_args.tokenizer_worker_num != 1:
+        raise ValueError(
+            "The offline Engine API requires tokenizer_worker_num=1; "
+            "multi-tokenizer workers are only supported by HTTP serving."
+        )
+    return server_args
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:

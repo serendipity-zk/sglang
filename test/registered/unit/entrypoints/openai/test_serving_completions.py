@@ -18,7 +18,8 @@ from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
+from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -174,6 +175,7 @@ class ServingCompletionTestCase(unittest.TestCase):
             max_tokens=10,
             logprobs=False,
             return_token_ids=True,
+            return_prompt_token_ids=True,
         )
 
         mock_ret = [
@@ -198,6 +200,30 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(len(response.choices[0].logprobs.top_logprobs), 0)
         self.assertEqual(response.choices[0].token_ids, [3, 4])
         self.assertEqual(response.choices[0].prompt_token_ids, [1, 2])
+
+    def test_token_ids_do_not_implicitly_request_prompt_ids(self):
+        req = CompletionRequest(
+            model="x", prompt=[1, 2], return_token_ids=True
+        )
+
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+
+        self.assertTrue(req.return_token_ids)
+        self.assertFalse(req.return_prompt_token_ids)
+        self.assertFalse(adapted_request.return_prompt_token_ids)
+
+    def test_alignment_token_span_does_not_depend_on_metrics(self):
+        stats = APIServerReqTimeStats()
+        state = ReqState([], False, Mock(), Mock(), stats)
+
+        state.mark_vibesim_token_output(1, 100.0)
+        state.mark_vibesim_token_output(0, 150.0)
+        self.assertEqual(stats.first_token_time, 100.0)
+        self.assertEqual(state.vibesim_last_token_time, 100.0)
+
+        state.mark_vibesim_token_output(2, 200.0)
+        self.assertEqual(stats.first_token_time, 100.0)
+        self.assertEqual(state.vibesim_last_token_time, 200.0)
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
@@ -272,6 +298,7 @@ class ServingCompletionTestCase(unittest.TestCase):
             max_tokens=10,
             stream=True,
             return_token_ids=True,
+            return_prompt_token_ids=True,
         )
         adapted_request, _ = self.sc._convert_to_internal_request(req)
         self.sc.tokenizer_manager.server_args.stream_response_default_include_usage = (
@@ -334,6 +361,64 @@ class ServingCompletionTestCase(unittest.TestCase):
                 self.assertEqual(choices[0]["prompt_token_ids"], [1, 2])
                 for choice in choices[1:]:
                     self.assertNotIn("prompt_token_ids", choice)
+
+    def test_streaming_generated_and_prompt_id_controls_are_independent(self):
+        self.sc.tokenizer_manager.server_args.stream_response_default_include_usage = (
+            False
+        )
+        self.sc.tokenizer_manager.server_args.incremental_streaming_output = True
+
+        for return_token_ids in (False, True):
+            for return_prompt_token_ids in (False, True):
+                with self.subTest(
+                    return_token_ids=return_token_ids,
+                    return_prompt_token_ids=return_prompt_token_ids,
+                ):
+                    req = CompletionRequest(
+                        model="x",
+                        prompt=[1, 2],
+                        stream=True,
+                        return_token_ids=return_token_ids,
+                        return_prompt_token_ids=return_prompt_token_ids,
+                    )
+                    adapted_request, _ = self.sc._convert_to_internal_request(req)
+                    self.assertEqual(
+                        adapted_request.return_prompt_token_ids,
+                        return_prompt_token_ids,
+                    )
+
+                    async def _mock_generate(*args, **kwargs):
+                        yield {
+                            "text": "a",
+                            "output_ids": [5],
+                            "prompt_token_ids": [1, 2],
+                            "meta_info": {
+                                "id": "cmpl-test",
+                                "prompt_tokens": 2,
+                                "completion_tokens": 1,
+                                "finish_reason": {"type": "stop"},
+                            },
+                            "index": 0,
+                        }
+
+                    self.sc.tokenizer_manager.generate_request = _mock_generate
+
+                    async def run_stream():
+                        return [
+                            chunk
+                            async for chunk in self.sc._generate_completion_stream(
+                                adapted_request, req, self.fastapi_request
+                            )
+                        ]
+
+                    raw_chunks = get_or_create_event_loop().run_until_complete(
+                        run_stream()
+                    )
+                    first = json.loads(raw_chunks[0][len("data: ") :])["choices"][0]
+                    self.assertEqual("token_ids" in first, return_token_ids)
+                    self.assertEqual(
+                        "prompt_token_ids" in first, return_prompt_token_ids
+                    )
 
     def test_non_streaming_cached_tokens_details_emits_sglext(self):
         """Test that non-streaming completion responses emit cached token details in sglext."""

@@ -235,6 +235,7 @@ class RayEngine(Engine):
         self._placement_group = kwargs.pop("placement_group", None)
         if "log_level" not in kwargs:
             kwargs["log_level"] = "error"
+        kwargs.setdefault("tokenizer_worker_num", 1)
         super().__init__(server_args=ServerArgs(**kwargs))
 
     def shutdown(self):

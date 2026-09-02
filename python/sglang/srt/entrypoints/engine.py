@@ -99,7 +99,7 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.plugins import load_plugins
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, _resolve_offline_server_args
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     SerializedTensorPayload,
@@ -231,16 +231,7 @@ class Engine(EngineScoreMixin, EngineBase):
         # so hooks on ServerArgs.__post_init__ fire correctly.
         load_plugins()
 
-        # Parse server_args
-        if "server_args" in kwargs:
-            # Directly load server_args
-            server_args = kwargs["server_args"]
-        else:
-            # Construct server_args from kwargs
-            if "log_level" not in kwargs:
-                # Do not print logs by default
-                kwargs["log_level"] = "error"
-            server_args = self.server_args_class(**kwargs)
+        server_args = _resolve_offline_server_args(self.server_args_class, kwargs)
         self.server_args = server_args
         logger.info(f"{server_args=}")
 
