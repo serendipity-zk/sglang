@@ -49,8 +49,10 @@ class Serving(msgspec.Struct):
     ] = "huggingface"
     tokenizer_worker_num: A[
         int,
-        "The worker num of the tokenizer manager.",
-    ] = 1
+        "The tokenizer worker count for HTTP serving; defaults to 4. The offline "
+        "Engine API, HTTP API-key authentication, SSL refresh, native gRPC, and "
+        "elastic EP runtime scale-up require 1.",
+    ] = 4
     detokenizer_worker_num: A[
         int,
         "The worker num of the detokenizer manager.",

@@ -241,6 +241,7 @@ class RayEngine(Engine):
             from sglang.srt.observability.ray_wrappers import build_ray_stat_loggers
 
             kwargs["stat_loggers"] = build_ray_stat_loggers()
+        kwargs.setdefault("tokenizer_worker_num", 1)
         super().__init__(server_args=ServerArgs(**kwargs))
 
     def shutdown(self):

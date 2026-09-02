@@ -335,7 +335,7 @@ class TestServerInfoInternalStatesRedaction(CustomTestCase):
     def test_http_and_engine_server_info(self):
         from sglang.srt.entrypoints.engine import Engine
 
-        server_args = ServerArgs(model_path="dummy", **self.SECRETS)
+        server_args = ServerArgs(model_path="dummy", tokenizer_worker_num=1, **self.SECRETS)
         readback = self._scheduler_readback(server_args)
 
         self._assert_redacted(_call_server_info_with(server_args, [readback]))

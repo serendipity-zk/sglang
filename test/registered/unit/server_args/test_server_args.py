@@ -120,7 +120,12 @@ from sglang.srt.runtime_context import (
     get_serving,
     override_platform,
 )
-from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+from sglang.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    _resolve_offline_server_args,
+    prepare_server_args,
+)
 from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -1025,6 +1030,70 @@ class TestPrepareServerArgs(CustomTestCase):
             self.assertEqual(parsed.mm_process_config, {"image": {"resize": 128}})
         finally:
             os.unlink(config_file)
+
+
+class TestMultiTokenizerDefaults(CustomTestCase):
+    def test_default_tokenizer_worker_count_is_four(self):
+        direct = ServerArgs(model_path="dummy")
+        parsed = prepare_server_args(["--model-path", "dummy"])
+
+        self.assertEqual(direct.tokenizer_worker_num, 4)
+        self.assertEqual(parsed.tokenizer_worker_num, 4)
+
+    def test_multi_tokenizer_rejects_api_keys(self):
+        for key_name in ("api_key", "admin_api_key"):
+            with self.subTest(key_name=key_name):
+                with self.assertRaisesRegex(ValueError, "tokenizer-worker-num 1"):
+                    ServerArgs(model_path="dummy", **{key_name: "secret"}).resolve_once()
+
+                args = ServerArgs(
+                    model_path="dummy",
+                    tokenizer_worker_num=1,
+                    **{key_name: "secret"},
+                )
+                args.resolve_once()
+                self.assertEqual(getattr(args, key_name), "secret")
+
+    def test_multi_tokenizer_rejects_ssl_refresh(self):
+        with self.assertRaisesRegex(ValueError, "tokenizer-worker-num 1"):
+            ServerArgs(model_path="dummy", enable_ssl_refresh=True).resolve_once()
+
+        args = ServerArgs(
+            model_path="dummy",
+            tokenizer_worker_num=1,
+            enable_ssl_refresh=True,
+        )
+        args.resolve_once()
+        self.assertTrue(args.enable_ssl_refresh)
+
+    def test_offline_engine_keeps_single_tokenizer_default(self):
+        class FakeServerArgs:
+            def __init__(self, **kwargs):
+                self.tokenizer_worker_num = kwargs["tokenizer_worker_num"]
+                self.log_level = kwargs["log_level"]
+
+        args = _resolve_offline_server_args(FakeServerArgs, {})
+        self.assertEqual(args.tokenizer_worker_num, 1)
+        self.assertEqual(args.log_level, "error")
+
+    def test_offline_engine_rejects_explicit_multi_tokenizer_args(self):
+        for args in (
+            SimpleNamespace(tokenizer_worker_num=4),
+            ServerArgs(model_path="dummy"),
+        ):
+            with self.subTest(args=args):
+                with self.assertRaisesRegex(ValueError, "offline Engine API"):
+                    _resolve_offline_server_args(
+                        ServerArgs,
+                        {"server_args": args},
+                    )
+
+    def test_offline_engine_accepts_explicit_single_tokenizer_args(self):
+        args = ServerArgs(model_path="dummy", tokenizer_worker_num=1)
+        self.assertIs(
+            _resolve_offline_server_args(ServerArgs, {"server_args": args}),
+            args,
+        )
 
 
 class TestMmEncoderDataParallelLogging(CustomTestCase):
@@ -2630,6 +2699,7 @@ class TestPortArgs(unittest.TestCase):
 
 class TestSSLArgs(unittest.TestCase):
     def _validate_ssl(self, **kwargs):
+        kwargs.setdefault("tokenizer_worker_num", 1)
         server_args = ServerArgs(model_path="dummy", **kwargs)
         handle_ssl_validation(server_args)
         return server_args
@@ -4232,7 +4302,21 @@ class TestGrpcServerArgs(CustomTestCase):
 
     @staticmethod
     def _args(**kwargs):
+        # Native gRPC is one of the restricted modes that must opt out of the
+        # HTTP serving default of four tokenizer workers.
+        kwargs.setdefault("tokenizer_worker_num", 1)
         return ServerArgs(model_path="dummy", **kwargs)
+
+    def test_native_grpc_rejects_default_multi_tokenizer(self):
+        sa = ServerArgs(model_path="dummy", grpc_port=40000)
+        self.assertEqual(sa.tokenizer_worker_num, 4)
+        with self.assertRaisesRegex(ValueError, "tokenizer-worker-num 1"):
+            handle_deprecated_args(sa)
+
+    def test_native_grpc_accepts_explicit_single_tokenizer(self):
+        sa = self._args(grpc_port=40000)
+        handle_deprecated_args(sa)
+        self.assertEqual(sa.tokenizer_worker_num, 1)
 
     def test_http_only_high_port_does_not_derive_grpc_port(self):
         sa = self._args(port=56000)
@@ -4489,7 +4573,15 @@ class TestGrpcServerArgs(CustomTestCase):
         parser = self._sidecar_parser()
         for value in (300, 1800, 0, -1):
             with self.subTest(timeout=value):
-                argv = ["--model-path", "dummy", "--grpc-port", "50051"]
+                argv = [
+                    "--model-path",
+                    "dummy",
+                    "--grpc-port",
+                    "50051",
+                    # Native gRPC requires one tokenizer worker.
+                    "--tokenizer-worker-num",
+                    "1",
+                ]
                 if value != 300:
                     argv += ["--grpc-response-timeout-secs", str(value)]
                 sa = ServerArgs.from_cli_args(parser.parse_args(argv))
@@ -5559,7 +5651,11 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
 
     @staticmethod
     def _resolve(cli_args, rust_server=True):
-        args = prepare_server_args(["--model-path", "dummy", *cli_args])
+        # API keys and SSL refresh are honored by the Python frontend only with
+        # one tokenizer worker, so state that rather than the HTTP default of 4.
+        args = prepare_server_args(
+            ["--model-path", "dummy", "--tokenizer-worker-num", "1", *cli_args]
+        )
         # `override` leaves the variable set when its body raises.
         with patch.dict(os.environ), envs.SGLANG_RUST_SERVER.override(rust_server):
             args.resolve_once()

@@ -262,9 +262,11 @@ async def init_multi_tokenizer() -> ServerArgs:
 
     publish(server_args, role="tokenizer")
 
-    # API key authentication is not supported in multi-tokenizer mode
-    assert get_serving().api_key is None, (
-        "API key is not supported in multi-tokenizer mode"
+    # API key authentication is not supported in multi-tokenizer mode. This
+    # duplicates the early ServerArgs validation as a defense against a
+    # deserialized or programmatically mutated configuration.
+    assert get_serving().api_key is None and get_serving().admin_api_key is None, (
+        "API keys are not supported in multi-tokenizer mode"
     )
 
     # Create a new ipc name for the current process
@@ -3075,13 +3077,21 @@ def _setup_and_run_http_server(
                 "level": "INFO",
                 "propagate": False,
             }
+            # Uvicorn replaces the parent process's logging configuration in
+            # each tokenizer worker. Keep alignment records visible there too;
+            # otherwise scheduler-side records survive but every API timing row
+            # silently disappears when --tokenizer-worker-num is greater than 1.
+            LOGGING_CONFIG["loggers"][
+                "sglang.srt.observability.vibesim_alignment"
+            ] = {
+                "handlers": ["default"],
+                "level": "INFO",
+                "propagate": False,
+            }
 
-            if get_serving().enable_ssl_refresh:
-                logger.warning(
-                    "--enable-ssl-refresh is not supported with multiple "
-                    "tokenizer workers (--tokenizer-worker-num > 1). "
-                    "SSL refresh will be disabled."
-                )
+            assert not get_serving().enable_ssl_refresh, (
+                "SSL refresh is not supported in multi-tokenizer mode"
+            )
 
             if get_serving().enable_http2:
                 logger.info(

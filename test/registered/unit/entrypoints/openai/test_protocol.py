@@ -55,6 +55,7 @@ class TestCompletionRequest(unittest.TestCase):
         self.assertEqual(request.n, 1)  # default
         self.assertFalse(request.stream)  # default
         self.assertFalse(request.echo)  # default
+        self.assertFalse(request.return_prompt_token_ids)
 
     def test_completion_request_validation_errors(self):
         """Test completion request validation errors"""
