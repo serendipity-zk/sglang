@@ -286,7 +286,8 @@ class TestFactoryFunctions(CustomTestCase):
             os.unlink(path)
 
     def test_zmq_mode_via_env(self):
-        self._publish(nnodes=1, dp_size=1)
+        # One tokenizer worker: several give each its own SHM reader instead.
+        self._publish(nnodes=1, dp_size=1, tokenizer_worker_num=1)
         port_args = SimpleNamespace(instance_id="test_zmq_factory")
         os.environ["SGLANG_LOAD_SNAPSHOT_USE_ZMQ"] = "1"
         try:

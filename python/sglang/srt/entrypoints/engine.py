@@ -143,7 +143,12 @@ from sglang.srt.runtime_context import (
     snapshot_context,
 )
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-from sglang.srt.server_args import PortArgs, ServerArgs, redact_server_args_secrets
+from sglang.srt.server_args import (
+    PortArgs,
+    ServerArgs,
+    _resolve_offline_server_args,
+    redact_server_args_secrets,
+)
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     SerializedTensorPayload,
@@ -302,19 +307,12 @@ class Engine(EngineScoreMixin, EngineBase):
         # so hooks on ServerArgs.__post_init__ fire correctly.
         load_plugins()
 
-        # Parse server_args
-        if "server_args" in kwargs:
-            # Directly load server_args
-            server_args = kwargs["server_args"]
-        else:
-            # Construct server_args from kwargs
-            if "log_level" not in kwargs:
-                # Do not print logs by default
-                kwargs["log_level"] = "error"
-            server_args = self.server_args_class(**kwargs)
+        server_args = _resolve_offline_server_args(self.server_args_class, kwargs)
+        if "server_args" not in kwargs:
             # There was no command line, so the call is what the operator
-            # asked for. `log_level` is filled in above when absent, so it
-            # shows here even when the caller did not pass it.
+            # asked for. `log_level` and `tokenizer_worker_num` are filled in
+            # above when absent, so they show here even when the caller did
+            # not pass them.
             msgspec.Struct.__setattr__(
                 server_args,
                 "_launch_command",

@@ -40,6 +40,23 @@ def handle_watermark_config(server_args: Any) -> None:
         declare_resolution(server_args, "handle_watermark_config", **resolved)
 
 
+def handle_tokenizer_worker_compatibility(server_args: Any):
+    """Reject HTTP features not wired into multi-tokenizer workers."""
+    cfg = resolving_view(server_args)
+    if cfg.tokenizer_worker_num == 1:
+        return
+
+    if cfg.api_key or cfg.admin_api_key:
+        raise ValueError(
+            "HTTP API-key authentication currently requires "
+            "--tokenizer-worker-num 1."
+        )
+    if cfg.enable_ssl_refresh:
+        raise ValueError(
+            "--enable-ssl-refresh currently requires --tokenizer-worker-num 1."
+        )
+
+
 def handle_ssl_validation(server_args: Any):
     """Ensure SSL arguments are consistent and referenced files exist."""
     cfg = resolving_view(server_args)

@@ -190,7 +190,7 @@ class TestTokenizerManagerCrashDump(CustomTestCase):
     def test_server_args_snapshot_redacted_with_watermarking_off(self):
         # The request dump pickles this snapshot as is. The Python API accepts
         # a server key without --enable-watermark, and validation then skips it.
-        server_args = ServerArgs(model_path="dummy", **_SECRETS)
+        server_args = ServerArgs(model_path="dummy", tokenizer_worker_num=1, **_SECRETS)
         context = create_context(server_args, role="test")
         self.assertFalse(context.config_bag("exec").features.enable_watermark)
         tm = SimpleNamespace(server_args=server_args)
@@ -204,7 +204,7 @@ class TestTokenizerManagerCrashDump(CustomTestCase):
         """`write_crash_dump` redacts on its own, so the dump carries no
         secret even when the writer passes the server args unredacted, as a
         dict or as the record."""
-        server_args = ServerArgs(model_path="dummy", **_SECRETS)
+        server_args = ServerArgs(model_path="dummy", tokenizer_worker_num=1, **_SECRETS)
         finished = (_request("done"), _out("done"), 100.0, 101.5)
         for passed in (server_args.resolved_dict(), server_args):
             tm = SimpleNamespace(
@@ -404,7 +404,7 @@ class TestRustServerCrashDump(CustomTestCase):
         """The dump carries no secret, as Python's does. Rust mode refuses
         `--enable-watermark`, but the Python API takes a server key without
         it and validation then skips the key."""
-        server_args = ServerArgs(model_path="dummy", **_SECRETS)
+        server_args = ServerArgs(model_path="dummy", tokenizer_worker_num=1, **_SECRETS)
         server = _rust_server(_SNAPSHOT)
         server.server_args = server_args
         with tempfile.TemporaryDirectory() as folder:

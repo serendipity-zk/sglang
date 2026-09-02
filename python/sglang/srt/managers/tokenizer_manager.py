@@ -295,6 +295,10 @@ class ReqState:
     # The latest stats the scheduler sent; see RequestOutputStats for when.
     request_stats: Optional[RequestOutputStats] = None
     ttft_observed: bool = False
+    # Alignment timing must not depend on Prometheus metrics being enabled.
+    # APIServerReqTimeStats.last_time is advanced only by collect_metrics, while
+    # workload_metrics deliberately launches with enable_metrics=False.
+    vibesim_last_token_time: float = 0.0
 
     dispatched: bool = False
     abort_sent: bool = False
@@ -334,6 +338,24 @@ class ReqState:
         ):
             self.request_stats = new_request_stats
         return self.request_stats
+
+    def mark_vibesim_token_output(
+        self, token_count: int, observed_monotonic: Optional[float] = None
+    ) -> None:
+        """Advance alignment API timing for one token-bearing output.
+
+        This is deliberately separate from ``collect_metrics``: workload-only
+        alignment disables Prometheus metrics, but still requires an exact
+        first-to-last token span. A terminal/usage-only output has zero tokens
+        and must preserve the preceding token boundary.
+        """
+        if token_count <= 0:
+            return
+        if observed_monotonic is None:
+            observed_monotonic = time.perf_counter()
+        if self.time_stats.first_token_time == 0.0:
+            self.time_stats.set_first_token_time(observed_monotonic)
+        self.vibesim_last_token_time = observed_monotonic
 
     def get_crash_dump_output(self) -> Dict[Any, Any]:
         out = {}
@@ -2831,6 +2853,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 
             state.finished = recv_obj.finished_reasons[i] is not None
+            # Output ids carried by a token stream row. A terminal/usage-only
+            # row carries neither ids nor text and must not move a token
+            # boundary; other outputs (embeddings, beam search) always do.
+            received_token_count = 0
+            carries_output = True
 
             # Must run after meta_info is fully populated.
             beam_out_dict = try_build_beam_search_out_dict(recv_obj, i, meta_info)
@@ -2843,6 +2870,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 incremental = is_stream and self.incremental_streaming_output
                 delta_text = recv_obj.output_strs[i]
                 delta_output_ids = list(row_output_ids(recv_obj, i))
+                received_token_count = len(delta_output_ids)
+                carries_output = received_token_count > 0 or bool(delta_text)
                 output_offset = state.last_output_offset
                 state.append_text(delta_text)
                 state.output_ids.extend(delta_output_ids)
@@ -2890,6 +2919,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 is_stream = getattr(state.obj, "stream", False)
                 incremental = is_stream and self.incremental_streaming_output
                 delta_output_ids = list(row_output_ids(recv_obj, i))
+                received_token_count = len(delta_output_ids)
+                carries_output = received_token_count > 0
                 output_offset = state.last_output_offset
                 state.output_ids.extend(delta_output_ids)
 
@@ -2948,16 +2979,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if pooled_hidden_states[i] is not None:
                         out_dict["pooled_hidden_state"] = pooled_hidden_states[i]
 
-            # Set first_token_time on the first output batch.
-            # This is the single write point for first_token_time.
+            # Stamp the first token on the first output batch that carries one.
             first_output_time = None
-            if state.time_stats.first_token_time == 0.0:
+            if state.time_stats.first_token_time == 0.0 and carries_output:
                 first_output_time = time.perf_counter()
                 state.time_stats.set_first_token_time(
                     ts=self._get_scheduler_first_token_time(state, request_stats)
                     or first_output_time
                 )
                 state.time_stats.set_last_time(ts=first_output_time)
+            # Keep the alignment-specific last boundary independent of
+            # collect_metrics: workload-only captures intentionally leave
+            # Prometheus disabled.
+            state.mark_vibesim_token_output(received_token_count, first_output_time)
 
             if state.finished:
                 span_attrs = (
@@ -2971,7 +3005,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     ts=first_output_time, span_attrs=span_attrs
                 )
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
-                self._maybe_emit_vibesim_api_timing(rid, state, recv_obj, i)
 
                 if get_spec().speculative_algorithm:
                     self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
@@ -3005,6 +3038,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if self.enable_metrics and state.obj.log_metrics:
                 self.collect_metrics(state, recv_obj, i, request_stats)
+            if state.finished:
+                self._maybe_emit_vibesim_api_timing(rid, state, recv_obj, i)
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
@@ -3381,7 +3416,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             dispatch_monotonic=stats.api_server_dispatch_time,
             dispatch_finish_monotonic=stats.api_server_dispatch_finish_time,
             first_token_monotonic=stats.first_token_time,
-            last_token_monotonic=stats.last_time,
+            last_token_monotonic=state.vibesim_last_token_time,
             finished_monotonic=stats.finished_time,
             output_tokens=completion_tokens,
         )

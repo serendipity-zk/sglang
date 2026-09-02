@@ -130,7 +130,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
-            return_prompt_token_ids=request.return_token_ids,
+            return_prompt_token_ids=request.return_prompt_token_ids,
             rid=request.rid,
             session_id=request.session_id,
             extra_key=request.extra_key,
@@ -343,8 +343,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         n_prev_token_ids[index] = len(output_ids)
                     else:
                         chunk_token_ids = output_ids
-                    if is_first_chunk:
-                        chunk_prompt_token_ids = content.get("prompt_token_ids")
+                if request.return_prompt_token_ids and is_first_chunk:
+                    chunk_prompt_token_ids = content.get("prompt_token_ids")
 
                 # Generate delta
                 if get_serving().incremental_streaming_output:
@@ -624,7 +624,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 ),
                 prompt_token_ids=(
                     ret_item.get("prompt_token_ids")
-                    if request.return_token_ids
+                    if request.return_prompt_token_ids
                     else None
                 ),
             )

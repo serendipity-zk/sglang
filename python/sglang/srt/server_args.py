@@ -742,6 +742,26 @@ def redact_secret_cli_args(
     return result
 
 
+def _resolve_offline_server_args(server_args_class, kwargs):
+    """Build/validate args for the in-process offline Engine topology."""
+    if "server_args" in kwargs:
+        server_args = kwargs["server_args"]
+    else:
+        kwargs.setdefault("log_level", "error")
+        # Multi-tokenizer workers are an HTTP serving topology. The offline
+        # Engine API owns its TokenizerManager in this process and therefore
+        # keeps the historical single-worker topology.
+        kwargs.setdefault("tokenizer_worker_num", 1)
+        server_args = server_args_class(**kwargs)
+
+    if server_args.tokenizer_worker_num != 1:
+        raise ValueError(
+            "The offline Engine API requires tokenizer_worker_num=1; "
+            "multi-tokenizer workers are only supported by HTTP serving."
+        )
+    return server_args
+
+
 def prepare_server_args(argv: list[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
