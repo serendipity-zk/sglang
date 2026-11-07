@@ -368,6 +368,25 @@ def test_build_directory_entries_are_dropped(tmp_path):
     assert [entry.relpath for entry in entries] == [str(outside)]
 
 
+def test_build_directory_entries_are_dropped_behind_a_symlink(tmp_path):
+    """A cache root reached through a symlink still drops the generated unit.
+
+    Dependencies arrive resolved; the staging directory is spelled from the
+    configured root. Comparing the two unresolved recorded the staging path,
+    which is gone once the leaf is published, so the leaf could never hit.
+    """
+    real_root = tmp_path / "disk"
+    real_root.mkdir()
+    (tmp_path / "home_cache").symlink_to(real_root, target_is_directory=True)
+    build_dir = tmp_path / "home_cache" / "build"
+    generated = _write(build_dir / "cuda.cu", "// generated")
+    outside = _write(tmp_path / "real.h", "// real")
+    entries = cache._to_entries(
+        dependencies=[generated.resolve(), outside], build_dir=build_dir
+    )
+    assert [entry.relpath for entry in entries] == [str(outside)]
+
+
 def test_publish_loses_the_race_gracefully(tmp_path):
     """Two processes building identical content: the loser adopts the winner's leaf."""
     winner = tmp_path / "leaf"
