@@ -490,6 +490,13 @@ def _to_entries(
     their paths are unstable, and their contents are already a function of
     inputs ``build_key`` covers.
     """
+    # Resolved like the candidates below. The staging directory is spelled from
+    # the configured cache root, which can sit behind a symlink (a home-directory
+    # `.cache` linked onto another disk); left unresolved, the generated unit
+    # fails the containment test, is recorded under its staging path, and that
+    # path vanishes at publication -- so the leaf never hits and every process
+    # rebuilds the module on first use.
+    build_dir = build_dir.resolve()
     seen: Dict[Tuple[str, str], _DepEntry] = {}
     for candidate in dependencies:
         path = (
