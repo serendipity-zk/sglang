@@ -26,6 +26,17 @@ The rebase kept all four commits, one for one, and dropped none:
 on `vibesim-alignment`; it exists only on a local branch of a retired Sim
 worktree. It is not carried. The pure-TP `expert_popularity` pass depends on it.
 
+## Upstream fixes carried
+
+- `962c5b3dee` `fix(jit): resolve the staging dir before dropping generated
+  units`. Upstream's content-addressed JIT cache never hits when the cache root
+  is reached through a symlink (here `~/.cache` -> `/raid/kanzhu/.cache`): the
+  generated `cuda.cu` is recorded under its vanishing `.staging-<uuid>` path.
+  Each process then rebuilds every `sgl_kernel_jit_*` module on first use,
+  serialized by the build lock, about 5 s per rank per module. Modules first
+  used while serving (`sampling_argmax`, `clamp_position`) stalled GLM-5.2 TP4
+  for 20 s and 18 s. Drop this commit once upstream resolves the staging path.
+
 ## Adaptations to upstream changes
 
 - `scheduler.py`: upstream moved the scripted hook and profiler predicate into
