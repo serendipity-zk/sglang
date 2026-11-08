@@ -1,19 +1,55 @@
 # ServingStudio instrumentation on upstream SGLang
 
-`vibesim-alignment-20261107` is the maintained ServingStudio line of this fork.
+`vibesim-alignment-20261108` is the maintained ServingStudio line of this fork.
 It sits on official SGLang `upstream/main`
-`ba5906471c62e82c0594a617b4d07d9b2c0fd2b3` (2026-11-07). ServingStudio Sim pins
-the line at `alignment/profiler/sglang`.
+`9d547e19ff519f0d1b964b0b1c014d98dc65caf4` (2026-11-08), the commit the official
+nightly image `lmsysorg/sglang:nightly-dev-cu13-20261108-9d547e19` is built from.
+`ALIGNMENT_BASE` states that base, the image and its digest for the Sim's
+profiler-image build; nothing derives the base from commit messages. Both
+alignment forks (vLLM and SGLang) are the latest upstream commit plus its
+official image plus our commits. At the next upgrade, prefer a stable release
+and its image.
 
-The previous line, `vibesim-alignment`, sits on main
-`9d4be40124cc4ef4ac3cc3a5be086f78a030a32c` (2026-08-10). Its head `449cb04a53`
-is tagged `vibesim-alignment-base-449cb04a5`. The branch is not moved, because
-recorded captures name it. Every capture's `<name>_launch.json` records the
-fork's `head`, `branch`, and `status_short` under `fork_git`.
+ServingStudio Sim pins the line at `alignment/profiler/sglang`.
+
+Earlier lines are not moved, because recorded captures name them; every
+capture's `<name>_launch.json` records the fork's `head`, `branch`, and
+`status_short` under `fork_git`.
+
+- `vibesim-alignment-20261107` (head `05ddf99b87`) sits on main `ba5906471c`
+  (2026-11-07). This line is that one rebased without conflicts: the nine
+  upstream commits between the two bases touch none of the files our commits
+  change.
+- `vibesim-alignment` (head `449cb04a53`, tagged
+  `vibesim-alignment-base-449cb04a5`) sits on main `9d4be40124` (2026-08-10).
+
+## Upstream delta since `vibesim-alignment-20261107`
+
+`ba5906471c..9d547e19ff` is nine commits. None touches the scheduler,
+`tokenizer_manager.py`, the JIT cache, DSA or MoE kernels, or the NVTX and
+profiler paths, so the GLM-5.2 TP4 B200 capture that validated
+`vibesim-alignment-20261107` (no iteration over 1.6 s; TTFT p90 1626 ms, TPOT
+p90 28.3 ms against 1805 ms and 30.4 ms in 2026-08) was not rerun for this base.
+
+| Commit | Change | Effect on a CUDA capture |
+| --- | --- | --- |
+| `c3c292b65a` | Rust server: image detail hint | none (Rust server only) |
+| `391f4e6f17` | AMD cookbook doc | none |
+| `9e10f79ac7` | Rust server request logging | none (Rust server; drops a Rust-only arg check) |
+| `7975093bd1` | tests pin the Python frontend | none (tests) |
+| `4b4dc7b01b` | Rust server cache report | none (Rust server only) |
+| `ba48fc1a9e` | ROCm MI450 custom all-reduce | code under `USE_ROCM` / `torch.version.hip` only; the edited `custom_all_reduce.cuh` changes that JIT module's content hash, so a warm cache builds it once more on first use |
+| `0a8ad45c12` | kv-canary ids in the graph-capture dummy forward | `None` unless the kv-canary token oracle is on |
+| `6d1ce5b894` | ERNIE 5.5 imports | none (other model) |
+| `9d547e19ff` | in-tree aiter tuned tables | `install_aiter_tuned_tables()` returns at once unless ROCm with aiter |
+
+Torch 2.14.1, `sglang-kernel` 0.4.10 and FlashInfer 0.7.3 are unchanged.
 
 ## Commits
 
-The rebase kept all four commits, one for one, and dropped none:
+The 2026-11-07 rebase from `vibesim-alignment` kept all four commits, one for
+one, and dropped none (the 2026-11-08 rebase then carried every commit
+unchanged):
 
 | `vibesim-alignment` | Here | Content |
 | --- | --- | --- |
@@ -28,8 +64,8 @@ worktree. It is not carried. The pure-TP `expert_popularity` pass depends on it.
 
 ## Upstream fixes carried
 
-- `962c5b3dee` `fix(jit): resolve the staging dir before dropping generated
-  units`. Upstream's content-addressed JIT cache never hits when the cache root
+- `96519bfe14` (`962c5b3dee` on the 2026-11-07 line) `fix(jit): resolve the
+  staging dir before dropping generated units`. Upstream's content-addressed JIT cache never hits when the cache root
   is reached through a symlink (here `~/.cache` -> `/raid/kanzhu/.cache`): the
   generated `cuda.cu` is recorded under its vanishing `.staging-<uuid>` path.
   Each process then rebuilds every `sgl_kernel_jit_*` module on first use,
